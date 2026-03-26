@@ -28,6 +28,7 @@ if [[ -z "$FEATURE_ID" ]]; then
     for state_file in "${PIPELINE_ROOT}"/*/state.json; do
         [[ -f "$state_file" ]] || continue
         fid=$(basename "$(dirname "$state_file")")
+        [[ "$fid" == ".archive" || "$fid" == "_debug" ]] && continue
         echo "  - ${fid}"
     done
     exit 1

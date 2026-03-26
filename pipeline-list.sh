@@ -177,10 +177,15 @@ pipeline_root = '${PIPELINE_ROOT}'
 features = []
 
 for state_file in sorted(glob.glob(os.path.join(pipeline_root, '*/state.json'))):
+    feature_dir = os.path.basename(os.path.dirname(state_file))
+    # Skip special directories
+    if feature_dir in ('.archive', '_debug'):
+        continue
+
     with open(state_file) as f:
         state = json.load(f)
 
-    feature_id = state.get('feature_id', os.path.basename(os.path.dirname(state_file)))
+    feature_id = state.get('feature_id', feature_dir)
     stages = state.get('stages', {})
     cost = state.get('cost', {})
 
