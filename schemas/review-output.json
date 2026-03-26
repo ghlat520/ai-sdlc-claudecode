@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S5 Review Output",
+  "description": "StageOutput schema for Code Review stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "review"],
+  "properties": {
+    "stage_id": { "const": "S5" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "review": {
+      "type": "object",
+      "required": ["code_review", "security_review", "summary"],
+      "properties": {
+        "code_review": {
+          "type": "object",
+          "required": ["issues"],
+          "properties": {
+            "issues": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["severity", "file", "description", "suggestion"],
+                "properties": {
+                  "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
+                  "file": { "type": "string" },
+                  "line": { "type": "integer" },
+                  "description": { "type": "string" },
+                  "suggestion": { "type": "string" },
+                  "category": { "enum": ["quality", "performance", "maintainability", "immutability", "naming"] }
+                }
+              }
+            },
+            "files_reviewed": { "type": "integer" },
+            "approved": { "type": "boolean" }
+          }
+        },
+        "security_review": {
+          "type": "object",
+          "required": ["issues"],
+          "properties": {
+            "issues": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["severity", "category", "file", "description", "remediation"],
+                "properties": {
+                  "severity": { "enum": ["critical", "high", "medium", "low"] },
+                  "category": { "enum": ["injection", "xss", "csrf", "auth", "secrets", "ssrf", "crypto", "config"] },
+                  "file": { "type": "string" },
+                  "line": { "type": "integer" },
+                  "description": { "type": "string" },
+                  "remediation": { "type": "string" }
+                }
+              }
+            },
+            "approved": { "type": "boolean" }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "required": ["critical_count", "high_count", "medium_count", "low_count", "overall_approved"],
+          "properties": {
+            "critical_count": { "type": "integer" },
+            "high_count": { "type": "integer" },
+            "medium_count": { "type": "integer" },
+            "low_count": { "type": "integer" },
+            "overall_approved": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "retry_count": { "type": "integer" }
+      }
+    }
+  }
+}

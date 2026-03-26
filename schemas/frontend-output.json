@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S3b Frontend Output",
+  "description": "StageOutput schema for Frontend Development stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "implementation"],
+  "properties": {
+    "stage_id": { "const": "S3b" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "implementation": {
+      "type": "object",
+      "required": ["files_changed", "build_result"],
+      "properties": {
+        "files_changed": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["path", "change_type", "line_count"],
+            "properties": {
+              "path": { "type": "string" },
+              "change_type": { "enum": ["added", "modified", "deleted"] },
+              "line_count": { "type": "integer", "maximum": 800 },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "build_result": {
+          "type": "object",
+          "required": ["success", "command"],
+          "properties": {
+            "success": { "type": "boolean" },
+            "command": { "type": "string" },
+            "warnings": { "type": "integer" },
+            "errors": { "type": "integer" }
+          }
+        },
+        "components_created": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type", "path"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "enum": ["page", "component", "layout", "hook", "util", "store"] },
+              "path": { "type": "string" }
+            }
+          }
+        },
+        "api_integrations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["endpoint", "method"],
+            "properties": {
+              "endpoint": { "type": "string" },
+              "method": { "type": "string" },
+              "status": { "enum": ["connected", "mocked"] }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "retry_count": { "type": "integer" }
+      }
+    }
+  }
+}

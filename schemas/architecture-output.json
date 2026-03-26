@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S2 Architecture Output",
+  "description": "StageOutput schema for Architecture Design stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "architecture"],
+  "properties": {
+    "stage_id": { "const": "S2" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "architecture": {
+      "type": "object",
+      "required": ["affected_modules", "api_contracts", "data_model", "sequence_flows"],
+      "properties": {
+        "affected_modules": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["module_name", "change_type", "description"],
+            "properties": {
+              "module_name": { "type": "string" },
+              "change_type": { "enum": ["new", "modify", "none"] },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "api_contracts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["endpoint", "method", "request_schema", "response_schema"],
+            "properties": {
+              "endpoint": { "type": "string" },
+              "method": { "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"] },
+              "request_schema": { "type": "object" },
+              "response_schema": { "type": "object" },
+              "dubbo_interface": { "type": "string" }
+            }
+          }
+        },
+        "data_model": {
+          "type": "object",
+          "required": ["tables"],
+          "properties": {
+            "tables": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "change_type", "columns"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "change_type": { "enum": ["new", "alter", "none"] },
+                  "columns": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["name", "type"],
+                      "properties": {
+                        "name": { "type": "string" },
+                        "type": { "type": "string" },
+                        "nullable": { "type": "boolean" },
+                        "index": { "type": "boolean" }
+                      }
+                    }
+                  },
+                  "ddl": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "sequence_flows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["name", "steps"],
+            "properties": {
+              "name": { "type": "string" },
+              "steps": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["from", "to", "action"],
+                  "properties": {
+                    "from": { "type": "string" },
+                    "to": { "type": "string" },
+                    "action": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "nfr_coverage": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["nfr_id", "solution"],
+            "properties": {
+              "nfr_id": { "type": "string" },
+              "solution": { "type": "string" }
+            }
+          }
+        },
+        "breaking_changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["description", "migration_plan"],
+            "properties": {
+              "description": { "type": "string" },
+              "migration_plan": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "retry_count": { "type": "integer" }
+      }
+    }
+  }
+}

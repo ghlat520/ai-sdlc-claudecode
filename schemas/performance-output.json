@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S9 Performance Output",
+  "description": "StageOutput schema for Performance Testing stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "performance"],
+  "properties": {
+    "stage_id": { "const": "S9" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "performance": {
+      "type": "object",
+      "required": ["benchmarks", "recommendations"],
+      "properties": {
+        "benchmarks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["name", "metric", "value", "unit"],
+            "properties": {
+              "name": { "type": "string" },
+              "metric": { "type": "string" },
+              "value": { "type": "number" },
+              "unit": { "type": "string" },
+              "threshold": { "type": "number" },
+              "passed": { "type": "boolean" }
+            }
+          }
+        },
+        "load_test": {
+          "type": "object",
+          "properties": {
+            "tool": { "type": "string" },
+            "concurrent_users": { "type": "integer" },
+            "duration_seconds": { "type": "integer" },
+            "requests_per_second": { "type": "number" },
+            "p50_ms": { "type": "number" },
+            "p95_ms": { "type": "number" },
+            "p99_ms": { "type": "number" },
+            "error_rate": { "type": "number" }
+          }
+        },
+        "recommendations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["issue", "suggestion", "impact"],
+            "properties": {
+              "issue": { "type": "string" },
+              "suggestion": { "type": "string" },
+              "impact": { "enum": ["critical", "high", "medium", "low"] }
+            }
+          }
+        },
+        "database_analysis": {
+          "type": "object",
+          "properties": {
+            "slow_queries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["query", "avg_ms"],
+                "properties": {
+                  "query": { "type": "string" },
+                  "avg_ms": { "type": "number" },
+                  "suggestion": { "type": "string" }
+                }
+              }
+            },
+            "missing_indexes": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "retry_count": { "type": "integer" }
+      }
+    }
+  }
+}

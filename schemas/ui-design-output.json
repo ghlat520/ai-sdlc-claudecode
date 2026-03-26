@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S2b UI Design Output",
+  "description": "StageOutput schema for UI Design stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status"],
+  "properties": {
+    "stage_id": { "const": "S2b" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "design_system": {
+      "type": "object",
+      "properties": {
+        "framework": { "type": "string" },
+        "color_primary": { "type": "string" },
+        "layout": { "type": "string" }
+      }
+    },
+    "pages": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "components": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "page_api_mappings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "page": { "type": "string" },
+          "api_count": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

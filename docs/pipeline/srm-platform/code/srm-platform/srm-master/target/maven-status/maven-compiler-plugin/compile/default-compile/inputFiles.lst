@@ -1,0 +1,9 @@
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/entity/Material.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/dto/SupplierMasterDto.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/service/impl/SupplierMasterServiceImpl.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/repository/MaterialRepository.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/repository/SupplierMasterRepository.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/entity/OrgUnit.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/entity/SupplierMaster.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/service/SupplierMasterService.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-master/src/main/java/com/srm/master/repository/OrgUnitRepository.java

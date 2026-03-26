@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S4b Integration Test Output",
+  "description": "StageOutput schema for Integration Testing stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "testing"],
+  "properties": {
+    "stage_id": { "const": "S4b" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "testing": {
+      "type": "object",
+      "required": ["test_results", "test_suites"],
+      "properties": {
+        "test_results": {
+          "type": "object",
+          "required": ["total", "passed", "failed", "skipped"],
+          "properties": {
+            "total": { "type": "integer" },
+            "passed": { "type": "integer" },
+            "failed": { "type": "integer" },
+            "skipped": { "type": "integer" }
+          }
+        },
+        "test_suites": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type", "tests"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "enum": ["api", "database", "service", "rpc", "mq"] },
+              "tests": { "type": "integer" },
+              "passed": { "type": "integer" },
+              "failed": { "type": "integer" }
+            }
+          }
+        },
+        "api_tests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["endpoint", "method", "status_code", "passed"],
+            "properties": {
+              "endpoint": { "type": "string" },
+              "method": { "type": "string" },
+              "status_code": { "type": "integer" },
+              "passed": { "type": "boolean" },
+              "response_time_ms": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "retry_count": { "type": "integer" }
+      }
+    }
+  }
+}

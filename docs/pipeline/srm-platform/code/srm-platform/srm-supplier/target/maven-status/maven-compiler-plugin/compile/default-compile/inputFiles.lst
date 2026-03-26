@@ -1,0 +1,8 @@
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-supplier/src/main/java/com/srm/supplier/dto/SupplierLifecycleDto.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-supplier/src/main/java/com/srm/supplier/service/SupplierLifecycleService.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-supplier/src/main/java/com/srm/supplier/fsm/SupplierStateMachine.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-supplier/src/main/java/com/srm/supplier/repository/StateTransitionRecordRepository.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-supplier/src/main/java/com/srm/supplier/entity/StateTransitionRecord.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-supplier/src/main/java/com/srm/supplier/service/impl/SupplierLifecycleServiceImpl.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-supplier/src/main/java/com/srm/supplier/entity/SupplierLifecycle.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-supplier/src/main/java/com/srm/supplier/repository/SupplierLifecycleRepository.java

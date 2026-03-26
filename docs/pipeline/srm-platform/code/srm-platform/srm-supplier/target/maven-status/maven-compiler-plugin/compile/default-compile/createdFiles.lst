@@ -1,0 +1,11 @@
+com/srm/supplier/repository/StateTransitionRecordRepository.class
+com/srm/supplier/fsm/SupplierStateMachine.class
+com/srm/supplier/entity/SupplierLifecycle.class
+com/srm/supplier/dto/SupplierLifecycleDto$Response.class
+com/srm/supplier/dto/SupplierLifecycleDto$TransitionRequest.class
+com/srm/supplier/dto/SupplierLifecycleDto$TransitionRecordDto.class
+com/srm/supplier/repository/SupplierLifecycleRepository.class
+com/srm/supplier/service/SupplierLifecycleService.class
+com/srm/supplier/entity/StateTransitionRecord.class
+com/srm/supplier/dto/SupplierLifecycleDto.class
+com/srm/supplier/service/impl/SupplierLifecycleServiceImpl.class

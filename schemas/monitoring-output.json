@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S7 Monitoring Output",
+  "description": "StageOutput schema for Monitoring & Observability stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "monitoring"],
+  "properties": {
+    "stage_id": { "const": "S7" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "monitoring": {
+      "type": "object",
+      "required": ["alerts", "dashboards", "logging"],
+      "properties": {
+        "alerts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "condition", "severity"],
+            "properties": {
+              "name": { "type": "string" },
+              "condition": { "type": "string" },
+              "severity": { "enum": ["critical", "warning", "info"] },
+              "channel": { "type": "string" }
+            }
+          }
+        },
+        "dashboards": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "panels"],
+            "properties": {
+              "name": { "type": "string" },
+              "panels": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["title", "metric"],
+                  "properties": {
+                    "title": { "type": "string" },
+                    "metric": { "type": "string" },
+                    "type": { "enum": ["graph", "gauge", "table", "stat"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "logging": {
+          "type": "object",
+          "required": ["log_format", "key_events"],
+          "properties": {
+            "log_format": { "type": "string" },
+            "key_events": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["event", "level"],
+                "properties": {
+                  "event": { "type": "string" },
+                  "level": { "enum": ["debug", "info", "warn", "error"] },
+                  "fields": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        "slos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "target", "metric"],
+            "properties": {
+              "name": { "type": "string" },
+              "target": { "type": "string" },
+              "metric": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "retry_count": { "type": "integer" }
+      }
+    }
+  }
+}

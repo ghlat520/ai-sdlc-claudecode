@@ -1,0 +1,884 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": "2.0.0",
+  "description": "SDLC Pipeline DAG - 13 Stages (6 Core + 7 Extended)",
+  "config": {
+    "max_retries_per_stage": 3,
+    "cost_limit_usd": 500,
+    "context_budget_tokens": 150000,
+    "max_files_per_agent_call": 20,
+    "pipeline_root": "docs/pipeline",
+    "log_format": "jsonl",
+    "timeout_multiplier": 2.0,
+    "max_output_bytes": 102400,
+    "max_upstream_chars_in_prompt": 50000,
+    "default_stage_timeout_seconds": 600,
+    "notification": {
+      "webhook_url": "",
+      "webhook_type": "dingtalk",
+      "notify_on": [
+        "human_wait",
+        "dead_letter",
+        "pipeline_end"
+      ]
+    },
+    "evidence_required": false,
+    "tech_stack": "java-maven",
+    "tech_stack_commands": {
+      "java-maven": {
+        "compile": "mvn clean compile test-compile -q",
+        "test": "mvn clean test",
+        "coverage": "mvn jacoco:report",
+        "lint": "mvn checkstyle:check -q"
+      },
+      "node-typescript": {
+        "compile": "npm run build",
+        "test": "npm test",
+        "coverage": "npm run test:coverage",
+        "lint": "npm run lint"
+      },
+      "python": {
+        "compile": "python -m py_compile",
+        "test": "pytest",
+        "coverage": "pytest --cov",
+        "lint": "ruff check ."
+      },
+      "golang": {
+        "compile": "go build ./...",
+        "test": "go test ./...",
+        "coverage": "go test -coverprofile=coverage.out ./...",
+        "lint": "golangci-lint run"
+      }
+    }
+  },
+  "stages": {
+    "strategic-review": {
+      "id": "S0",
+      "name": "Strategic Review",
+      "description": "Multi-perspective strategic review before implementation",
+      "agents": [
+        {
+          "type": "Product Manager",
+          "role": "primary",
+          "model": "opus",
+          "prompt_file": "prompts/stages/S0-strategic-review.md",
+          "prompt_template": "Review the feature request from business, engineering, and design perspectives. Feature: {{feature_description}}\n\nOutput to: {{output_path}}/strategic-review.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "feature_description"
+        ],
+        "optional": []
+      },
+      "output_schema": "schemas/strategic-review-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S0-strategic-review",
+      "dependencies": [],
+      "gate": {
+        "type": "human-required",
+        "checks": [
+          "scope_approved",
+          "risks_addressed",
+          "design_scored"
+        ],
+        "pass_threshold": 3,
+        "notification": "Strategic review complete. Review the scope decision, risk matrix, and Go/No-Go recommendation before proceeding."
+      },
+      "estimated_tokens": {
+        "input": 5000,
+        "output": 10000,
+        "total": 15000
+      },
+      "max_retries": 1
+    },
+    "requirements": {
+      "id": "S1",
+      "name": "Requirements Analysis",
+      "description": "Generate PRD from feature request",
+      "agents": [
+        {
+          "type": "Product Manager",
+          "role": "primary",
+          "model": "opus",
+          "prompt_file": "prompts/stages/S1-requirements.md",
+          "prompt_template": "Analyze the feature request and produce a PRD following the StageOutput schema. Feature: {{feature_description}}\n\nContext files:\n{{context_files}}\n\nOutput to: {{output_path}}/requirements.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "feature_description"
+        ],
+        "optional": [
+          "existing_prd",
+          "user_stories"
+        ]
+      },
+      "output_schema": "schemas/requirements-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S1-requirements",
+      "dependencies": ["strategic-review"],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "prd_has_functional_requirements",
+          "prd_has_non_functional_requirements",
+          "prd_has_user_stories",
+          "prd_has_acceptance_criteria"
+        ],
+        "pass_threshold": 4
+      },
+      "estimated_tokens": {
+        "input": 5000,
+        "output": 15000,
+        "total": 20000
+      },
+      "max_retries": 3
+    },
+    "architecture": {
+      "id": "S2",
+      "name": "Architecture Design",
+      "description": "Design system architecture based on PRD",
+      "agents": [
+        {
+          "type": "Software Architect",
+          "role": "primary",
+          "model": "opus",
+          "prompt_file": "prompts/stages/S2-architecture.md",
+          "prompt_template": "Design architecture for the feature described in the PRD.\n\nPRD: {{S1_output}}\n\nProject context:\n- Java Maven multi-module\n- Dubbo RPC + RocketMQ + Redis\n- Existing modules: {{module_list}}\n\nOutput to: {{output_path}}/architecture.json"
+        },
+        {
+          "type": "Database Optimizer",
+          "role": "secondary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S2b-database.md",
+          "prompt_template": "Design database schema changes for:\n\nPRD: {{S1_output}}\n\nExisting tables: {{table_list}}\n\nOutput to: {{output_path}}/database-design.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S1_output"
+        ],
+        "optional": [
+          "existing_architecture_docs"
+        ]
+      },
+      "output_schema": "schemas/architecture-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S2-architecture",
+      "dependencies": [
+        "requirements"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "covers_all_prd_nfrs",
+          "identifies_affected_modules",
+          "has_api_contracts",
+          "has_data_model",
+          "no_breaking_changes_unaddressed"
+        ],
+        "pass_threshold": 4
+      },
+      "estimated_tokens": {
+        "input": 30000,
+        "output": 20000,
+        "total": 50000
+      },
+      "max_retries": 3
+    },
+    "ui-design": {
+      "id": "S2b",
+      "name": "UI Design",
+      "description": "Design comprehensive UI based on PRD and Architecture",
+      "timeout_seconds": 600,
+      "agents": [
+        {
+          "type": "UI Designer",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S2b-ui-design.md",
+          "prompt_template": "Design the complete UI for this feature.\n\nPRD: {{S1_output}}\nArchitecture: {{S2_output}}\n\nOutput to: {{output_path}}/ui-design.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S1_output",
+          "S2_output"
+        ],
+        "optional": [
+          "design_mockups"
+        ]
+      },
+      "output_schema": "schemas/ui-design-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S2b-ui-design",
+      "dependencies": [
+        "architecture"
+      ],
+      "gate": {
+        "type": "human-required",
+        "checks": [
+          "navigation_structure_defined",
+          "page_inventory_complete",
+          "wireframes_described",
+          "component_reuse_planned"
+        ],
+        "pass_threshold": 4,
+        "notification": "UI Design complete. Review navigation, page inventory, wireframes, and component plan before proceeding."
+      },
+      "estimated_tokens": {
+        "input": 40000,
+        "output": 25000,
+        "total": 65000
+      },
+      "max_retries": 2
+    },
+    "backend": {
+      "id": "S3",
+      "name": "Backend Development",
+      "description": "Implement backend code based on architecture",
+      "timeout_seconds": 1800,
+      "agents": [
+        {
+          "type": "Senior Developer",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S3-backend.md",
+          "prompt_template": "Implement the backend code for this feature.\n\nArchitecture: {{S2_output}}\nPRD: {{S1_output}}\n\nQuality Lessons:\n{{quality_lessons}}\n\nRules:\n- Follow existing code patterns\n- Immutable objects only\n- Handle all errors explicitly\n- Max 800 lines per file\n- Every CRUD must include: list, create, update, delete, getById, export(CSV)\n- Seed data: ≥5 rows per table, cover all status values\n- Dashboard: real aggregation queries, no hardcoded demo data\n- AOP aspects must handle nullable fields\n\nOutput to: {{output_path}}/implementation.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S1_output",
+          "S2_output"
+        ],
+        "optional": [
+          "code_summary"
+        ]
+      },
+      "output_schema": "schemas/backend-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S3-backend",
+      "dependencies": [
+        "architecture"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "compile_passes",
+          "no_new_warnings",
+          "files_under_800_lines"
+        ],
+        "pass_threshold": 3
+      },
+      "estimated_tokens": {
+        "input": 80000,
+        "output": 40000,
+        "total": 120000
+      },
+      "post_commands": ["{{compile}}", "{{lint}}"],
+      "max_retries": 3,
+      "context_strategy": {
+        "use_code_summary": true,
+        "max_source_files": 20,
+        "summary_includes": [
+          "module_structure",
+          "key_interfaces",
+          "dependency_graph"
+        ]
+      }
+    },
+    "frontend": {
+      "id": "S3b",
+      "name": "Frontend Development",
+      "description": "Implement frontend UI based on architecture and UI design",
+      "timeout_seconds": 1800,
+      "agents": [
+        {
+          "type": "Frontend Developer",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S3b-frontend.md",
+          "prompt_template": "Implement the frontend UI for this feature.\n\nArchitecture: {{S2_output}}\nPRD: {{S1_output}}\nUI Design: {{S2b_output}}\n\nBackend APIs (SOURCE OF TRUTH — copy endpoint URLs, field names, param names exactly):\n{{S3_output}}\n\nQuality Lessons:\n{{quality_lessons}}\n\nRules:\n- Use Vant components where possible\n- Responsive design\n- Proper error handling and loading states\n- Max 800 lines per file\n- ZERO empty function bodies — every button must have real implementation\n- API paths and field names MUST match backend Controller code exactly\n- If backend has no endpoint for an action, do NOT render the button\n\nOutput to: {{output_path}}/implementation.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S1_output",
+          "S2_output",
+          "S3_output"
+        ],
+        "optional": [
+          "S2b_output",
+          "design_mockups"
+        ]
+      },
+      "output_schema": "schemas/frontend-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S3b-frontend",
+      "dependencies": [
+        "architecture",
+        "ui-design",
+        "backend"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "build_passes",
+          "no_lint_errors",
+          "files_under_800_lines"
+        ],
+        "pass_threshold": 2
+      },
+      "estimated_tokens": {
+        "input": 60000,
+        "output": 30000,
+        "total": 90000
+      },
+      "post_commands": ["{{compile}}", "{{lint}}"],
+      "max_retries": 3
+    },
+    "testing": {
+      "id": "S4",
+      "name": "Unit Testing",
+      "description": "Write and run unit tests for the implementation",
+      "agents": [
+        {
+          "type": "tdd-guide",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S4-unit-testing.md",
+          "prompt_template": "Write comprehensive unit tests for the implementation.\n\nPRD acceptance criteria: {{S1_output}}\nArchitecture: {{S2_output}}\nImplementation: {{S3_output}}\n\nRequirements:\n- Unit tests for all new methods\n- 80%+ coverage target\n- Test edge cases and error paths\n\nOutput to: {{output_path}}/testing.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S1_output",
+          "S2_output",
+          "S3_output"
+        ],
+        "optional": []
+      },
+      "output_schema": "schemas/testing-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S4-testing",
+      "dependencies": [
+        "backend"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "all_tests_pass",
+          "coverage_above_80",
+          "no_skipped_tests"
+        ],
+        "pass_threshold": 2
+      },
+      "estimated_tokens": {
+        "input": 60000,
+        "output": 30000,
+        "total": 90000
+      },
+      "post_commands": ["{{test}}"],
+      "max_retries": 3
+    },
+    "integration-testing": {
+      "id": "S4b",
+      "name": "Integration Testing",
+      "description": "Write and run integration tests for API endpoints and services",
+      "agents": [
+        {
+          "type": "tdd-guide",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S4b-integration-testing.md",
+          "prompt_template": "Write integration tests for the backend services.\n\nArchitecture: {{S2_output}}\nImplementation: {{S3_output}}\nUnit test results: {{S4_output}}\n\nRequirements:\n- Test API endpoint request/response\n- Test Dubbo service interactions\n- Test database operations with real DB\n- Test MQ message handling\n\nOutput to: {{output_path}}/integration-testing.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S2_output",
+          "S3_output"
+        ],
+        "optional": [
+          "S4_output"
+        ]
+      },
+      "output_schema": "schemas/integration-test-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S4b-integration-testing",
+      "dependencies": [
+        "backend"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "all_integration_tests_pass",
+          "api_tests_complete"
+        ],
+        "pass_threshold": 2
+      },
+      "estimated_tokens": {
+        "input": 50000,
+        "output": 25000,
+        "total": 75000
+      },
+      "post_commands": ["{{test}}"],
+      "max_retries": 3
+    },
+    "e2e-testing": {
+      "id": "S4c",
+      "name": "E2E Testing",
+      "description": "Write and run end-to-end tests for critical user flows",
+      "agents": [
+        {
+          "type": "e2e-runner",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S4c-e2e-testing.md",
+          "prompt_template": "Write E2E tests for critical user journeys.\n\nPRD user stories: {{S1_output}}\nFrontend: {{S3b_output}}\nBackend APIs: {{S3_output}}\n\nRequirements:\n- Cover all critical user flows from PRD\n- Use Playwright for browser automation\n- Screenshot on failure\n- Test responsive layouts\n\nOutput to: {{output_path}}/e2e-testing.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S1_output",
+          "S3_output"
+        ],
+        "optional": [
+          "S3b_output"
+        ]
+      },
+      "output_schema": "schemas/e2e-test-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S4c-e2e-testing",
+      "dependencies": [
+        "backend",
+        "frontend"
+      ],
+      "gate": {
+        "type": "auto+ai-review",
+        "commands": ["npx playwright test --reporter=json"],
+        "checks": [
+          "all_e2e_tests_pass",
+          "critical_journeys_covered"
+        ],
+        "pass_threshold": 2
+      },
+      "estimated_tokens": {
+        "input": 40000,
+        "output": 20000,
+        "total": 60000
+      },
+      "post_commands": ["{{test}}"],
+      "max_retries": 3
+    },
+    "smoke-test": {
+      "id": "S4d",
+      "name": "Integration Smoke Test",
+      "description": "Start the application, login, and verify every API endpoint returns 200 with data",
+      "agents": [
+        {
+          "type": "general-purpose",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_template": "Run the smoke test script to verify the application starts and all API endpoints work.\n\n1. Execute: bash scripts/smoke-test.sh {{project_dir}}\n2. If any endpoint fails, analyze the error and fix it\n3. Re-run until all endpoints pass\n4. Report results\n\nOutput to: {{output_path}}/smoke-test.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S3_output",
+          "S3b_output"
+        ],
+        "optional": []
+      },
+      "output_schema": "schemas/smoke-test-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S4d-smoke-test",
+      "dependencies": [
+        "backend",
+        "frontend"
+      ],
+      "gate": {
+        "type": "auto",
+        "commands": ["bash scripts/smoke-test.sh {{project_dir}}"],
+        "checks": [
+          "all_endpoints_200",
+          "no_empty_responses",
+          "login_works"
+        ],
+        "pass_threshold": 3
+      },
+      "estimated_tokens": {
+        "input": 10000,
+        "output": 5000,
+        "total": 15000
+      },
+      "post_commands": [],
+      "max_retries": 3
+    },
+    "review": {
+      "id": "S5",
+      "name": "Code Review",
+      "description": "Automated code review and security scan",
+      "agents": [
+        {
+          "type": "code-reviewer",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S5-code-review.md",
+          "prompt_template": "Review all code changes for this feature.\n\nChanged files:\n{{S3_output.files_changed}}\n{{S3b_output.files_changed}}\n\nQuality Lessons:\n{{quality_lessons}}\n\nCheck for:\n- Code quality (naming, structure, complexity)\n- Security vulnerabilities (OWASP Top 10)\n- Performance issues\n- Immutability violations\n- COMPLETENESS: zero empty function bodies, all buttons have real handlers\n- CONTRACT: frontend field names match backend Entity fields exactly\n- SEED DATA: every table has ≥5 rows, covers all status values\n- EXPORT: every list page has backend CSV export + frontend download button\n\nClassify issues as: A-Contract, B-Stub, C-Data, D-Integration\n\nOutput to: {{output_path}}/review.json"
+        },
+        {
+          "type": "security-reviewer",
+          "role": "secondary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S5b-security-review.md",
+          "prompt_template": "Security audit of all code changes.\n\nChanged files: {{S3_output.files_changed}}\n\nCheck: hardcoded secrets, SQL injection, XSS, CSRF, auth bypass, rate limiting\n\nOutput to: {{output_path}}/security-review.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S3_output"
+        ],
+        "optional": [
+          "S4_output",
+          "S3b_output"
+        ]
+      },
+      "output_schema": "schemas/review-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S5-review",
+      "dependencies": [
+        "testing",
+        "integration-testing"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "zero_critical_issues",
+          "zero_high_security_issues",
+          "all_high_issues_addressed"
+        ],
+        "pass_threshold": 3,
+        "adversarial": {
+          "enabled": true,
+          "min_diff_lines": 200,
+          "passes": [
+            {"role": "structural", "model": "haiku", "focus": "correctness and spec compliance"},
+            {"role": "adversarial", "model": "sonnet", "focus": "edge cases, race conditions, failure modes"}
+          ]
+        }
+      },
+      "estimated_tokens": {
+        "input": 50000,
+        "output": 15000,
+        "total": 65000
+      },
+      "max_retries": 2
+    },
+    "deployment": {
+      "id": "S6",
+      "name": "Deployment",
+      "description": "Prepare deployment artifacts and instructions",
+      "agents": [
+        {
+          "type": "DevOps Automator",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S6-deployment.md",
+          "prompt_template": "Prepare deployment for this feature.\n\nArchitecture: {{S2_output}}\nImplementation: {{S3_output}}\nTest results: {{S4_output}}\nReview results: {{S5_output}}\n\nGenerate:\n- Deployment checklist\n- Rollback plan\n- Monitoring alerts to add\n\nOutput to: {{output_path}}/deployment.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S2_output",
+          "S3_output",
+          "S4_output",
+          "S5_output"
+        ],
+        "optional": []
+      },
+      "output_schema": "schemas/deployment-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S6-deployment",
+      "dependencies": [
+        "review"
+      ],
+      "gate": {
+        "type": "human-required",
+        "checks": [
+          "deployment_checklist_complete",
+          "rollback_plan_exists",
+          "human_approval"
+        ],
+        "pass_threshold": 3,
+        "notification": "Pipeline ready for deployment. Review artifacts at {{output_path}}/"
+      },
+      "estimated_tokens": {
+        "input": 20000,
+        "output": 10000,
+        "total": 30000
+      },
+      "max_retries": 2
+    },
+    "monitoring": {
+      "id": "S7",
+      "name": "Monitoring & Observability",
+      "description": "Set up monitoring, alerts, dashboards, and SLOs",
+      "agents": [
+        {
+          "type": "SRE (Site Reliability Engineer)",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S7-monitoring.md",
+          "prompt_template": "Design monitoring and observability for this feature.\n\nArchitecture: {{S2_output}}\nDeployment: {{S6_output}}\n\nGenerate:\n- Alert definitions (critical/warning/info)\n- Dashboard panels with key metrics\n- Structured logging requirements\n- SLO definitions\n\nOutput to: {{output_path}}/monitoring.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S2_output",
+          "S6_output"
+        ],
+        "optional": [
+          "S3_output"
+        ]
+      },
+      "output_schema": "schemas/monitoring-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S7-monitoring",
+      "dependencies": [
+        "deployment"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "has_alerts",
+          "has_dashboards",
+          "has_slos"
+        ],
+        "pass_threshold": 3
+      },
+      "estimated_tokens": {
+        "input": 20000,
+        "output": 15000,
+        "total": 35000
+      },
+      "max_retries": 2
+    },
+    "documentation": {
+      "id": "S8",
+      "name": "Documentation",
+      "description": "Generate API docs, user guide, changelog, and runbook",
+      "agents": [
+        {
+          "type": "Technical Writer",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S8-documentation.md",
+          "prompt_template": "Write comprehensive documentation for this feature.\n\nPRD: {{S1_output}}\nArchitecture: {{S2_output}}\nImplementation: {{S3_output}}\nAPI endpoints: {{S2_output}}\n\nGenerate:\n- API documentation with examples\n- User guide sections\n- Changelog entry\n- Architecture diagram description\n- Operational runbook\n\nOutput to: {{output_path}}/documentation.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S1_output",
+          "S2_output",
+          "S3_output"
+        ],
+        "optional": [
+          "S3b_output"
+        ]
+      },
+      "output_schema": "schemas/documentation-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S8-documentation",
+      "dependencies": [
+        "deployment"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "has_api_docs",
+          "has_user_guide",
+          "has_changelog"
+        ],
+        "pass_threshold": 3
+      },
+      "estimated_tokens": {
+        "input": 30000,
+        "output": 20000,
+        "total": 50000
+      },
+      "max_retries": 2
+    },
+    "performance": {
+      "id": "S9",
+      "name": "Performance Testing",
+      "description": "Run performance benchmarks and load tests",
+      "agents": [
+        {
+          "type": "Performance Benchmarker",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S9-performance.md",
+          "prompt_template": "Design and analyze performance tests for this feature.\n\nArchitecture: {{S2_output}}\nImplementation: {{S3_output}}\nNFRs: {{S1_output}}\n\nGenerate:\n- Benchmark definitions with thresholds\n- Load test configuration\n- Performance recommendations\n- Database query analysis\n\nOutput to: {{output_path}}/performance.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S1_output",
+          "S2_output",
+          "S3_output"
+        ],
+        "optional": [
+          "S4_output"
+        ]
+      },
+      "output_schema": "schemas/performance-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S9-performance",
+      "dependencies": [
+        "review"
+      ],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "benchmarks_defined",
+          "nfr_thresholds_met"
+        ],
+        "pass_threshold": 2
+      },
+      "estimated_tokens": {
+        "input": 30000,
+        "output": 15000,
+        "total": 45000
+      },
+      "max_retries": 2
+    },
+    "release": {
+      "id": "S10",
+      "name": "Release & Rollout",
+      "description": "Final release checklist, rollback plan, and deployment strategy",
+      "agents": [
+        {
+          "type": "DevOps Automator",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S10-release.md",
+          "prompt_template": "Prepare the final release for this feature.\n\nDeployment plan: {{S6_output}}\nMonitoring: {{S7_output}}\nDocumentation: {{S8_output}}\nPerformance: {{S9_output}}\n\nGenerate:\n- Release version\n- Complete checklist\n- Detailed rollback plan\n- Deployment strategy (canary/blue-green/rolling)\n- Stakeholder notifications\n\nOutput to: {{output_path}}/release.json"
+        }
+      ],
+      "inputs": {
+        "required": [
+          "S6_output",
+          "S7_output",
+          "S8_output"
+        ],
+        "optional": [
+          "S9_output"
+        ]
+      },
+      "output_schema": "schemas/release-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S10-release",
+      "dependencies": [
+        "monitoring",
+        "documentation",
+        "performance"
+      ],
+      "gate": {
+        "type": "human-required",
+        "checks": [
+          "release_checklist_complete",
+          "rollback_plan_verified",
+          "stakeholders_notified"
+        ],
+        "pass_threshold": 3,
+        "notification": "Release ready for final approval. Review all artifacts before proceeding."
+      },
+      "estimated_tokens": {
+        "input": 25000,
+        "output": 15000,
+        "total": 40000
+      },
+      "max_retries": 2
+    }
+  },
+  "execution_order": [
+    {
+      "stage": "strategic-review",
+      "mode": "sequential"
+    },
+    {
+      "stage": "requirements",
+      "mode": "sequential"
+    },
+    {
+      "stage": "architecture",
+      "mode": "sequential"
+    },
+    {
+      "stages": ["ui-design"],
+      "mode": "sequential"
+    },
+    {
+      "stage": "backend",
+      "mode": "sequential"
+    },
+    {
+      "stage": "frontend",
+      "mode": "sequential"
+    },
+    {
+      "stages": ["testing", "integration-testing", "e2e-testing"],
+      "mode": "parallel"
+    },
+    {
+      "stage": "smoke-test",
+      "mode": "sequential"
+    },
+    {
+      "stage": "review",
+      "mode": "sequential"
+    },
+    {
+      "stage": "deployment",
+      "mode": "sequential"
+    },
+    {
+      "stages": ["monitoring", "documentation", "performance"],
+      "mode": "parallel"
+    },
+    {
+      "stage": "release",
+      "mode": "sequential"
+    }
+  ],
+  "state_machine": {
+    "states": [
+      "pending",
+      "running",
+      "gate_checking",
+      "passed",
+      "failed",
+      "retrying",
+      "dead_letter",
+      "human_waiting",
+      "paused"
+    ],
+    "transitions": {
+      "pending": [
+        "running"
+      ],
+      "running": [
+        "gate_checking",
+        "failed"
+      ],
+      "gate_checking": [
+        "passed",
+        "failed"
+      ],
+      "passed": [],
+      "failed": [
+        "retrying",
+        "dead_letter"
+      ],
+      "retrying": [
+        "running"
+      ],
+      "dead_letter": [
+        "human_waiting"
+      ],
+      "human_waiting": [
+        "running"
+      ],
+      "paused": [
+        "running"
+      ]
+    }
+  }
+}

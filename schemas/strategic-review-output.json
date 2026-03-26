@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S0 Strategic Review Output",
+  "description": "StageOutput schema for Strategic Review stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "strategic_review"],
+  "properties": {
+    "stage_id": { "const": "S0" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "strategic_review": {
+      "type": "object",
+      "required": ["scope_decision", "risk_matrix", "design_scores", "recommendation"],
+      "properties": {
+        "scope_decision": {
+          "type": "object",
+          "required": ["decision", "rationale"],
+          "properties": {
+            "decision": { "enum": ["expand", "hold", "reduce"] },
+            "rationale": { "type": "string", "minLength": 10 }
+          }
+        },
+        "risk_matrix": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["concern", "risk_level", "impact_level", "mitigation"],
+            "properties": {
+              "concern": { "type": "string" },
+              "risk_level": { "enum": ["low", "medium", "high", "critical"] },
+              "impact_level": { "enum": ["low", "medium", "high", "critical"] },
+              "mitigation": { "type": "string" }
+            }
+          }
+        },
+        "design_scores": {
+          "type": "object",
+          "required": ["ux_impact", "consistency", "accessibility"],
+          "properties": {
+            "ux_impact": { "type": "integer", "minimum": 0, "maximum": 10 },
+            "consistency": { "type": "integer", "minimum": 0, "maximum": 10 },
+            "accessibility": { "type": "integer", "minimum": 0, "maximum": 10 }
+          }
+        },
+        "recommendation": {
+          "type": "object",
+          "required": ["decision", "conditions"],
+          "properties": {
+            "decision": { "enum": ["go", "no-go", "conditional-go"] },
+            "conditions": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "summary": { "type": "string" }
+          }
+        },
+        "engineering_effort": { "enum": ["S", "M", "L", "XL"] },
+        "business_alignment": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$comment": "Maps each stage to which methodology prompt fragments to inject",
+  "S0": ["anti-rationalization", "verification"],
+  "S1": ["anti-rationalization", "verification"],
+  "S2": ["anti-rationalization", "verification"],
+  "S3": ["tdd", "anti-rationalization", "verification"],
+  "S3b": ["tdd", "anti-slop", "anti-rationalization", "verification"],
+  "S4": ["tdd", "verification"],
+  "S4b": ["tdd", "verification"],
+  "S4c": ["tdd", "verification"],
+  "S5": ["code-review", "adversarial-review", "anti-rationalization", "verification"],
+  "S6": ["verification"],
+  "S7": ["anti-rationalization", "verification"],
+  "S8": ["anti-rationalization", "verification"],
+  "S9": ["verification"],
+  "S10": ["verification"]
+}

@@ -1,0 +1,9 @@
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/entity/InspectionRecord.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/service/impl/InspectionServiceImpl.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/service/ReceivingService.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/service/InspectionService.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/dto/ReceivingDto.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/repository/InspectionRecordRepository.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/entity/ReceivingRecord.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/repository/ReceivingRecordRepository.java
+/Applications/soft/CodeSpace/ai-sdlc-claudecode/docs/pipeline/srm-platform/code/srm-platform/srm-receiving/src/main/java/com/srm/receiving/service/impl/ReceivingServiceImpl.java
