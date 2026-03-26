@@ -42,12 +42,15 @@ Arguments:
 Options:
   --tech-stack <S>    Technology stack (default: from DAG config)
                       Options: java-maven, node-typescript, python, golang
+  --project-dir <D>   Target directory for generated code (default: ../<feature_id>)
+                      Pipeline docs stay in docs/pipeline/<feature_id>/
+                      Generated code goes to <project-dir>/
   --force             Overwrite existing feature directory
 
 Examples:
+  $(basename "$0") srm-platform "SRM供应商管理平台" --project-dir /path/to/CodeSpace/srm-platform
   $(basename "$0") ai-media-platform "AI self-media content platform"
   $(basename "$0") health-check "Add /health endpoint" --tech-stack golang
-  $(basename "$0") order-export "Order export batch job" --force
 EOF
     exit 1
 }
@@ -56,11 +59,13 @@ main() {
     local feature_id=""
     local feature_description=""
     local tech_stack=""
+    local project_dir=""
     local force=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --tech-stack) tech_stack="$2"; shift 2 ;;
+            --project-dir) project_dir="$2"; shift 2 ;;
             --force) force=true; shift ;;
             --help|-h) usage ;;
             *)
@@ -76,6 +81,14 @@ main() {
     if [[ -z "$feature_id" || -z "$feature_description" ]]; then
         usage
     fi
+
+    # Default project_dir: sibling directory of ai-sdlc-claudecode
+    if [[ -z "$project_dir" ]]; then
+        project_dir="$(cd "${PROJECT_ROOT}/.." && pwd)/${feature_id}"
+    fi
+    # Resolve to absolute path
+    project_dir="$(cd "$(dirname "$project_dir")" 2>/dev/null && pwd)/$(basename "$project_dir")"
+    export PROJECT_CODE_DIR="$project_dir"
 
     local feature_dir="${PIPELINE_ROOT}/${feature_id}"
 
@@ -94,6 +107,8 @@ main() {
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${CYAN}║  Pipeline Init: ${feature_id}${NC}"
     echo -e "${BOLD}${CYAN}║  Tech Stack: ${tech_stack}${NC}"
+    echo -e "${BOLD}${CYAN}║  Code Output: ${project_dir}${NC}"
+    echo -e "${BOLD}${CYAN}║  Pipeline Docs: ${feature_dir}${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════╝${NC}"
 
     # Validate DAG first
@@ -146,6 +161,7 @@ state = {
     'feature_id': '${feature_id}',
     'feature_description': '${feature_description}',
     'tech_stack': '${tech_stack}',
+    'project_dir': '${project_dir}',
     'pipeline_state': 'initialized',
     'stages': {},
     'cost': {'total_tokens': 0, 'estimated_usd': 0.0},

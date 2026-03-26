@@ -8,6 +8,7 @@
     "context_budget_tokens": 150000,
     "max_files_per_agent_call": 20,
     "pipeline_root": "docs/pipeline",
+    "project_dir": "",
     "log_format": "jsonl",
     "timeout_multiplier": 2.0,
     "max_output_bytes": 102400,

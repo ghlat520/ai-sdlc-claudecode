@@ -1,7 +1,0 @@
-com/srm/web/controller/AuthController.class
-com/srm/web/config/JpaAuditingConfig.class
-com/srm/web/controller/ReceivingController.class
-com/srm/web/controller/PurchaseOrderController.class
-com/srm/web/exception/GlobalExceptionHandler.class
-com/srm/web/SrmApplication.class
-com/srm/web/controller/SupplierController.class

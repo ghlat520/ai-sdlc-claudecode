@@ -2,6 +2,11 @@
 
 Implement the frontend UI for this feature.
 
+## Project Directory (WRITE CODE HERE)
+{{project_dir}}
+
+**CRITICAL**: All generated code files MUST be written to `{{project_dir}}/`, NOT to the pipeline docs directory. The pipeline docs directory (`{{output_path}}`) is only for stage metadata (output.json).
+
 ## Architecture
 {{S2_output}}
 

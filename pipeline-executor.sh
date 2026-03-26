@@ -563,6 +563,7 @@ else:
 prompt = prompt.replace('{{context_files}}', '(see project codebase)')
 prompt = prompt.replace('{{module_list}}', '(auto-detect from pom.xml)')
 prompt = prompt.replace('{{table_list}}', '(auto-detect from existing mappers)')
+prompt = prompt.replace('{{project_dir}}', os.environ.get('PROJECT_CODE_DIR', ''))
 
 # Inject quality lessons from accumulated deployment retrospectives
 quality_lessons_path = os.path.join(os.path.dirname(dag_path), 'prompts', 'quality-lessons.md')
@@ -1383,6 +1384,7 @@ main() {
     local force_restart=false
     local spec_file=""
     local plan_file=""
+    local project_dir=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -1393,6 +1395,7 @@ main() {
             --stages) specific_stages="$2"; shift 2 ;;
             --cost-limit) COST_LIMIT="$2"; shift 2 ;;
             --tech-stack) tech_stack="$2"; shift 2 ;;
+            --project-dir) project_dir="$2"; shift 2 ;;
             --skip-stage) skip_stages="$2"; shift 2 ;;
             --mock-review) mock_review=true; shift ;;
             --skeleton) skeleton_mode=true; mock_review=true; shift ;;
@@ -1417,6 +1420,20 @@ main() {
     if [[ -z "$feature_id" || -z "$feature_description" ]]; then
         usage
     fi
+
+    # Resolve project_dir: CLI arg > state.json > default (sibling of ai-sdlc-claudecode)
+    if [[ -z "$project_dir" ]]; then
+        # Try reading from state.json
+        local state_file="${PIPELINE_ROOT}/${feature_id}/state.json"
+        if [[ -f "$state_file" ]]; then
+            project_dir=$(python3 -c "import json; print(json.load(open('${state_file}')).get('project_dir', ''))" 2>/dev/null || echo "")
+        fi
+    fi
+    if [[ -z "$project_dir" ]]; then
+        project_dir="$(cd "${PROJECT_ROOT}/.." && pwd)/${feature_id}"
+    fi
+    export PROJECT_CODE_DIR="$project_dir"
+    echo -e "${CYAN}Code output directory: ${PROJECT_CODE_DIR}${NC}"
 
     # Validate DAG
     if ! validate_dag; then
