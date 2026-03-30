@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S4e Browser QA Output",
+  "description": "StageOutput schema for exploratory browser QA using gstack browse",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "qa"],
+  "properties": {
+    "stage_id": { "const": "S4e" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed", "skipped"] },
+    "qa": {
+      "type": "object",
+      "required": ["health_score", "summary", "journeys"],
+      "properties": {
+        "health_score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "100 = zero issues, -25/critical, -10/high, -5/medium, -1/low"
+        },
+        "summary": {
+          "type": "object",
+          "required": ["pages_visited", "issues_by_severity"],
+          "properties": {
+            "pages_visited": { "type": "integer" },
+            "issues_by_severity": {
+              "type": "object",
+              "properties": {
+                "critical": { "type": "integer", "default": 0 },
+                "high": { "type": "integer", "default": 0 },
+                "medium": { "type": "integer", "default": 0 },
+                "low": { "type": "integer", "default": 0 }
+              }
+            },
+            "total_issues": { "type": "integer" }
+          }
+        },
+        "journeys": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "steps", "passed"],
+            "properties": {
+              "name": { "type": "string" },
+              "steps": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["action", "result"],
+                  "properties": {
+                    "action": { "type": "string", "description": "browse command executed" },
+                    "result": { "enum": ["pass", "fail", "warning"] },
+                    "screenshot": { "type": "string", "description": "path to screenshot" },
+                    "observation": { "type": "string", "description": "what was observed" }
+                  }
+                }
+              },
+              "passed": { "type": "boolean" }
+            }
+          }
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["severity", "category", "description"],
+            "properties": {
+              "severity": { "enum": ["critical", "high", "medium", "low"] },
+              "category": { "enum": ["visual", "functional", "forms", "console", "network", "performance", "content", "accessibility"] },
+              "description": { "type": "string" },
+              "page_url": { "type": "string" },
+              "screenshot": { "type": "string" },
+              "reproduction_steps": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        },
+        "skip_reason": {
+          "type": "string",
+          "description": "Reason for skipping, if status is skipped"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "retry_count": { "type": "integer" },
+        "browse_binary": { "type": "string" }
+      }
+    }
+  }
+}
