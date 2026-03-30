@@ -42,6 +42,13 @@ Review all code changes for this feature.
 - [ ] **Response structure aligned** — frontend data extraction matches backend response wrapper
 - [ ] **Pagination aligned** — frontend uses same page/size params and reads same total/records fields
 
+### Browser QA Findings (if available)
+{{S4e_output}}
+If browser QA results are available, cross-reference each reported issue with the source code:
+- For each critical/high issue, identify the root cause file and line
+- Verify the issue is reproducible from the code
+- Add to the defect list with classification
+
 ### Defect Classification
 When reporting issues, classify each as:
 - **A-Contract**: Frontend-backend field/param/structure mismatch

@@ -571,6 +571,45 @@
       "post_commands": [],
       "max_retries": 3
     },
+    "browser-qa": {
+      "id": "S4e",
+      "name": "Browser QA (Exploratory)",
+      "description": "AI-driven exploratory browser testing using gstack browse — navigates like a real user to discover issues that scripted tests miss",
+      "timeout_seconds": 900,
+      "agents": [
+        {
+          "type": "Evidence Collector",
+          "role": "primary",
+          "model": "sonnet",
+          "prompt_file": "prompts/stages/S4e-browser-qa.md",
+          "prompt_template": "Explore the running application as a real user.\n\nPRD user stories: {{S1_output}}\nFrontend: {{S3b_output}}\nBackend APIs: {{S3_output}}\nApp URL: {{app_url}}\n\nUse gstack browse CLI ($B) to navigate, click, fill forms, and verify.\nDo NOT write test scripts — explore interactively.\n\nOutput to: {{output_path}}/browser-qa.json"
+        }
+      ],
+      "inputs": {
+        "required": ["S1_output", "S3_output"],
+        "optional": ["S3b_output", "app_url"]
+      },
+      "output_schema": "schemas/browser-qa-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S4e-browser-qa",
+      "dependencies": ["smoke-test"],
+      "gate": {
+        "type": "ai-review",
+        "checks": [
+          "zero_critical_issues",
+          "health_score_above_60"
+        ],
+        "pass_threshold": 2
+      },
+      "estimated_tokens": {
+        "input": 30000,
+        "output": 15000,
+        "total": 45000
+      },
+      "post_commands": [],
+      "max_retries": 1,
+      "optional": true,
+      "skip_condition": "gstack browse binary not found at ~/.claude/skills/gstack/browse/dist/browse"
+    },
     "review": {
       "id": "S5",
       "name": "Code Review",
@@ -597,7 +636,8 @@
         ],
         "optional": [
           "S4_output",
-          "S3b_output"
+          "S3b_output",
+          "S4e_output"
         ]
       },
       "output_schema": "schemas/review-output.json",
@@ -888,6 +928,11 @@
     {
       "stage": "smoke-test",
       "mode": "sequential"
+    },
+    {
+      "stage": "browser-qa",
+      "mode": "sequential",
+      "optional": true
     },
     {
       "stage": "review",
