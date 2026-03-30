@@ -53,6 +53,55 @@
     }
   },
   "stages": {
+    "product-discovery": {
+      "id": "S0p",
+      "name": "Product Discovery",
+      "description": "Transform vague ideas into evaluable feature descriptions via PRFAQ + demand validation",
+      "agents": [
+        {
+          "type": "Product Manager",
+          "role": "primary",
+          "model": "opus",
+          "prompt_file": "prompts/stages/S0p-product-discovery.md",
+          "prompt_template": "Analyze the raw idea and produce a structured feature description.\n\nRaw idea: {{feature_description}}\n\nOutput to: {{output_path}}/product-discovery.json"
+        }
+      ],
+      "inputs": {
+        "required": ["feature_description"],
+        "optional": ["existing_research", "market_data"]
+      },
+      "output_schema": "schemas/product-discovery-output.json",
+      "output_path": "{{pipeline_root}}/{{feature_id}}/S0p-product-discovery",
+      "dependencies": [],
+      "review_passes": [
+        {
+          "role": "demand-critic",
+          "model": "sonnet",
+          "prompt_file": "prompts/reviews/S0p-demand-critic.md"
+        }
+      ],
+      "gate": {
+        "type": "human-required",
+        "checks": [
+          "problem_validated",
+          "demand_evidence_provided",
+          "scope_defined"
+        ],
+        "pass_threshold": 2,
+        "notification": "Product discovery complete. Review problem statement, demand evidence, and scope before strategic review.",
+        "auto_skip": {
+          "enabled": true,
+          "condition": "feature_description has: specific persona + clear problem + measurable criteria + scope boundary",
+          "description": "Auto-skip when feature description is already well-defined (3+ of 4 criteria present)"
+        }
+      },
+      "estimated_tokens": {
+        "input": 5000,
+        "output": 12000,
+        "total": 17000
+      },
+      "max_retries": 1
+    },
     "strategic-review": {
       "id": "S0",
       "name": "Strategic Review",
@@ -74,7 +123,14 @@
       },
       "output_schema": "schemas/strategic-review-output.json",
       "output_path": "{{pipeline_root}}/{{feature_id}}/S0-strategic-review",
-      "dependencies": [],
+      "dependencies": ["product-discovery"],
+      "review_passes": [
+        {
+          "role": "devils-advocate",
+          "model": "sonnet",
+          "prompt_file": "prompts/reviews/S0-devils-advocate.md"
+        }
+      ],
       "gate": {
         "type": "human-required",
         "checks": [
@@ -117,6 +173,13 @@
       "output_schema": "schemas/requirements-output.json",
       "output_path": "{{pipeline_root}}/{{feature_id}}/S1-requirements",
       "dependencies": ["strategic-review"],
+      "review_passes": [
+        {
+          "role": "architect-checker",
+          "model": "sonnet",
+          "prompt_file": "prompts/reviews/S1-architect-checker.md"
+        }
+      ],
       "gate": {
         "type": "ai-review",
         "checks": [
@@ -790,6 +853,10 @@
     }
   },
   "execution_order": [
+    {
+      "stage": "product-discovery",
+      "mode": "sequential"
+    },
     {
       "stage": "strategic-review",
       "mode": "sequential"

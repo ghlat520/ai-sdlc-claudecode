@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "S0 Strategic Review Output",
-  "description": "StageOutput schema for Strategic Review stage",
+  "title": "S0 Strategic Review Output (Enhanced)",
+  "description": "StageOutput schema for Deep Strategic Review with cognitive patterns and anti-sycophancy",
   "type": "object",
   "required": ["stage_id", "feature_id", "timestamp", "status", "strategic_review"],
   "properties": {
@@ -11,14 +11,84 @@
     "status": { "enum": ["complete", "partial", "failed"] },
     "strategic_review": {
       "type": "object",
-      "required": ["scope_decision", "risk_matrix", "design_scores", "recommendation"],
+      "required": ["forcing_questions", "scope_decision", "risk_matrix", "design_scores", "recommendation"],
       "properties": {
+        "forcing_questions": {
+          "type": "object",
+          "description": "Honest answers to the 6 forcing questions",
+          "required": ["demand_reality", "status_quo", "desperate_specificity", "narrowest_wedge", "observation", "future_fit"],
+          "properties": {
+            "demand_reality": {
+              "type": "object",
+              "required": ["answer", "evidence_level"],
+              "properties": {
+                "answer": { "type": "string", "minLength": 20 },
+                "evidence_level": { "enum": ["validated", "partial", "unvalidated", "none"] }
+              }
+            },
+            "status_quo": {
+              "type": "object",
+              "required": ["answer", "workaround_severity"],
+              "properties": {
+                "answer": { "type": "string", "minLength": 20 },
+                "workaround_severity": { "enum": ["intolerable", "painful", "tolerable", "non-issue"] }
+              }
+            },
+            "desperate_specificity": {
+              "type": "object",
+              "required": ["one_sentence", "measurable_outcome"],
+              "properties": {
+                "one_sentence": { "type": "string", "maxLength": 200 },
+                "measurable_outcome": { "type": "string" }
+              }
+            },
+            "narrowest_wedge": {
+              "type": "object",
+              "required": ["description", "can_be_defined"],
+              "properties": {
+                "description": { "type": "string" },
+                "can_be_defined": { "type": "boolean" }
+              }
+            },
+            "observation": {
+              "type": "object",
+              "required": ["metric", "baseline", "target", "timeframe"],
+              "properties": {
+                "metric": { "type": "string" },
+                "baseline": { "type": "string" },
+                "target": { "type": "string" },
+                "timeframe": { "type": "string" }
+              }
+            },
+            "future_fit": {
+              "type": "object",
+              "required": ["enables", "reversal_cost"],
+              "properties": {
+                "enables": { "type": "string" },
+                "prevents": { "type": "string" },
+                "reversal_cost": { "enum": ["trivial", "moderate", "expensive", "irreversible"] }
+              }
+            }
+          }
+        },
         "scope_decision": {
           "type": "object",
-          "required": ["decision", "rationale"],
+          "required": ["mode", "rationale"],
           "properties": {
-            "decision": { "enum": ["expand", "hold", "reduce"] },
-            "rationale": { "type": "string", "minLength": 10 }
+            "mode": { "enum": ["expansion", "selective", "hold", "reduction"] },
+            "rationale": { "type": "string", "minLength": 20 }
+          }
+        },
+        "cognitive_patterns_applied": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["pattern", "finding"],
+            "properties": {
+              "pattern": { "type": "string" },
+              "source": { "type": "string" },
+              "finding": { "type": "string" }
+            }
           }
         },
         "risk_matrix": {
@@ -47,12 +117,29 @@
           "type": "object",
           "required": ["decision", "conditions"],
           "properties": {
-            "decision": { "enum": ["go", "no-go", "conditional-go"] },
+            "decision": { "enum": ["go", "no-go", "conditional-go", "needs-context"] },
             "conditions": {
               "type": "array",
               "items": { "type": "string" }
             },
             "summary": { "type": "string" }
+          }
+        },
+        "anti_sycophancy_flags": {
+          "type": "array",
+          "description": "Uncomfortable truths that must be stated",
+          "items": { "type": "string" }
+        },
+        "scope_ceremony_log": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["item", "decision"],
+            "properties": {
+              "item": { "type": "string" },
+              "decision": { "enum": ["approved", "deferred", "rejected"] },
+              "rationale": { "type": "string" }
+            }
           }
         },
         "engineering_effort": { "enum": ["S", "M", "L", "XL"] },

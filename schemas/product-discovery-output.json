@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S0p Product Discovery Output",
+  "description": "StageOutput schema for Product Discovery stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "discovery"],
+  "properties": {
+    "stage_id": { "const": "S0p" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "skipped", "failed"] },
+    "skipped": {
+      "type": "boolean",
+      "description": "True if auto-skip criteria were met and discovery was bypassed"
+    },
+    "discovery": {
+      "type": "object",
+      "required": ["title", "problem_statement", "demand_evidence", "personas", "narrowest_viable_feature", "scope_boundary"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "problem_statement": { "type": "string", "minLength": 20 },
+        "demand_evidence": {
+          "type": "object",
+          "required": ["level", "data_points"],
+          "properties": {
+            "level": { "enum": ["strong", "medium", "weak", "none"] },
+            "data_points": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "personas": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["role", "goal", "pain"],
+            "properties": {
+              "role": { "type": "string" },
+              "goal": { "type": "string" },
+              "pain": { "type": "string" },
+              "success_looks_like": { "type": "string" },
+              "technical_context": { "type": "string" }
+            }
+          }
+        },
+        "press_release": { "type": "string", "minLength": 50 },
+        "narrowest_viable_feature": {
+          "type": "object",
+          "required": ["persona", "workflow", "success_metric", "validation_method"],
+          "properties": {
+            "persona": { "type": "string" },
+            "workflow": { "type": "string" },
+            "success_metric": { "type": "string" },
+            "validation_method": { "type": "string" }
+          }
+        },
+        "scope_boundary": {
+          "type": "object",
+          "required": ["in_scope", "explicitly_out"],
+          "properties": {
+            "in_scope": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "explicitly_out": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "domain_context": {
+          "type": "object",
+          "properties": {
+            "competitor_approaches": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "compliance_flags": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "technical_constraints": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

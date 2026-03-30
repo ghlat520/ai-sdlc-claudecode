@@ -68,6 +68,13 @@ for name, s in dag['stages'].items():
     print(f'DAG_{safe_name}_deps="{deps}"')
     post_cmds = '|'.join(s.get('post_commands', []))
     print(f'DAG_{safe_name}_post_commands="{post_cmds}"')
+    # Review passes: sequential review agents that critique and revise primary output
+    rp = s.get('review_passes', [])
+    print(f'DAG_{safe_name}_review_pass_count={len(rp)}')
+    for i, rpass in enumerate(rp):
+        print(f'DAG_{safe_name}_rp{i}_role="{rpass.get("role", "reviewer")}"')
+        print(f'DAG_{safe_name}_rp{i}_model="{rpass.get("model", "sonnet")}"')
+        print(f'DAG_{safe_name}_rp{i}_prompt="{rpass.get("prompt_file", "")}"')
 
 # Export tech_stack_commands as TECH_CMD_<key> variables
 ts = cfg.get('tech_stack', 'node-typescript')
@@ -723,6 +730,123 @@ print('Evidence extracted')
     return 0
 }
 
+# --- Review Passes: Sequential multi-agent review loop ---
+# After primary agent generates output.json, run review agents that critique and revise
+# Each review agent gets the primary output + its review prompt, and produces a revised output
+run_review_passes() {
+    local stage_name="$1"
+    local feature_id="$2"
+    local output_dir="$3"
+    local stage_id="$4"
+
+    local safe_name="${stage_name//-/_}"
+    local pass_count_var="DAG_${safe_name}_review_pass_count"
+    local pass_count="${!pass_count_var:-0}"
+
+    [[ "$pass_count" -eq 0 ]] && return 0
+
+    local output_json="${output_dir}/output.json"
+    [[ ! -f "$output_json" ]] && return 0
+
+    echo -e "  ${MAGENTA}Running ${pass_count} review pass(es)...${NC}"
+
+    local i=0
+    while [[ $i -lt $pass_count ]]; do
+        local role_var="DAG_${safe_name}_rp${i}_role"
+        local model_var="DAG_${safe_name}_rp${i}_model"
+        local prompt_var="DAG_${safe_name}_rp${i}_prompt"
+        local rp_role="${!role_var:-reviewer}"
+        local rp_model="${!model_var:-sonnet}"
+        local rp_prompt_file="${!prompt_var:-}"
+
+        echo -e "  ${MAGENTA}  Review pass $((i+1))/${pass_count}: ${rp_role} (${rp_model})${NC}"
+
+        # Build review prompt
+        local review_prompt=""
+
+        # Load review prompt from file
+        if [[ -n "$rp_prompt_file" ]]; then
+            local rp_path="${SCRIPT_DIR}/${rp_prompt_file}"
+            if [[ -f "$rp_path" ]]; then
+                review_prompt=$(cat "$rp_path")
+            fi
+        fi
+
+        # Inject the primary output as context
+        local primary_output
+        primary_output=$(cat "$output_json")
+
+        local full_review_prompt
+        full_review_prompt=$(cat <<REVIEW_EOF
+${review_prompt}
+
+## Primary Agent Output (to review and revise)
+
+\`\`\`json
+${primary_output}
+\`\`\`
+
+## Instructions
+
+1. Review the primary output above through your ${rp_role} lens
+2. Identify specific weaknesses, gaps, or errors
+3. Produce a REVISED version of the JSON that fixes the issues you found
+4. Your revised JSON must conform to the same schema as the original
+5. Add a "review_${rp_role}" field to the top-level JSON documenting what you changed and why
+
+CRITICAL: Output ONLY the revised JSON in a \`\`\`json code block. No other text.
+REVIEW_EOF
+)
+
+        # Execute review agent
+        local review_output
+        local review_exit=0
+
+        if [[ "${PIPELINE_SKELETON_MODE:-false}" == "true" ]]; then
+            echo -e "    ${YELLOW}[SKELETON] Skipping review pass${NC}"
+            ((i++))
+            continue
+        fi
+
+        local rp_timeout=300  # 5 min per review pass
+        if command -v timeout >/dev/null 2>&1; then
+            review_output=$(timeout "${rp_timeout}" claude --print --model "${rp_model}" "$full_review_prompt" 2>&1) || review_exit=$?
+        else
+            review_output=$(perl -e 'alarm shift; exec @ARGV' "${rp_timeout}" claude --print --model "${rp_model}" "$full_review_prompt" 2>&1) || review_exit=$?
+        fi
+
+        if [[ $review_exit -eq 0 ]]; then
+            # Try to extract revised JSON and replace output.json
+            local revised_json="${output_dir}/review-${rp_role}.json"
+            echo "$review_output" | python3 -m ai_sdlc_claudecode extract-json "$revised_json" 2>/dev/null || true
+
+            if [[ -f "$revised_json" ]]; then
+                # Validate the revised JSON has the correct stage_id
+                if python3 -c "import json; d=json.load(open('${revised_json}')); assert d.get('stage_id') == '${stage_id}'" 2>/dev/null; then
+                    cp "$revised_json" "$output_json"
+                    echo -e "    ${GREEN}✓ Review pass ${rp_role}: output revised${NC}"
+                    emit_event "$feature_id" "review_pass" "$stage_id" "Review pass ${rp_role} revised output"
+
+                    # Estimate tokens for cost tracking
+                    local rp_tokens=$(( (${#full_review_prompt} + ${#review_output}) / 4 ))
+                    update_cost "$feature_id" "$rp_tokens" "$rp_model" || true
+                else
+                    echo -e "    ${YELLOW}⚠ Review pass ${rp_role}: revised output invalid, keeping original${NC}"
+                fi
+            else
+                echo -e "    ${YELLOW}⚠ Review pass ${rp_role}: no JSON extracted, keeping original${NC}"
+            fi
+        else
+            echo -e "    ${YELLOW}⚠ Review pass ${rp_role}: agent failed (exit ${review_exit}), keeping original${NC}"
+        fi
+
+        ((i++))
+    done
+
+    echo -e "  ${MAGENTA}Review passes complete${NC}"
+    return 0
+}
+
 # --- Execute a single stage ---
 execute_stage() {
     local stage_name="$1"
@@ -998,6 +1122,10 @@ except Exception:
                 echo "$claude_output" > "${output_dir}/raw_output.txt"
             }
         fi
+
+        # Layer 0.5: Review passes — sequential multi-agent review loop
+        # Review agents critique and revise the primary output before post-commands
+        run_review_passes "$stage_name" "$feature_id" "$output_dir" "$stage_id"
 
         # Layer 1: Post-commands hard gate (compile/test/lint)
         # Skip in skeleton mode — no real code to compile
