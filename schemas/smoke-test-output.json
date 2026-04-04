@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S4d Smoke Test Output",
+  "description": "StageOutput schema for Smoke Test stage",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "status", "smoke_test"],
+  "properties": {
+    "stage_id": { "const": "S4d" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["complete", "partial", "failed"] },
+    "smoke_test": {
+      "type": "object",
+      "required": ["endpoints_tested", "results"],
+      "properties": {
+        "endpoints_tested": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["endpoint", "method", "status"],
+            "properties": {
+              "endpoint": { "type": "string" },
+              "method": { "type": "string" },
+              "status": { "enum": ["pass", "fail", "skip"] },
+              "response_code": { "type": "integer" },
+              "error": { "type": "string" }
+            }
+          }
+        },
+        "results": {
+          "type": "object",
+          "required": ["total", "passed", "failed"],
+          "properties": {
+            "total": { "type": "integer" },
+            "passed": { "type": "integer" },
+            "failed": { "type": "integer" },
+            "duration_seconds": { "type": "number" }
+          }
+        },
+        "app_startup": {
+          "type": "object",
+          "properties": {
+            "started": { "type": "boolean" },
+            "startup_time_seconds": { "type": "number" },
+            "command": { "type": "string" }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "retry_count": { "type": "integer" }
+      }
+    }
+  }
+}

@@ -154,10 +154,27 @@ Respond ONLY with a valid JSON object (no markdown, no explanation outside JSON)
                 S5)  review_focus="code review findings and security audit" ;;
             esac
 
+            # Load PRD (S1 output) as cross-reference baseline
+            local prd_context=""
+            local prd_dir
+            prd_dir="$(dirname "$(dirname "$output_json")")"
+            local prd_file="${prd_dir}/S1-requirements/output.json"
+            if [[ -f "$prd_file" ]]; then
+                prd_context="
+## Requirements Specification (S1 PRD) — Cross-Reference Baseline
+You MUST compare the implementation against this PRD to score requirements_conformance, defect_rate, and completion_deviation.
+\`\`\`json
+$(cat "$prd_file")
+\`\`\`
+"
+            fi
+
             prompt="You are a senior engineer reviewing ${review_focus} output.
+${prd_context}
 
 Evaluate the following output on these dimensions (score each 0-100):
 
+**A. Code Quality Dimensions (implementation quality)**
 1. **correctness** — Does the implementation/test correctly address requirements?
 2. **code_quality** — Clean code, proper naming, small functions, no deep nesting?
 3. **security** — No hardcoded secrets, input validation, OWASP compliance?
@@ -166,6 +183,14 @@ Evaluate the following output on these dimensions (score each 0-100):
 6. **error_handling** — Comprehensive error handling, no swallowed exceptions?
 7. **verification_evidence** — Does the output contain concrete verification evidence (command outputs, test results, coverage numbers)? No evidence = 0.
 8. **methodology_compliance** — Did the agent follow the expected methodology? S3: code + tests written together? S4: TDD red-green-refactor? S5: two-phase review (code quality + security)? No methodology adherence = 0.
+
+**B. Requirements Conformance Dimensions (PRD cross-reference)**
+9. **requirements_conformance** — What percentage of PRD functional requirements are correctly implemented? Count each FR: fully implemented=100, partially=50, missing=0, then average. If no PRD available, score based on stated scope.
+10. **defect_rate** — Inverse of potential defect density: 100 = no potential defects found, 0 = every requirement has a defect. Check: missing validation, wrong business logic, unhandled edge cases, incorrect API contracts vs PRD.
+11. **completion_deviation** — How close is the implementation to the PRD scope? 100 = exact match, deduct for: missing features (-10 each), scope creep/extra features (-5 each), deviating API signatures (-10 each).
+
+**C. Risk & Improvement**
+12. **risk_score** — Overall production risk: 100 = no risk, 0 = critical risk. Consider: data loss scenarios, security vulnerabilities, performance cliffs, single points of failure.
 
 Output:
 \`\`\`json
@@ -184,10 +209,30 @@ Respond ONLY with a valid JSON object (no markdown, no explanation outside JSON)
     \"immutability\": <0-100>,
     \"error_handling\": <0-100>,
     \"verification_evidence\": <0-100>,
-    \"methodology_compliance\": <0-100>
+    \"methodology_compliance\": <0-100>,
+    \"requirements_conformance\": <0-100>,
+    \"defect_rate\": <0-100>,
+    \"completion_deviation\": <0-100>,
+    \"risk_score\": <0-100>
   },
   \"overall_score\": <weighted average>,
   \"passed\": <true if overall >= ${PASS_THRESHOLD}>,
+  \"requirements_detail\": {
+    \"total_frs\": <number of FRs in PRD>,
+    \"implemented\": <number fully implemented>,
+    \"partial\": <number partially implemented>,
+    \"missing\": <number missing>,
+    \"extra\": <number of features not in PRD (scope creep)>
+  },
+  \"defects\": [
+    {\"fr_id\": \"FR-X\", \"description\": \"...\", \"severity\": \"critical|high|medium|low\", \"type\": \"logic|validation|contract|edge_case\"}
+  ],
+  \"risks\": [
+    {\"risk\": \"...\", \"likelihood\": \"high|medium|low\", \"impact\": \"high|medium|low\", \"mitigation\": \"...\"}
+  ],
+  \"improvements\": [
+    {\"priority\": \"P0|P1|P2\", \"area\": \"...\", \"suggestion\": \"...\", \"effort\": \"small|medium|large\"}
+  ],
   \"issues\": [
     {\"severity\": \"critical|high|medium|low\", \"description\": \"...\", \"suggestion\": \"...\"}
   ],
@@ -299,15 +344,77 @@ print(f'\n  {BOLD}AI Review Result: {status_icon}{NC}')
 print(f'  Overall Score: {overall}/100')
 print()
 
-# Scores
-print(f'  {CYAN}Dimension Scores:{NC}')
-for dim, score in data.get('scores', {}).items():
-    bar_len = score // 5
-    bar = '=' * bar_len + '-' * (20 - bar_len)
-    color = GREEN if score >= 70 else (YELLOW if score >= 50 else RED)
-    print(f'    {dim:20s} {color}{score:3d}{NC} [{bar}]')
+# Scores — grouped by category
+code_dims = ['correctness','code_quality','security','performance','immutability','error_handling','verification_evidence','methodology_compliance']
+req_dims = ['requirements_conformance','defect_rate','completion_deviation']
+risk_dims = ['risk_score']
+scores = data.get('scores', {})
 
-# Issues
+def print_scores(title, dims):
+    subset = {k: v for k, v in scores.items() if k in dims}
+    if not subset:
+        return
+    print(f'  {CYAN}{title}:{NC}')
+    for dim, score in subset.items():
+        bar_len = score // 5
+        bar = '=' * bar_len + '-' * (20 - bar_len)
+        color = GREEN if score >= 70 else (YELLOW if score >= 50 else RED)
+        print(f'    {dim:28s} {color}{score:3d}{NC} [{bar}]')
+
+print_scores('A. Code Quality', code_dims)
+print_scores('B. Requirements Conformance', req_dims)
+print_scores('C. Risk Assessment', risk_dims)
+
+# Other dimensions not in known categories
+other_dims = [k for k in scores if k not in code_dims + req_dims + risk_dims]
+if other_dims:
+    print_scores('Other', other_dims)
+
+# Requirements detail
+req_detail = data.get('requirements_detail', {})
+if req_detail and req_detail.get('total_frs', 0) > 0:
+    total = req_detail['total_frs']
+    impl = req_detail.get('implemented', 0)
+    partial = req_detail.get('partial', 0)
+    missing = req_detail.get('missing', 0)
+    extra = req_detail.get('extra', 0)
+    print(f'\n  {CYAN}Requirements Coverage:{NC}')
+    print(f'    Total FRs: {total}  |  Implemented: {GREEN}{impl}{NC}  |  Partial: {YELLOW}{partial}{NC}  |  Missing: {RED}{missing}{NC}  |  Scope creep: {YELLOW}{extra}{NC}')
+    if total > 0:
+        pct = (impl * 100 + partial * 50) // total
+        print(f'    Conformance rate: {pct}%')
+
+# Defects
+defects = data.get('defects', [])
+if defects:
+    print(f'\n  {RED}Defects ({len(defects)}):{NC}')
+    for d in defects:
+        sev = d.get('severity', 'medium')
+        sev_color = RED if sev in ('critical', 'high') else YELLOW
+        print(f'    {sev_color}[{sev.upper()}]{NC} {d.get(\"fr_id\",\"\")} {d[\"description\"]} ({d.get(\"type\",\"\")})')
+
+# Risks
+risks = data.get('risks', [])
+if risks:
+    print(f'\n  {YELLOW}Risks ({len(risks)}):{NC}')
+    for r in risks:
+        lh = r.get('likelihood', '?')
+        imp = r.get('impact', '?')
+        color = RED if imp == 'high' else YELLOW
+        print(f'    {color}[L:{lh}/I:{imp}]{NC} {r[\"risk\"]}')
+        if r.get('mitigation'):
+            print(f'           Mitigation: {r[\"mitigation\"]}')
+
+# Improvements
+improvements = data.get('improvements', [])
+if improvements:
+    print(f'\n  {CYAN}Improvements ({len(improvements)}):{NC}')
+    for imp in improvements:
+        pri = imp.get('priority', 'P2')
+        pri_color = RED if pri == 'P0' else (YELLOW if pri == 'P1' else CYAN)
+        print(f'    {pri_color}[{pri}]{NC} {imp.get(\"area\",\"\")}: {imp[\"suggestion\"]} ({imp.get(\"effort\",\"\")})')
+
+# Issues (legacy format, still supported)
 issues = data.get('issues', [])
 if issues:
     print(f'\n  {YELLOW}Issues ({len(issues)}):{NC}')
@@ -616,7 +723,7 @@ elif stage_id in ('S7', 'S8', 'S9', 'S10'):
     dims = {'completeness': 80, 'correctness': 82, 'actionability': 78, 'risk_coverage': 80}
     rtype = 'ops_quality'
 else:
-    dims = {'correctness': 80, 'code_quality': 82, 'security': 78, 'performance': 80, 'immutability': 85, 'error_handling': 80, 'verification_evidence': 80, 'methodology_compliance': 80}
+    dims = {'correctness': 80, 'code_quality': 82, 'security': 78, 'performance': 80, 'immutability': 85, 'error_handling': 80, 'verification_evidence': 80, 'methodology_compliance': 80, 'requirements_conformance': 82, 'defect_rate': 85, 'completion_deviation': 80, 'risk_score': 78}
     rtype = 'code_quality'
 
 overall = sum(dims.values()) // len(dims)

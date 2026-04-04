@@ -93,6 +93,23 @@
           "enabled": true,
           "condition": "feature_description has: specific persona + clear problem + measurable criteria + scope boundary",
           "description": "Auto-skip when feature description is already well-defined (3+ of 4 criteria present)"
+        },
+        "review_guide": {
+          "why": "产品方向决定后续所有投入，AI 能分析数据但无法替你决定「值不值得做」",
+          "star": {
+            "situation": "AI 已完成竞品分析、需求验证、用户画像，输出了产品发现报告",
+            "task": "判断：这个问题是否真实存在？目标用户是否愿意付费/使用？",
+            "action": "审核以下 checklist",
+            "result": "GO = 进入战略评审 | NO-GO = 终止 pipeline 节省后续成本"
+          },
+          "checklist": [
+            {"item": "问题真实性", "question": "报告中的痛点是否与你的一线认知一致？有无被 AI 放大的伪需求？", "how": "对比你的客户反馈/销售记录"},
+            {"item": "需求证据", "question": "需求证据是强信号(付费意愿/竞品增长)还是弱信号(论坛吐槽)?", "how": "检查 demand_evidence 字段的数据来源"},
+            {"item": "范围边界", "question": "MVP 范围是否足够小？能否 2 周内交付？", "how": "检查 scope 字段，砍掉非核心功能"},
+            {"item": "机会成本", "question": "做这个意味着不做什么？团队当前优先级是否允许？", "how": "你的判断，AI 无法替代"}
+          ],
+          "approve_signal": "问题真实 + 证据充分 + 范围可控 + 优先级匹配",
+          "reject_signal": "伪需求 / 证据不足 / 范围过大 / 有更高优先级"
         }
       },
       "estimated_tokens": {
@@ -139,7 +156,24 @@
           "design_scored"
         ],
         "pass_threshold": 3,
-        "notification": "Strategic review complete. Review the scope decision, risk matrix, and Go/No-Go recommendation before proceeding."
+        "notification": "Strategic review complete. Review the scope decision, risk matrix, and Go/No-Go recommendation before proceeding.",
+        "review_guide": {
+          "why": "GO/NO-GO 是资源投入决策，AI 已量化风险和 ROI，但「投不投」是你的商业判断",
+          "star": {
+            "situation": "AI 已完成风险矩阵、ROI 估算、技术可行性评分，输出了战略评审报告",
+            "task": "判断：风险是否可接受？ROI 是否值得？技术路线是否正确？",
+            "action": "审核以下 checklist",
+            "result": "GO = 进入需求阶段 | NO-GO = 终止 | PIVOT = 调整方向后重跑 S0"
+          },
+          "checklist": [
+            {"item": "风险接受度", "question": "AI 标出的 TOP3 风险，你能承受最坏情况吗？", "how": "检查 risk_matrix，关注 impact=high 的项"},
+            {"item": "ROI 合理性", "question": "AI 估算的 ROI 假设是否过于乐观？", "how": "检查 roi_estimate 的输入假设（用户量/转化率/客单价）"},
+            {"item": "技术路线", "question": "技术选型是否与团队能力匹配？有无过度设计？", "how": "检查 tech_stack 和 architecture_score"},
+            {"item": "竞争窗口", "question": "时间窗口是否紧迫？晚 1 个月会怎样？", "how": "你的市场判断，AI 无法替代"}
+          ],
+          "approve_signal": "风险可控 + ROI 假设合理 + 技术匹配 + 窗口合适",
+          "reject_signal": "致命风险无缓解方案 / ROI 假设虚高 / 技术超出团队能力"
+        }
       },
       "estimated_tokens": {
         "input": 5000,
@@ -257,7 +291,7 @@
         {
           "type": "UI Designer",
           "role": "primary",
-          "model": "sonnet",
+          "model": "opus",
           "prompt_file": "prompts/stages/S2b-ui-design.md",
           "prompt_template": "Design the complete UI for this feature.\n\nPRD: {{S1_output}}\nArchitecture: {{S2_output}}\n\nOutput to: {{output_path}}/ui-design.json"
         }
@@ -277,7 +311,7 @@
         "architecture"
       ],
       "gate": {
-        "type": "human-required",
+        "type": "ai-review",
         "checks": [
           "navigation_structure_defined",
           "page_inventory_complete",
@@ -285,7 +319,15 @@
           "component_reuse_planned"
         ],
         "pass_threshold": 4,
-        "notification": "UI Design complete. Review navigation, page inventory, wireframes, and component plan before proceeding."
+        "decision_log": {
+          "auto_criteria": [
+            "页面数 ≥ PRD 用户故事数",
+            "导航层级 ≤ 3",
+            "组件复用率 ≥ 70%（自定义组件 / 总组件）",
+            "移动端适配描述存在"
+          ],
+          "auto_decision": "全部满足 → PASS，否则重试并修复"
+        }
       },
       "estimated_tokens": {
         "input": 40000,
@@ -306,6 +348,13 @@
           "model": "sonnet",
           "prompt_file": "prompts/stages/S3-backend.md",
           "prompt_template": "Implement the backend code for this feature.\n\nArchitecture: {{S2_output}}\nPRD: {{S1_output}}\n\nQuality Lessons:\n{{quality_lessons}}\n\nRules:\n- Follow existing code patterns\n- Immutable objects only\n- Handle all errors explicitly\n- Max 800 lines per file\n- Every CRUD must include: list, create, update, delete, getById, export(CSV)\n- Seed data: ≥5 rows per table, cover all status values\n- Dashboard: real aggregation queries, no hardcoded demo data\n- AOP aspects must handle nullable fields\n\nOutput to: {{output_path}}/implementation.json"
+        }
+      ],
+      "review_passes": [
+        {
+          "role": "architecture-quality-reviewer",
+          "model": "opus",
+          "prompt_file": "prompts/reviews/S3-architecture-quality.md"
         }
       ],
       "inputs": {
@@ -359,7 +408,14 @@
           "role": "primary",
           "model": "sonnet",
           "prompt_file": "prompts/stages/S3b-frontend.md",
-          "prompt_template": "Implement the frontend UI for this feature.\n\nArchitecture: {{S2_output}}\nPRD: {{S1_output}}\nUI Design: {{S2b_output}}\n\nBackend APIs (SOURCE OF TRUTH — copy endpoint URLs, field names, param names exactly):\n{{S3_output}}\n\nQuality Lessons:\n{{quality_lessons}}\n\nRules:\n- Use Vant components where possible\n- Responsive design\n- Proper error handling and loading states\n- Max 800 lines per file\n- ZERO empty function bodies — every button must have real implementation\n- API paths and field names MUST match backend Controller code exactly\n- If backend has no endpoint for an action, do NOT render the button\n\nOutput to: {{output_path}}/implementation.json"
+          "prompt_template": "Implement the frontend UI for this feature.\n\nArchitecture: {{S2_output}}\nPRD: {{S1_output}}\nUI Design: {{S2b_output}}\n\nBackend APIs (SOURCE OF TRUTH — copy endpoint URLs, field names, param names exactly):\n{{S3_output}}\n\nQuality Lessons:\n{{quality_lessons}}\n\n=== IRON RULE: BACKEND CODE IS THE ONLY SOURCE OF TRUTH ===\nBefore writing ANY frontend code, you MUST:\n1. Extract a complete API contract table from S3_output backend code:\n   | Method | Path | Params (name + type + source: @RequestParam/@RequestBody/@PathVariable) | Response DTO fields |\n2. Every frontend api/*.js function MUST reference this table — copy paths and field names character-for-character\n3. If a param is @RequestParam, use query string. If @RequestBody, use JSON body. If @PathVariable, use path interpolation. NO GUESSING.\n4. If backend has no endpoint for a UI action, do NOT render the button/page — leave a TODO comment instead\n5. Response field bindings in Vue templates MUST match backend DTO/VO field names exactly (case-sensitive)\n6. Include the extracted API contract table in your output as 'api_contract' field for downstream verification\n\nViolating this rule produces 404/400 errors on every mismatched endpoint — this is the #1 cause of pipeline failure.\n=== END IRON RULE ===\n\nRules:\n- Use Vant components where possible\n- Responsive design\n- Proper error handling and loading states\n- Max 800 lines per file\n- ZERO empty function bodies — every button must have real implementation\n\nOutput to: {{output_path}}/implementation.json"
+        }
+      ],
+      "review_passes": [
+        {
+          "role": "frontend-ux-reviewer",
+          "model": "opus",
+          "prompt_file": "prompts/reviews/S3b-ux-quality.md"
         }
       ],
       "inputs": {
@@ -618,9 +674,9 @@
         {
           "type": "code-reviewer",
           "role": "primary",
-          "model": "sonnet",
+          "model": "opus",
           "prompt_file": "prompts/stages/S5-code-review.md",
-          "prompt_template": "Review all code changes for this feature.\n\nChanged files:\n{{S3_output.files_changed}}\n{{S3b_output.files_changed}}\n\nQuality Lessons:\n{{quality_lessons}}\n\nCheck for:\n- Code quality (naming, structure, complexity)\n- Security vulnerabilities (OWASP Top 10)\n- Performance issues\n- Immutability violations\n- COMPLETENESS: zero empty function bodies, all buttons have real handlers\n- CONTRACT: frontend field names match backend Entity fields exactly\n- SEED DATA: every table has ≥5 rows, covers all status values\n- EXPORT: every list page has backend CSV export + frontend download button\n\nClassify issues as: A-Contract, B-Stub, C-Data, D-Integration\n\nOutput to: {{output_path}}/review.json"
+          "prompt_template": "Review all code changes for this feature.\n\nChanged files:\n{{S3_output.files_changed}}\n{{S3b_output.files_changed}}\n\nQuality Lessons:\n{{quality_lessons}}\n\nCheck for:\n- Code quality (naming, structure, complexity)\n- Security vulnerabilities (OWASP Top 10)\n- Performance issues\n- Immutability violations\n- COMPLETENESS: zero empty function bodies, all buttons have real handlers\n- CONTRACT (IRON RULE — #1 failure cause): For EVERY frontend api/*.js call, verify against backend Controller:\n  a) HTTP method matches (@GetMapping vs @PostMapping)\n  b) URL path matches exactly (character-for-character)\n  c) Param binding matches (@RequestParam→query string, @RequestBody→JSON, @PathVariable→path)\n  d) Response field names in Vue templates match backend DTO/VO/Entity fields (case-sensitive)\n  e) If frontend calls an endpoint that doesn't exist in backend, mark as Critical A-Contract\n  Produce a contract_verification table in output\n- SEED DATA: every table has ≥5 rows, covers all status values\n- EXPORT: every list page has backend CSV export + frontend download button\n\nClassify issues as: A-Contract, B-Stub, C-Data, D-Integration\n\nOutput to: {{output_path}}/review.json"
         },
         {
           "type": "security-reviewer",
@@ -678,7 +734,7 @@
         {
           "type": "DevOps Automator",
           "role": "primary",
-          "model": "sonnet",
+          "model": "opus",
           "prompt_file": "prompts/stages/S6-deployment.md",
           "prompt_template": "Prepare deployment for this feature.\n\nArchitecture: {{S2_output}}\nImplementation: {{S3_output}}\nTest results: {{S4_output}}\nReview results: {{S5_output}}\n\nGenerate:\n- Deployment checklist\n- Rollback plan\n- Monitoring alerts to add\n\nOutput to: {{output_path}}/deployment.json"
         }
@@ -698,14 +754,23 @@
         "review"
       ],
       "gate": {
-        "type": "human-required",
+        "type": "ai-review",
         "checks": [
           "deployment_checklist_complete",
           "rollback_plan_exists",
-          "human_approval"
+          "monitoring_alerts_configured"
         ],
         "pass_threshold": 3,
-        "notification": "Pipeline ready for deployment. Review artifacts at {{output_path}}/"
+        "decision_log": {
+          "auto_criteria": [
+            "部署清单覆盖率 = 100%（每个服务/中间件都有部署步骤）",
+            "回滚方案存在且 data_migration_reversible = true",
+            "S5 Critical/High issues 全部 status=fixed",
+            "环境变量清单中 sensitive=true 的项均有配置说明",
+            "监控告警 ≥ 3 条（至少覆盖 health/latency/error_rate）"
+          ],
+          "auto_decision": "全部满足 → PASS 并记录决策依据，任一不满足 → 重试修复"
+        }
       },
       "estimated_tokens": {
         "input": 20000,
@@ -809,7 +874,7 @@
         {
           "type": "Performance Benchmarker",
           "role": "primary",
-          "model": "sonnet",
+          "model": "opus",
           "prompt_file": "prompts/stages/S9-performance.md",
           "prompt_template": "Design and analyze performance tests for this feature.\n\nArchitecture: {{S2_output}}\nImplementation: {{S3_output}}\nNFRs: {{S1_output}}\n\nGenerate:\n- Benchmark definitions with thresholds\n- Load test configuration\n- Performance recommendations\n- Database query analysis\n\nOutput to: {{output_path}}/performance.json"
         }
@@ -852,9 +917,9 @@
         {
           "type": "DevOps Automator",
           "role": "primary",
-          "model": "sonnet",
+          "model": "opus",
           "prompt_file": "prompts/stages/S10-release.md",
-          "prompt_template": "Prepare the final release for this feature.\n\nDeployment plan: {{S6_output}}\nMonitoring: {{S7_output}}\nDocumentation: {{S8_output}}\nPerformance: {{S9_output}}\n\nGenerate:\n- Release version\n- Complete checklist\n- Detailed rollback plan\n- Deployment strategy (canary/blue-green/rolling)\n- Stakeholder notifications\n\nOutput to: {{output_path}}/release.json"
+          "prompt_template": "Prepare the final release decision brief for this feature.\n\nDeployment plan: {{S6_output}}\nMonitoring: {{S7_output}}\nDocumentation: {{S8_output}}\nPerformance: {{S9_output}}\nTest results: {{S4_output}}\nCode review: {{S5_output}}\n\nIMPORTANT: Do NOT generate a manual verification checklist. All verification items (compile, build, smoke test, env scan, etc.) MUST be automated in pipeline stages S3-S9. The human reviewer should NEVER manually run commands.\n\nGenerate:\n1. Evidence summary — auto-collected from S3-S9 outputs (test pass rates, review scores, perf benchmarks, monitoring alerts count). Show GREEN/YELLOW/RED per stage.\n2. Known technical debt — list unresolved issues from S5/S9 with severity, impact, and recommended timeline to fix (v1.1/v1.2/backlog)\n3. Release Notes draft — user-facing changelog with known limitations honestly declared\n4. Rollback plan — trigger conditions + automated steps + estimated time\n5. Deployment strategy — rolling/canary/blue-green with rationale\n6. Stakeholder notifications — pre-drafted messages for dev/ops/business/CEO\n\nThe human reviewer will ONLY decide: (a) release timing, (b) risk acceptance for known debt, (c) Release Notes approval.\n\nOutput to: {{output_path}}/release.json"
         }
       ],
       "inputs": {
@@ -875,14 +940,30 @@
         "performance"
       ],
       "gate": {
-        "type": "human-required",
+        "type": "ai-review",
         "checks": [
           "release_checklist_complete",
           "rollback_plan_verified",
           "stakeholders_notified"
         ],
         "pass_threshold": 3,
-        "notification": "Release ready for final approval. Review all artifacts before proceeding."
+        "decision_log": {
+          "auto_criteria": [
+            "S3-S9 全部 status=passed（无 failed/dead_letter）",
+            "ai-review 评分卡综合分 ≥ 70（加权平均）",
+            "S5 Critical issues 全部 fixed（High 允许 ≤ 2 条标注为 known_limitation）",
+            "S9 性能基准无 Critical 回归（P99 延迟 ≤ 基线 × 1.5）",
+            "回滚方案存在且触发条件明确",
+            "Release Notes 包含已知限制声明"
+          ],
+          "auto_decision": "全部满足 → PASS 并生成发布简报，任一不满足 → 记录阻塞原因并 HOLD",
+          "human_escalation": "仅当 auto_criteria 有 2+ 条不满足时升级人工决策",
+          "post_decision_report": {
+            "format": "决策简报",
+            "sections": ["通过/阻塞的标准项", "已知技术债清单", "Release Notes 摘要", "回滚触发条件"],
+            "deliver_to": "human for critique"
+          }
+        }
       },
       "estimated_tokens": {
         "input": 25000,

@@ -654,7 +654,8 @@ run_post_commands() {
         echo -e "    Running: ${resolved}"
         local cmd_exit=0
         local cmd_result=""
-        cmd_result=$(cd "$PROJECT_ROOT" && eval "$resolved" 2>&1) || cmd_exit=$?
+        local cmd_dir="${PROJECT_CODE_DIR:-$PROJECT_ROOT}"
+        cmd_result=$(cd "$cmd_dir" && eval "$resolved" 2>&1) || cmd_exit=$?
         if [[ $cmd_exit -eq 0 ]]; then
             echo -e "    ${GREEN}✓ Passed${NC}"
         else
@@ -1376,28 +1377,30 @@ print('\n'.join(cmds))
                     echo -e "  ${GREEN}✓ Gate PASSED (human-required, skeleton auto-approved)${NC}"
                     return 0
                 fi
-                # Create approval request file
+                # Create approval request file with quantitative scorecard
                 local approval_file="${output_dir}/APPROVAL_REQUIRED"
-                local notification
-                notification=$(DAG_PATH="$DAG_FILE" STG="$stage_name" python3 -c "
+                local scorecard_script="${SCRIPT_DIR}/lib/review-scorecard.py"
+                local review_content=""
+
+                # Generate quantitative scorecard if script exists
+                if [[ -f "$scorecard_script" ]]; then
+                    review_content=$(python3 "$scorecard_script" "$PIPELINE_ROOT" "$feature_id" "$stage_id" 2>/dev/null) || true
+                fi
+
+                # Fallback to basic notification if scorecard failed
+                if [[ -z "$review_content" ]]; then
+                    review_content=$(DAG_PATH="$DAG_FILE" STG="$stage_name" python3 -c "
 import json, os
 stage = json.load(open(os.environ['DAG_PATH']))['stages'][os.environ['STG']]
 print(stage.get('gate', {}).get('notification', 'Human approval required'))
 " 2>/dev/null)
+                fi
 
                 cat > "$approval_file" <<APPROVAL
-============================================
-HUMAN APPROVAL REQUIRED
-============================================
-Feature:  ${feature_id}
-Stage:    ${stage_id} - ${stage_name}
-Time:     $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-${notification}
+${review_content}
 
 To approve:  rm ${approval_file} && touch ${output_dir}/APPROVED
 To reject:   rm ${approval_file} && touch ${output_dir}/REJECTED
-============================================
 APPROVAL
 
                 emit_event "$feature_id" "human_wait" "$stage_id" "Waiting for human approval"
