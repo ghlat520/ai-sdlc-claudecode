@@ -127,8 +127,9 @@ with open(state_file, 'w') as f:
 " 2>/dev/null
 }
 
-# Update cost tracking
+# Update cost tracking (legacy path — char/4 estimate)
 # Usage: update_cost <feature_id> <tokens_used> <model>
+# Kept for backward compat; prefer update_cost_real when claude returns JSON usage.
 update_cost() {
     local feature_id="$1"
     local tokens_used="$2"
@@ -164,11 +165,73 @@ cost_increment = (tokens_used / 1_000_000) * rate
 
 state['cost']['total_tokens'] = state['cost'].get('total_tokens', 0) + tokens_used
 state['cost']['estimated_usd'] = round(state['cost'].get('estimated_usd', 0.0) + cost_increment, 4)
+state['cost'].setdefault('source', 'estimated')  # mark as heuristic
 
 with open(state_file, 'w') as f:
     json.dump(state, f, indent=2, ensure_ascii=False)
 
-print(f"Tokens: +{tokens_used} | Total: {state['cost']['total_tokens']} | USD: ${state['cost']['estimated_usd']}")
+print(f"Tokens: +{tokens_used} | Total: {state['cost']['total_tokens']} | USD: ${state['cost']['estimated_usd']} (estimated)")
+PYEOF
+}
+
+# Update cost with real usage data from claude --output-format json
+# Usage: update_cost_real <feature_id> <total_cost_usd> <input_tokens> <output_tokens> <cache_read> <cache_creation> [model]
+# Values must be numeric; any omitted are treated as 0.
+update_cost_real() {
+    local feature_id="$1"
+    local cost_usd="$2"
+    local input_tokens="${3:-0}"
+    local output_tokens="${4:-0}"
+    local cache_read="${5:-0}"
+    local cache_creation="${6:-0}"
+    local model="${7:-unknown}"
+    local pipeline_root="${PIPELINE_ROOT:-docs/pipeline}"
+    local state_file="${pipeline_root}/${feature_id}/state.json"
+
+    _UCR_STATE_FILE="$state_file" _UCR_FEATURE_ID="$feature_id" \
+    _UCR_COST="$cost_usd" _UCR_IN="$input_tokens" _UCR_OUT="$output_tokens" \
+    _UCR_CACHE_R="$cache_read" _UCR_CACHE_C="$cache_creation" _UCR_MODEL="$model" \
+    python3 << 'PYEOF' 2>/dev/null
+import json, os
+
+state_file = os.environ['_UCR_STATE_FILE']
+feature_id = os.environ['_UCR_FEATURE_ID']
+cost = float(os.environ.get('_UCR_COST') or 0)
+tin = int(os.environ.get('_UCR_IN') or 0)
+tout = int(os.environ.get('_UCR_OUT') or 0)
+cr = int(os.environ.get('_UCR_CACHE_R') or 0)
+cc = int(os.environ.get('_UCR_CACHE_C') or 0)
+model = os.environ.get('_UCR_MODEL', 'unknown')
+
+if os.path.exists(state_file):
+    with open(state_file) as f:
+        state = json.load(f)
+else:
+    state = {'feature_id': feature_id, 'stages': {}, 'cost': {}}
+
+c = state.setdefault('cost', {})
+total_tokens = tin + tout + cr + cc
+c['total_tokens'] = c.get('total_tokens', 0) + total_tokens
+c['input_tokens'] = c.get('input_tokens', 0) + tin
+c['output_tokens'] = c.get('output_tokens', 0) + tout
+c['cache_read_input_tokens'] = c.get('cache_read_input_tokens', 0) + cr
+c['cache_creation_input_tokens'] = c.get('cache_creation_input_tokens', 0) + cc
+c['actual_usd'] = round(c.get('actual_usd', 0.0) + cost, 6)
+# keep estimated_usd in sync for backward compat
+c['estimated_usd'] = c['actual_usd']
+c['source'] = 'claude_json'
+c.setdefault('by_model', {})
+bm = c['by_model'].setdefault(model, {'usd': 0.0, 'calls': 0, 'input_tokens': 0, 'output_tokens': 0})
+bm['usd'] = round(bm['usd'] + cost, 6)
+bm['calls'] += 1
+bm['input_tokens'] += tin
+bm['output_tokens'] += tout
+
+with open(state_file, 'w') as f:
+    json.dump(state, f, indent=2, ensure_ascii=False)
+
+hit = (cr / max(tin + cr, 1)) * 100
+print(f"Real: +${cost:.6f} | in={tin} out={tout} cache_read={cr} creation={cc} | hit={hit:.1f}% | total=${c['actual_usd']:.4f}")
 PYEOF
 }
 

@@ -1053,21 +1053,94 @@ SKELPYEOF
         else
             echo -e "  ${YELLOW}Invoking Claude (${agent_model}, timeout: ${stage_timeout}s)...${NC}"
 
+            # Use --output-format json when available (claude >=2026-Q1) to get real usage+cost.
+            # Opt-out with AI_SDLC_CLAUDE_JSON=0 for old claude binaries.
+            local use_json="${AI_SDLC_CLAUDE_JSON:-1}"
+            local claude_raw=""
             if command -v timeout >/dev/null 2>&1; then
-                claude_output=$(timeout "${stage_timeout}" claude --print --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
+                if [[ "$use_json" == "1" ]]; then
+                    claude_raw=$(timeout "${stage_timeout}" claude --print --output-format json --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
+                else
+                    claude_raw=$(timeout "${stage_timeout}" claude --print --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
+                fi
                 if [[ $claude_exit -eq 124 ]]; then
                     echo -e "  ${RED}Stage timed out after ${stage_timeout}s${NC}"
                     emit_event "$feature_id" "stage_timeout" "$stage_id" "Timed out after ${stage_timeout}s"
                     set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
                     send_notification "$feature_id" "dead_letter" "Stage ${stage_id} timed out after ${stage_timeout}s"
-                    prev_error_output="TIMEOUT after ${stage_timeout}s. Partial output: ${claude_output: -500}"
+                    prev_error_output="TIMEOUT after ${stage_timeout}s. Partial output: ${claude_raw: -500}"
                     prev_exit_code="124 (timeout)"
                     ((retry_count++))
                     continue
                 fi
             else
                 # macOS may not have timeout; use perl wrapper
-                claude_output=$(perl -e 'alarm shift; exec @ARGV' "${stage_timeout}" claude --print --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
+                if [[ "$use_json" == "1" ]]; then
+                    claude_raw=$(perl -e 'alarm shift; exec @ARGV' "${stage_timeout}" claude --print --output-format json --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
+                else
+                    claude_raw=$(perl -e 'alarm shift; exec @ARGV' "${stage_timeout}" claude --print --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
+                fi
+            fi
+
+            # Parse JSON envelope if enabled; otherwise raw stays as-is.
+            # Fallback chain: try jq → try python3 → treat as plain text.
+            local parsed_cost="" parsed_in="" parsed_out="" parsed_cr="" parsed_cc=""
+            local parsed_ok=0
+            if [[ "$use_json" == "1" && -n "$claude_raw" ]]; then
+                # Try jq first (fast path)
+                if command -v jq >/dev/null 2>&1; then
+                    local jq_result
+                    jq_result=$(echo "$claude_raw" | jq -r '
+                        if (.type == "result" and .result != null) then
+                            [.result,
+                             (.total_cost_usd // 0),
+                             (.usage.input_tokens // 0),
+                             (.usage.output_tokens // 0),
+                             (.usage.cache_read_input_tokens // 0),
+                             (.usage.cache_creation_input_tokens // 0)]
+                            | @tsv
+                        else empty end
+                    ' 2>/dev/null)
+                    if [[ -n "$jq_result" ]]; then
+                        claude_output=$(printf '%s' "$jq_result" | cut -f1)
+                        parsed_cost=$(printf '%s' "$jq_result" | cut -f2)
+                        parsed_in=$(printf '%s' "$jq_result" | cut -f3)
+                        parsed_out=$(printf '%s' "$jq_result" | cut -f4)
+                        parsed_cr=$(printf '%s' "$jq_result" | cut -f5)
+                        parsed_cc=$(printf '%s' "$jq_result" | cut -f6)
+                        parsed_ok=1
+                    fi
+                fi
+                # Python fallback if jq missing or failed (env var carries data; heredoc carries program)
+                if [[ "$parsed_ok" != "1" ]]; then
+                    local py_out
+                    py_out=$(CLAUDE_RAW="$claude_raw" python3 << 'PYEOF' 2>/dev/null || true
+import json, os
+raw = os.environ.get("CLAUDE_RAW", "")
+try:
+    d = json.loads(raw)
+    if d.get("type") == "result" and d.get("result") is not None:
+        u = d.get("usage", {}) or {}
+        print("__AI_SDLC_METRICS__", d.get("total_cost_usd", 0), u.get("input_tokens", 0),
+              u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0),
+              u.get("cache_creation_input_tokens", 0), sep="\t")
+        print(d["result"])
+except Exception:
+    pass
+PYEOF
+)
+                    if [[ "$py_out" == __AI_SDLC_METRICS__* ]]; then
+                        local first_line="${py_out%%$'\n'*}"
+                        local rest="${py_out#*$'\n'}"
+                        IFS=$'\t' read -r _ parsed_cost parsed_in parsed_out parsed_cr parsed_cc <<< "$first_line"
+                        claude_output="$rest"
+                        parsed_ok=1
+                    fi
+                fi
+            fi
+            if [[ "$parsed_ok" != "1" ]]; then
+                # Couldn't parse JSON — treat as plain text (old claude binary or non-JSON error)
+                claude_output="$claude_raw"
             fi
         fi
 
@@ -1075,10 +1148,16 @@ SKELPYEOF
         end_time=$(date +%s)
         local duration=$((end_time - start_time))
 
-        # Estimate tokens (rough: 4 chars per token)
-        local est_tokens=$(( (${#prompt} + ${#claude_output}) / 4 ))
-        update_cost "$feature_id" "$est_tokens" "$agent_model" || true
-        emit_event "$feature_id" "cost_update" "$stage_id" "Tokens: ~${est_tokens}" "{\"tokens\": ${est_tokens}, \"duration\": ${duration}}" || true
+        # Cost tracking: prefer real usage from claude JSON, fallback to char/4 estimate
+        if [[ -n "${parsed_cost:-}" ]]; then
+            update_cost_real "$feature_id" "$parsed_cost" "$parsed_in" "$parsed_out" "$parsed_cr" "$parsed_cc" "$agent_model" || true
+            local total_t=$((${parsed_in:-0} + ${parsed_out:-0} + ${parsed_cr:-0} + ${parsed_cc:-0}))
+            emit_event "$feature_id" "cost_update" "$stage_id" "Real: \$${parsed_cost} (${total_t}t, cache_read=${parsed_cr:-0})" "{\"cost_usd\": ${parsed_cost}, \"input\": ${parsed_in:-0}, \"output\": ${parsed_out:-0}, \"cache_read\": ${parsed_cr:-0}, \"cache_creation\": ${parsed_cc:-0}, \"duration\": ${duration}, \"source\": \"claude_json\"}" || true
+        else
+            local est_tokens=$(( (${#prompt} + ${#claude_output}) / 4 ))
+            update_cost "$feature_id" "$est_tokens" "$agent_model" || true
+            emit_event "$feature_id" "cost_update" "$stage_id" "Est: ~${est_tokens}t" "{\"tokens\": ${est_tokens}, \"duration\": ${duration}, \"source\": \"estimated\"}" || true
+        fi
 
         if [[ $claude_exit -ne 0 ]]; then
             echo -e "  ${RED}Claude invocation failed (exit: ${claude_exit})${NC}"
