@@ -8,16 +8,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
 
 @dataclass(frozen=True)
 class ErrorRecord:
-    """Immutable record of a captured error and its fix pattern."""
+    """Immutable record of a captured error and its fix pattern.
+
+    variants: list of alternative injections for Thompson-Sampling based A/B testing.
+    Each variant: {"id": str, "injection": str, "success": int, "fail": int, "retired": bool}
+    Legacy records without variants synthesize one from fix_pattern on demand.
+    """
 
     error_id: str
     timestamp: str
@@ -30,6 +36,7 @@ class ErrorRecord:
     fix_pattern: dict  # {"type": "prompt_augmentation", "injection": "...", "position": "prepend"}
     applied_count: int = 0
     success_after_apply: int = 0
+    variants: tuple[dict, ...] = field(default_factory=tuple)  # Thompson-Sampling pool
 
 
 # --- Error categories (deterministic, no LLM) ---
@@ -51,6 +58,33 @@ ALL_CATEGORIES = (
 
 MAX_RAW_ERROR_LEN = 2000
 PROMOTE_THRESHOLD = 3
+
+# Variant retirement: a variant with fail-rate above threshold AND sufficient trials
+# is removed from sampling to avoid repeating known-bad fixes.
+RETIRE_FAIL_RATE = 0.70
+RETIRE_MIN_TRIALS = 5
+
+# Exploration epsilon: proportion of time we pick a random non-retired variant
+# (instead of Thompson-sampled argmax) to ensure all variants get tried.
+EPSILON_EXPLORE = 0.10
+
+
+def _make_fix_id(category: str, injection: str) -> str:
+    """Stable 8-char id derived from category+injection (same content = same id)."""
+    return hashlib.sha256(f"{category}::{injection}".encode("utf-8")).hexdigest()[:8]
+
+
+def _new_variant(category: str, injection: str, **extras) -> dict:
+    """Factory for a fresh variant dict with stable id and zeroed counters."""
+    v = {
+        "id": _make_fix_id(category, injection),
+        "injection": injection,
+        "success": 0,
+        "fail": 0,
+        "retired": False,
+    }
+    v.update(extras)
+    return v
 
 
 class ErrorEngine:
@@ -81,6 +115,7 @@ class ErrorEngine:
         """Capture a failure, classify it, extract a fix pattern, and persist."""
         category = self.classify(raw_output, exit_code)
         fix_pattern = self.extract_pattern(category, raw_output, stage_id)
+        variants = self.extract_variants(category, raw_output, stage_id)
         truncated = raw_output[:MAX_RAW_ERROR_LEN] if raw_output else ""
 
         error_id = hashlib.sha256(
@@ -97,6 +132,7 @@ class ErrorEngine:
             category=category,
             raw_error=truncated,
             fix_pattern=fix_pattern,
+            variants=tuple(variants),
         )
 
         self.index.setdefault(stage_id, []).append(record)
@@ -212,6 +248,165 @@ class ErrorEngine:
 
         return base
 
+    def extract_variants(self, category: str, raw_output: str, stage_id: str) -> list[dict]:
+        """Generate 2-3 alternative injection variants per category for A/B testing.
+
+        Variant 0 (conservative) mirrors extract_pattern's wording; variant 1+ are
+        alternative phrasings explored via Thompson Sampling (Beta posterior).
+        Returns list of variant dicts with stable `id` and zeroed success/fail counters.
+        """
+        if category == CATEGORY_SCHEMA:
+            missing = self._extract_missing_fields(raw_output)
+            hint = f" Missing fields detected: {', '.join(missing)}." if missing else ""
+            return [
+                _new_variant(category,
+                    "CRITICAL: Your output MUST be a single valid JSON object. "
+                    "Include ALL required fields from the schema. "
+                    "Do NOT wrap in markdown code blocks. "
+                    f"Do NOT include any text before or after the JSON.{hint}\n\n"),
+                _new_variant(category,
+                    "Schema validation failed. Re-read the JSON schema for this stage. "
+                    "For every `required` field, emit a key-value pair in your output. "
+                    "Double-check types (string vs. number, object vs. array).\n\n"),
+            ]
+
+        if category == CATEGORY_AI_OUTPUT:
+            return [
+                _new_variant(category,
+                    "IMPORTANT: Output ONLY valid JSON. No explanations, no markdown, "
+                    "no code blocks. Start your response with { and end with }. "
+                    "Every string value must be properly escaped.\n\n"),
+                _new_variant(category,
+                    "The previous attempt produced malformed output. "
+                    "Emit ONE JSON object. Ensure every string has matching quotes, "
+                    "every object has matching braces, no trailing commas.\n\n"),
+            ]
+
+        if category == CATEGORY_COMPILATION:
+            snippet = self._extract_error_lines(raw_output, max_lines=5)
+            ctx = f": {snippet}" if snippet else "."
+            return [
+                _new_variant(category,
+                    "IMPORTANT: After generating code, verify it compiles. "
+                    "Run 'mvn clean compile test-compile' mentally before finalizing. "
+                    f"Previous attempt had compilation errors{ctx}. "
+                    "Fix these issues in your output.\n\n"),
+                _new_variant(category,
+                    "Compilation failed. Before emitting any code, trace every import, "
+                    "class reference, and method signature. If unsure whether a symbol "
+                    f"exists, prefer writing it explicitly. Errors{ctx}\n\n"),
+            ]
+
+        if category == CATEGORY_TIMEOUT:
+            return [
+                _new_variant(category,
+                    "IMPORTANT: Keep your response concise and focused. "
+                    "Previous attempt timed out. Reduce output length, "
+                    "avoid unnecessary explanations.\n\n",
+                    model_suggestion="haiku"),
+                _new_variant(category,
+                    "Time budget exceeded. Split the task mentally: emit ONLY the "
+                    "core deliverable in this turn; skip commentary, examples, and "
+                    "alternatives. Prioritize the JSON over prose.\n\n",
+                    model_suggestion="haiku"),
+            ]
+
+        if category == CATEGORY_COST:
+            return [
+                _new_variant(category,
+                    "COST ALERT: Use minimal tokens. Be extremely concise. "
+                    "Output only the required JSON, nothing else.\n\n",
+                    model_suggestion="haiku"),
+                _new_variant(category,
+                    "Token budget is tight. Strip every non-essential word. "
+                    "No preambles, no summaries — only the required JSON object.\n\n",
+                    model_suggestion="haiku"),
+            ]
+
+        if category == CATEGORY_CONTEXT_OVERFLOW:
+            return [
+                _new_variant(category,
+                    "CONTEXT OVERFLOW: Previous attempt exceeded context window. "
+                    "Reduce upstream input by using summary mode. "
+                    "Keep your output concise — only essential JSON fields.\n\n",
+                    context_reduction=True),
+                _new_variant(category,
+                    "Context window is full. Treat this request as a summarization: "
+                    "produce only the distilled JSON result; do not echo input back.\n\n",
+                    context_reduction=True),
+            ]
+
+        return []
+
+    def select_variant(
+        self, stage_id: str, category: Optional[str] = None
+    ) -> Optional[dict]:
+        """Pick the best variant for a stage using Thompson Sampling.
+
+        Strategy:
+          * Aggregate live variants across all records for this stage (by variant id).
+          * With EPSILON_EXPLORE probability: pick uniformly at random (explore).
+          * Otherwise: for each variant, sample theta ~ Beta(success+1, fail+1);
+            return the argmax (exploit + exploration via posterior uncertainty).
+          * Retired variants (fail_rate > 70% and >= 5 trials) are excluded.
+
+        If `category` is provided, restrict to variants for that category.
+        Returns None if no viable variants exist.
+        """
+        pool = self._aggregate_variants(stage_id, category)
+        live = [v for v in pool if not v.get("retired")]
+        if not live:
+            return None
+
+        if random.random() < EPSILON_EXPLORE:
+            return random.choice(live)
+
+        def _sample(v: dict) -> float:
+            return random.betavariate(v.get("success", 0) + 1, v.get("fail", 0) + 1)
+
+        return max(live, key=_sample)
+
+    def _aggregate_variants(
+        self, stage_id: str, category: Optional[str] = None
+    ) -> list[dict]:
+        """Merge variants across all records for a stage, summing success/fail per id.
+
+        Legacy records without variants synthesize a single variant from fix_pattern
+        so the Thompson pool is never empty for stages learned before this upgrade.
+        """
+        agg: dict[str, dict] = {}
+        for rec in self.index.get(stage_id, []):
+            if category and rec.category != category:
+                continue
+            source = list(rec.variants) if rec.variants else [
+                _new_variant(rec.category, rec.fix_pattern.get("injection", ""))
+            ] if rec.fix_pattern.get("injection") else []
+            for v in source:
+                vid = v.get("id") or _make_fix_id(rec.category, v.get("injection", ""))
+                slot = agg.setdefault(vid, {
+                    "id": vid,
+                    "injection": v.get("injection", ""),
+                    "category": rec.category,
+                    "success": 0,
+                    "fail": 0,
+                    "retired": False,
+                })
+                slot["success"] += int(v.get("success", 0))
+                slot["fail"] += int(v.get("fail", 0))
+                if v.get("retired"):
+                    slot["retired"] = True
+                # carry through any hints
+                for k in ("model_suggestion", "context_reduction"):
+                    if v.get(k) is not None and k not in slot:
+                        slot[k] = v[k]
+        # apply retirement rule
+        for v in agg.values():
+            trials = v["success"] + v["fail"]
+            if trials >= RETIRE_MIN_TRIALS and trials > 0:
+                if v["fail"] / trials >= RETIRE_FAIL_RATE:
+                    v["retired"] = True
+        return list(agg.values())
+
     def lookup_fix(self, stage_id: str) -> list[dict]:
         """Return best fixes for a stage, sorted by success rate descending."""
         records = self.index.get(stage_id, [])
@@ -250,16 +445,77 @@ class ErrorEngine:
 
         return "".join(injections) + original_prompt
 
-    def mark_success(self, stage_id: str) -> None:
-        """Increment success counters for applied fixes."""
+    def mark_success(
+        self, stage_id: str, applied_fix_ids: Optional[list[str]] = None
+    ) -> None:
+        """Increment success counters.
+
+        If `applied_fix_ids` is provided, only variants whose id is in the list
+        get success+1 (attribution). Otherwise falls back to legacy behavior:
+        any record with applied_count>0 gets success_after_apply+1.
+        """
         records = self.index.get(stage_id, [])
+        fix_ids_set = set(applied_fix_ids or [])
+
+        new_records: list[ErrorRecord] = []
+        for rec in records:
+            new_variants = self._score_variants(
+                rec.variants or (), fix_ids_set, success=True
+            )
+            # Legacy success counter: bump if either applied_count>0 OR we matched any variant
+            matched = any(
+                (v.get("id") in fix_ids_set) for v in (rec.variants or ())
+            )
+            if applied_fix_ids is None:
+                # Legacy behavior: bump by applied_count presence
+                new_succ = (
+                    rec.success_after_apply + 1 if rec.applied_count > 0
+                    else rec.success_after_apply
+                )
+            else:
+                new_succ = rec.success_after_apply + (1 if matched else 0)
+            new_records.append(
+                replace(rec, success_after_apply=new_succ, variants=new_variants)
+            )
+        self.index[stage_id] = new_records
+        self._persist_all_records(stage_id)
+
+    def mark_failed(
+        self, stage_id: str, applied_fix_ids: Optional[list[str]] = None
+    ) -> None:
+        """Increment fail counters for applied variants (no-op if none provided)."""
+        if not applied_fix_ids:
+            return
+        records = self.index.get(stage_id, [])
+        fix_ids_set = set(applied_fix_ids)
         self.index[stage_id] = [
-            replace(rec, success_after_apply=rec.success_after_apply + 1)
-            if rec.applied_count > 0
-            else rec
+            replace(rec, variants=self._score_variants(
+                rec.variants or (), fix_ids_set, success=False
+            ))
             for rec in records
         ]
         self._persist_all_records(stage_id)
+
+    def _score_variants(
+        self, variants: tuple[dict, ...], fix_ids: set, *, success: bool
+    ) -> tuple[dict, ...]:
+        """Return a new tuple where variants matching fix_ids have success/fail bumped."""
+        out: list[dict] = []
+        for v in variants:
+            if v.get("id") in fix_ids:
+                nv = dict(v)
+                key = "success" if success else "fail"
+                nv[key] = int(nv.get(key, 0)) + 1
+                trials = int(nv.get("success", 0)) + int(nv.get("fail", 0))
+                if (
+                    trials >= RETIRE_MIN_TRIALS
+                    and int(nv.get("fail", 0)) / max(trials, 1) >= RETIRE_FAIL_RATE
+                ):
+                    nv["retired"] = True
+                out.append(nv)
+            else:
+                out.append(dict(v))
+        return tuple(out)
 
     def mark_applied(self, stage_id: str) -> None:
         """Mark that fixes for a stage have been applied (before retry)."""
@@ -287,18 +543,60 @@ class ErrorEngine:
         return promoted
 
     def write_augments(self) -> None:
-        """Write augment files for bash to read: augments/{stage_id}.txt."""
+        """Write augment files for bash to read.
+
+        Writes two formats side-by-side (writer-side backward compat):
+          * augments/{stage_id}.txt  — concatenated injections (legacy consumers)
+          * augments/{stage_id}.json — {"fix_ids": [...], "injection": "...", ...}
+            for attribution-aware consumers (new pipeline-executor path)
+
+        Selection: per category, Thompson-sample one variant; concatenate selected
+        injections across categories. Falls back to lookup_fix for legacy records
+        with no variants.
+        """
         augments_dir = self.errors_dir / "augments"
         augments_dir.mkdir(exist_ok=True)
 
         for stage_id in self.index:
-            fixes = self.lookup_fix(stage_id)
-            injections = [f["injection"] for f in fixes if f.get("injection")]
-            if injections:
-                (augments_dir / f"{stage_id}.txt").write_text(
-                    "".join(injections), encoding="utf-8"
-                )
-                self.mark_applied(stage_id)
+            categories = {rec.category for rec in self.index[stage_id]}
+            chosen: list[dict] = []
+            for cat in categories:
+                v = self.select_variant(stage_id, category=cat)
+                if v and v.get("injection"):
+                    chosen.append(v)
+
+            # Fallback: if no variants (pure-legacy records), use lookup_fix
+            if not chosen:
+                fixes = self.lookup_fix(stage_id)
+                for f in fixes:
+                    if f.get("injection"):
+                        chosen.append({
+                            "id": _make_fix_id("legacy", f["injection"]),
+                            "injection": f["injection"],
+                            "category": "legacy",
+                        })
+
+            if not chosen:
+                continue
+
+            injection_text = "".join(v["injection"] for v in chosen)
+            (augments_dir / f"{stage_id}.txt").write_text(
+                injection_text, encoding="utf-8"
+            )
+            (augments_dir / f"{stage_id}.json").write_text(
+                json.dumps({
+                    "stage_id": stage_id,
+                    "fix_ids": [v["id"] for v in chosen],
+                    "injection": injection_text,
+                    "variants_applied": [
+                        {"id": v["id"], "category": v.get("category", "?")}
+                        for v in chosen
+                    ],
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.mark_applied(stage_id)
 
     def read_failures(self, iteration: int, phase: int, feature_id: str) -> list[ErrorRecord]:
         """Read failure files written by bash and process them."""
@@ -357,16 +655,9 @@ class ErrorEngine:
             iteration=iteration,
             phase=phase,
         )
-        # Write augment immediately so next retry can use it
-        fixes = self.lookup_fix(stage_id)
-        injections = [f["injection"] for f in fixes if f.get("injection")]
-        if injections:
-            augments_dir = self.errors_dir / "augments"
-            augments_dir.mkdir(exist_ok=True)
-            (augments_dir / f"{stage_id}.txt").write_text(
-                "".join(injections), encoding="utf-8"
-            )
-            self.mark_applied(stage_id)
+        # Write augment immediately using Thompson Sampling (+ JSON with fix_ids).
+        # write_augments() handles both legacy .txt and new .json formats.
+        self.write_augments()
         return record
 
     def get_stats(self) -> dict:
@@ -442,6 +733,7 @@ class ErrorEngine:
             "fix_pattern": record.fix_pattern,
             "applied_count": record.applied_count,
             "success_after_apply": record.success_after_apply,
+            "variants": list(record.variants),
         }, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _persist_all_records(self, stage_id: str) -> None:
@@ -467,6 +759,7 @@ class ErrorEngine:
                     fix_pattern=data["fix_pattern"],
                     applied_count=data.get("applied_count", 0),
                     success_after_apply=data.get("success_after_apply", 0),
+                    variants=tuple(data.get("variants", [])),
                 )
                 self.index.setdefault(record.stage_id, []).append(record)
             except (json.JSONDecodeError, KeyError, OSError):

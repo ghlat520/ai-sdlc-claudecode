@@ -918,9 +918,21 @@ execute_stage() {
         local prompt
         prompt=$(build_prompt "$stage_name" "$feature_id" "$feature_description")
 
-        # Augment prompt with learned fixes from ErrorEngine
+        # Augment prompt with learned fixes from ErrorEngine (self-evolution loop).
+        # Prefer augments/{stage}.json (has fix_ids for attribution) over legacy .txt.
         local evolve_dir="${EVOLVE_ERRORS_DIR:-${PIPELINE_ROOT}/${feature_id}/evolve}"
-        if [[ -f "${evolve_dir}/augments/${stage_id}.txt" ]]; then
+        unset PIPELINE_LAST_APPLIED_FIXES  # reset each attempt
+        if [[ -f "${evolve_dir}/augments/${stage_id}.json" ]]; then
+            local augment_json aug_txt aug_ids
+            augment_json="${evolve_dir}/augments/${stage_id}.json"
+            aug_txt=$(python3 -c "import json; d=json.load(open('${augment_json}')); print(d.get('injection',''), end='')" 2>/dev/null || cat "${evolve_dir}/augments/${stage_id}.txt" 2>/dev/null)
+            aug_ids=$(python3 -c "import json; d=json.load(open('${augment_json}')); print(','.join(d.get('fix_ids',[])))" 2>/dev/null || echo "")
+            if [[ -n "$aug_txt" ]]; then
+                prompt="${aug_txt}${prompt}"
+                export PIPELINE_LAST_APPLIED_FIXES="$aug_ids"
+            fi
+        elif [[ -f "${evolve_dir}/augments/${stage_id}.txt" ]]; then
+            # Legacy path (no variant tracking available)
             local augment
             augment=$(cat "${evolve_dir}/augments/${stage_id}.txt")
             prompt="${augment}${prompt}"

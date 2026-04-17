@@ -194,3 +194,106 @@ class TestPersistAndReload:
         # Create new engine pointing to same dir
         engine2 = ErrorEngine(engine.errors_dir)
         assert len(engine2.index.get("S3", [])) == 1
+
+    def test_reload_preserves_variants(self, engine: ErrorEngine) -> None:
+        rec = engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        assert len(rec.variants) >= 2
+
+        engine2 = ErrorEngine(engine.errors_dir)
+        records = engine2.index.get("S3", [])
+        assert len(records) == 1
+        assert len(records[0].variants) >= 2
+        ids_before = {v["id"] for v in rec.variants}
+        ids_after = {v["id"] for v in records[0].variants}
+        assert ids_before == ids_after
+
+
+class TestVariantsAndThompsonSampling:
+    """Coverage for the self-evolution loop: variants, selection, attribution."""
+
+    def test_capture_populates_variants(self, engine: ErrorEngine) -> None:
+        rec = engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        assert len(rec.variants) >= 2, "compilation should have multiple variants"
+        for v in rec.variants:
+            assert "id" in v and len(v["id"]) == 8
+            assert "injection" in v and v["injection"]
+            assert v["success"] == 0 and v["fail"] == 0
+            assert not v.get("retired")
+
+    def test_variant_id_is_stable(self, engine: ErrorEngine) -> None:
+        r1 = engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        r2 = engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 1, 1)
+        ids1 = {v["id"] for v in r1.variants}
+        ids2 = {v["id"] for v in r2.variants}
+        assert ids1 == ids2, "same category+injection must yield same fix_id"
+
+    def test_select_variant_returns_one(self, engine: ErrorEngine) -> None:
+        engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        selected = engine.select_variant("S3")
+        assert selected is not None
+        assert "id" in selected and "injection" in selected
+
+    def test_select_variant_empty_stage(self, engine: ErrorEngine) -> None:
+        assert engine.select_variant("S99") is None
+
+    def test_mark_success_with_fix_ids_credits_only_matching(
+        self, engine: ErrorEngine
+    ) -> None:
+        rec = engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        target_id = rec.variants[0]["id"]
+        other_id = rec.variants[1]["id"]
+
+        engine.mark_success("S3", applied_fix_ids=[target_id])
+        updated = engine.index["S3"][0]
+        by_id = {v["id"]: v for v in updated.variants}
+        assert by_id[target_id]["success"] == 1
+        assert by_id[other_id]["success"] == 0
+        assert updated.success_after_apply == 1
+
+    def test_mark_failed_increments_fail_counter(self, engine: ErrorEngine) -> None:
+        rec = engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        vid = rec.variants[0]["id"]
+        engine.mark_failed("S3", applied_fix_ids=[vid])
+        v = {v["id"]: v for v in engine.index["S3"][0].variants}[vid]
+        assert v["fail"] == 1
+        assert not v.get("retired")  # 1 trial, below RETIRE_MIN_TRIALS
+
+    def test_variant_retires_after_high_fail_rate(self, engine: ErrorEngine) -> None:
+        rec = engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        vid = rec.variants[0]["id"]
+        for _ in range(6):
+            engine.mark_failed("S3", applied_fix_ids=[vid])
+        v = {v["id"]: v for v in engine.index["S3"][0].variants}[vid]
+        assert v["retired"] is True, "6 fails >= RETIRE_MIN_TRIALS and fail_rate 100%"
+
+    def test_retired_variant_excluded_from_selection(self, engine: ErrorEngine) -> None:
+        rec = engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        for v in rec.variants:
+            for _ in range(6):
+                engine.mark_failed("S3", applied_fix_ids=[v["id"]])
+        # all variants retired → select_variant returns None
+        assert engine.select_variant("S3") is None
+
+    def test_write_augments_emits_json_with_fix_ids(
+        self, engine: ErrorEngine
+    ) -> None:
+        engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        engine.write_augments()
+        json_file = engine.errors_dir / "augments" / "S3.json"
+        txt_file = engine.errors_dir / "augments" / "S3.txt"
+        assert json_file.exists()
+        assert txt_file.exists()
+        data = json.loads(json_file.read_text())
+        assert data["stage_id"] == "S3"
+        assert len(data["fix_ids"]) >= 1
+        assert all(len(fid) == 8 for fid in data["fix_ids"])
+        assert data["injection"] == txt_file.read_text()
+
+    def test_mark_success_without_fix_ids_preserves_legacy(
+        self, engine: ErrorEngine
+    ) -> None:
+        """Legacy callers (no applied_fix_ids) must still get success+1 after apply."""
+        engine.capture("feat", "S3", "backend", "cannot find symbol", 1, 0, 1)
+        engine.mark_applied("S3")
+        engine.mark_success("S3")
+        assert engine.index["S3"][0].success_after_apply == 1

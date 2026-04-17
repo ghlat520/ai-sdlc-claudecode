@@ -92,6 +92,48 @@ print(state.get('stages', {}).get('${stg_id}', {}).get('status', 'pending'))
 " 2>/dev/null || echo "pending"
 }
 
+# ErrorEngine outcome attribution (optimization 1: self-evolution feedback loop).
+# Credits/discredits the variant fix_ids recorded when augments/{stage}.json was loaded.
+# Called automatically by set_stage_state when status transitions to passed/failed/dead_letter.
+# Usage: _evolve_attribute_outcome <feature_id> <stage_id> <outcome>   (outcome: passed|failed)
+_evolve_attribute_outcome() {
+    local feat_id="$1" stg_id="$2" outcome="$3"
+    local fix_ids="${PIPELINE_LAST_APPLIED_FIXES:-}"
+    # Nothing to attribute if augment wasn't loaded for this stage run
+    [[ -z "$fix_ids" ]] && return 0
+
+    local p_root="${PIPELINE_ROOT:-docs/pipeline}"
+    local evolve_dir="${EVOLVE_ERRORS_DIR:-${p_root}/${feat_id}/evolve}"
+    local pkg_root="${PROJECT_ROOT:-}"
+    [[ -z "$pkg_root" ]] && pkg_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+    _EV_EVOLVE_DIR="$evolve_dir" _EV_STAGE="$stg_id" _EV_FIX_IDS="$fix_ids" \
+    _EV_OUTCOME="$outcome" _EV_PKG_ROOT="$pkg_root" \
+    python3 << 'PYEOF' 2>/dev/null || true
+import json, os, sys
+sys.path.insert(0, os.path.join(os.environ['_EV_PKG_ROOT'], 'src'))
+try:
+    from ai_sdlc_claudecode.engine import ErrorEngine
+except Exception:
+    sys.exit(0)
+
+evolve_dir = os.environ['_EV_EVOLVE_DIR']
+stage_id = os.environ['_EV_STAGE']
+fix_ids = [f for f in os.environ['_EV_FIX_IDS'].split(',') if f]
+outcome = os.environ['_EV_OUTCOME']
+
+from pathlib import Path
+e = ErrorEngine(Path(evolve_dir))
+if outcome == 'passed':
+    e.mark_success(stage_id, applied_fix_ids=fix_ids)
+elif outcome in ('failed', 'dead_letter'):
+    e.mark_failed(stage_id, applied_fix_ids=fix_ids)
+PYEOF
+
+    # Clear so next retry/stage starts fresh (avoids double-attribution)
+    unset PIPELINE_LAST_APPLIED_FIXES
+}
+
 # Update state file
 # Usage: set_stage_state <feature_id> <stage_id> <status> [retry_count]
 set_stage_state() {
@@ -101,6 +143,12 @@ set_stage_state() {
     local retry_cnt="${4:-0}"
     local p_root="${PIPELINE_ROOT:-docs/pipeline}"
     local s_file="${p_root}/${feat_id}/state.json"
+
+    # Self-evolution attribution: credit or discredit the variant we applied
+    case "$stg_status" in
+        passed)       _evolve_attribute_outcome "$feat_id" "$stg_id" "passed" ;;
+        failed|dead_letter) _evolve_attribute_outcome "$feat_id" "$stg_id" "failed" ;;
+    esac
 
     mkdir -p "$(dirname "$s_file")"
 
