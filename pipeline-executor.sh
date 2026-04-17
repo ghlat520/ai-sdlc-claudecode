@@ -918,35 +918,39 @@ execute_stage() {
         local prompt
         prompt=$(build_prompt "$stage_name" "$feature_id" "$feature_description")
 
-        # Augment prompt with learned fixes from ErrorEngine (self-evolution loop).
-        # Prefer augments/{stage}.json (has fix_ids for attribution) over legacy .txt.
+        # --- Prompt layout (optimization 12: prefix-cache friendly) ---
+        # STABLE PREFIX (cacheable across retries): base prompt = methods + template + upstream
+        # VARIABLE SUFFIX (per-retry):              augment + diagnostic
+        # Rationale: Anthropic prompt caching reuses the longest matching prefix across calls.
+        # Prepending variable content invalidates the cache every retry; appending preserves it.
+        # Expected impact: cache_read_input_tokens/input_tokens climbs ~5% → >60% → cost -40%.
+
+        # Collect variable-suffix fragments (applied to prompt tail, not head)
         local evolve_dir="${EVOLVE_ERRORS_DIR:-${PIPELINE_ROOT}/${feature_id}/evolve}"
         unset PIPELINE_LAST_APPLIED_FIXES  # reset each attempt
+
+        local aug_suffix=""
         if [[ -f "${evolve_dir}/augments/${stage_id}.json" ]]; then
             local augment_json aug_txt aug_ids
             augment_json="${evolve_dir}/augments/${stage_id}.json"
             aug_txt=$(python3 -c "import json; d=json.load(open('${augment_json}')); print(d.get('injection',''), end='')" 2>/dev/null || cat "${evolve_dir}/augments/${stage_id}.txt" 2>/dev/null)
             aug_ids=$(python3 -c "import json; d=json.load(open('${augment_json}')); print(','.join(d.get('fix_ids',[])))" 2>/dev/null || echo "")
             if [[ -n "$aug_txt" ]]; then
-                prompt="${aug_txt}${prompt}"
+                aug_suffix="$aug_txt"
                 export PIPELINE_LAST_APPLIED_FIXES="$aug_ids"
             fi
         elif [[ -f "${evolve_dir}/augments/${stage_id}.txt" ]]; then
-            # Legacy path (no variant tracking available)
-            local augment
-            augment=$(cat "${evolve_dir}/augments/${stage_id}.txt")
-            prompt="${augment}${prompt}"
+            aug_suffix=$(cat "${evolve_dir}/augments/${stage_id}.txt")
         fi
 
-        # Diagnostic retry: inject previous failure context (replaces blind retry)
+        local diag_suffix=""
         if [[ $retry_count -gt 0 && -n "$prev_error_output" ]]; then
             local diag_methods_dir="${SCRIPT_DIR}/prompts/methods"
             local diag_fragment=""
             if [[ -f "${diag_methods_dir}/diagnostic-retry.md" ]]; then
                 diag_fragment=$(cat "${diag_methods_dir}/diagnostic-retry.md")
             fi
-            local diag_context
-            diag_context=$(cat <<DIAG_EOF
+            diag_suffix=$(cat <<DIAG_EOF
 
 ## DIAGNOSTIC RETRY CONTEXT (Attempt $((retry_count + 1)))
 
@@ -969,10 +973,22 @@ and apply a targeted fix.
 ${diag_fragment}
 DIAG_EOF
 )
-            prompt="${diag_context}
-
-${prompt}"
             echo -e "  ${YELLOW}  [DIAGNOSTIC] Injected failure context from attempt ${retry_count}${NC}"
+        fi
+
+        # Append variable fragments to tail (STABLE prefix + VARIABLE suffix)
+        if [[ -n "$aug_suffix" ]]; then
+            prompt="${prompt}
+
+---
+## Learned Guidance (based on prior runs)
+${aug_suffix}"
+        fi
+        if [[ -n "$diag_suffix" ]]; then
+            prompt="${prompt}
+
+---
+${diag_suffix}"
         fi
 
         # Set scope lock to stage output directory + feature directory
