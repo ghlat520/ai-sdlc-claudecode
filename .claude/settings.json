@@ -4,6 +4,15 @@
       {
         "matcher": "Edit|Write",
         "command": "bash ${PROJECT_ROOT}/lib/check-scope.sh"
+      },
+      {
+        "matcher": "Edit|Write",
+        "command": "bash ${PROJECT_ROOT}/lib/hooks/post-tool-use.sh"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "bash ${PROJECT_ROOT}/lib/hooks/stop.sh"
       }
     ]
   }

@@ -385,7 +385,7 @@
         "output": 40000,
         "total": 120000
       },
-      "post_commands": ["{{compile}}", "{{lint}}"],
+      "post_commands": ["{{compile}}", "{{lint}}", "bash ${PROJECT_ROOT}/scripts/completeness-check.sh ${PROJECT_CODE_DIR}"],
       "max_retries": 3,
       "context_strategy": {
         "use_code_summary": true,
@@ -450,7 +450,7 @@
         "output": 30000,
         "total": 90000
       },
-      "post_commands": ["{{compile}}", "{{lint}}"],
+      "post_commands": ["{{compile}}", "{{lint}}", "bash ${PROJECT_ROOT}/scripts/completeness-check.sh ${PROJECT_CODE_DIR}"],
       "max_retries": 3
     },
     "testing": {
@@ -493,7 +493,7 @@
         "output": 30000,
         "total": 90000
       },
-      "post_commands": ["{{test}}"],
+      "post_commands": ["{{test}}", "bash ${PROJECT_ROOT}/scripts/completeness-check.sh ${PROJECT_CODE_DIR}"],
       "max_retries": 3
     },
     "integration-testing": {

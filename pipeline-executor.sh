@@ -20,6 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PROJECT_ROOT  # needed by post_commands (e.g., completeness-check)
 DAG_FILE="${SCRIPT_DIR}/pipeline-dag.json"
 VALIDATE_SCRIPT="${SCRIPT_DIR}/validate-handoff.sh"
 
@@ -1464,6 +1465,13 @@ EVOLVE_TIMEOUT
     echo -e "  ${RED}[DEAD LETTER] Stage ${stage_id} failed after ${max_retry} retries${NC}"
 
     send_notification "$feature_id" "dead_letter" "Stage ${stage_id} (${stage_name}) failed after ${max_retry} retries. Manual intervention required."
+
+    # Post-stage-fail hook (non-blocking, records structured dead_letter + optional hermes notify)
+    if [[ -x "${PROJECT_ROOT}/lib/hooks/post-stage-fail.sh" ]]; then
+        bash "${PROJECT_ROOT}/lib/hooks/post-stage-fail.sh" \
+            "$feature_id" "$stage_id" "$retry_count" "max_retries_exceeded" \
+            >/dev/null 2>&1 || true
+    fi
 
     # Write dead letter
     local dead_letter_file="${output_dir}/DEAD_LETTER"
