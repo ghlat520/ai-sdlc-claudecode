@@ -1274,6 +1274,42 @@ except Exception:
             fi
         fi
 
+        # Contract Hard Gate: cross-service contract drift check (S3, S3b)
+        # Catches C1/C2/C3-class bugs (ai-media-platform 2026-03-19): encrypt/decrypt mismatch,
+        # duplicate services with divergent schemas, cross-service message field drift.
+        if [[ "$stage_id" == "S3" || "$stage_id" == "S3b" ]] && [[ "${PIPELINE_SKELETON_MODE:-false}" != "true" ]]; then
+            local contracts_json
+            contracts_json=$(find "${PIPELINE_ROOT:-./pipeline}/${feature_id}" -path "*/S2-*/contracts.json" -type f 2>/dev/null | head -1)
+            local code_root="${PROJECT_CODE_DIR:-$PROJECT_ROOT}"
+            if [[ -n "$contracts_json" && -f "$contracts_json" && -d "$code_root" ]]; then
+                echo -e "  ${YELLOW}Running Contract Hard Gate (cross-service drift check)...${NC}"
+                local contract_report="${output_dir}/contract_violations.json"
+                local contract_exit=0
+                PYTHONPATH="${SCRIPT_DIR}/src" python3 -m ai_sdlc_claudecode.contract_validator \
+                    "$contracts_json" "$code_root" > "$contract_report" 2> "${output_dir}/contract_violations.txt" || contract_exit=$?
+
+                if [[ $contract_exit -eq 0 ]]; then
+                    echo -e "  ${GREEN}✓ Contract Gate PASSED${NC}"
+                    emit_event "$feature_id" "contract_gate_pass" "$stage_id" "Contract validator passed"
+                elif [[ $contract_exit -eq 1 ]]; then
+                    local blocking_count
+                    blocking_count=$(python3 -c "import json; print(json.load(open('$contract_report'))['blocking'])" 2>/dev/null || echo "?")
+                    echo -e "  ${RED}✗ Contract Gate FAILED — $blocking_count blocking violation(s)${NC}"
+                    head -15 "${output_dir}/contract_violations.txt" | sed 's/^/    /' >&2
+                    emit_event "$feature_id" "contract_gate_fail" "$stage_id" "Contract violations: $blocking_count blocking"
+                    prev_error_output="Contract Hard Gate failed with $blocking_count blocking violation(s). See ${contract_report} for the full list. You MUST fix these cross-service contract violations: service names must match contracts.services[]; encrypted fields must be decrypted before external use; cross-service message field names must match contracts.cross_service_messages[].payload_fields exactly; shared models have one owner_service only; no hallucinated npm packages or LLM model IDs."
+                    prev_exit_code="contract_gate_fail"
+                    set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
+                    ((retry_count++))
+                    continue
+                else
+                    echo -e "  ${YELLOW}⚠ Contract Gate: validator error (exit $contract_exit), treating as non-blocking${NC}"
+                fi
+            else
+                echo -e "  ${YELLOW}⚠ Contract Gate: no contracts.json found (S2 skipped? legacy feature?), skipping${NC}"
+            fi
+        fi
+
         # TDD Hard Gate: enforce coverage threshold for testing stages (S4, S4b, S4c)
         if [[ "$stage_id" == "S4" || "$stage_id" == "S4b" || "$stage_id" == "S4c" ]]; then
             local tdd_gate_script="${SCRIPT_DIR}/lib/tdd-gate.sh"

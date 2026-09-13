@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S2 Cross-Service Contracts Output",
+  "description": "Strong contracts emitted by S2 that are the single source of truth for all downstream stages. Consumed by lib/contract_validator.py after S3/S3b to detect cross-service drift (ai-media-platform C1/C2/C3 class of bugs).",
+  "type": "object",
+  "required": ["stage_id", "feature_id", "timestamp", "contracts"],
+  "properties": {
+    "stage_id": { "const": "S2" },
+    "feature_id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "contracts": {
+      "type": "object",
+      "required": ["services", "api_endpoints", "cross_service_messages", "encryption_pairs", "shared_models", "external_refs"],
+      "properties": {
+        "services": {
+          "description": "Authoritative list of services/modules. Prevents duplicate-service bugs (ai-media-platform C2).",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": ["name", "responsibility", "language", "port"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Canonical service name. Code directories must match exactly." },
+              "responsibility": { "type": "string", "minLength": 10 },
+              "language": { "enum": ["node", "python", "java", "go", "typescript"] },
+              "port": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+              "depends_on": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        },
+        "api_endpoints": {
+          "description": "HTTP/RPC endpoints with field-level request/response shapes. Prevents frontend-backend drift.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["service", "method", "path", "request_fields", "response_fields"],
+            "properties": {
+              "service": { "type": "string" },
+              "method": { "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"] },
+              "path": { "type": "string", "pattern": "^/" },
+              "auth_required": { "type": "boolean" },
+              "request_fields": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/field" }
+              },
+              "response_fields": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/field" }
+              }
+            }
+          }
+        },
+        "cross_service_messages": {
+          "description": "Queue/topic messages between services. Prevents field-name drift (ai-media-platform C3: publishTaskId vs taskId).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["queue_name", "producer_service", "consumer_service", "payload_fields"],
+            "properties": {
+              "queue_name": { "type": "string", "pattern": "^[a-z][a-z0-9:_-]*$" },
+              "producer_service": { "type": "string" },
+              "consumer_service": { "type": "string" },
+              "transport": { "enum": ["bullmq", "rocketmq", "kafka", "rabbitmq", "redis-pubsub", "http"] },
+              "payload_fields": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "$ref": "#/$defs/field" }
+              }
+            }
+          }
+        },
+        "encryption_pairs": {
+          "description": "Fields that must be encrypted on write and decrypted on read. Prevents broken encrypt/decrypt chains (ai-media-platform C1).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["field_name", "algorithm", "key_env_var", "encrypt_in_service", "decrypt_in_services"],
+            "properties": {
+              "field_name": { "type": "string", "description": "Exact field name where ciphertext is stored (e.g. credentialsEncrypted)." },
+              "algorithm": { "enum": ["aes-256-gcm", "aes-256-cbc", "rsa-oaep", "chacha20-poly1305"] },
+              "key_env_var": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+              "encrypt_in_service": { "type": "string", "description": "Service that owns write-side encryption." },
+              "decrypt_in_services": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Every service that reads the field MUST decrypt before use. Listed services are checked for decrypt() call presence.",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        },
+        "shared_models": {
+          "description": "Data models shared across services. Prevents duplicate model registrations with divergent schemas (ai-media-platform C2 - mongoose.model('Article') x 2).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["model_name", "owner_service", "fields"],
+            "properties": {
+              "model_name": { "type": "string" },
+              "owner_service": { "type": "string", "description": "The ONLY service allowed to define this model. Other services must import, not redefine." },
+              "storage": { "enum": ["mongodb", "postgres", "mysql", "redis"] },
+              "fields": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "$ref": "#/$defs/field" }
+              }
+            }
+          }
+        },
+        "external_refs": {
+          "description": "External API / model references with pinned versions. Prevents hallucinated model IDs and phantom dependencies (ai-media-platform H1/H3).",
+          "type": "object",
+          "required": ["ai_models", "npm_packages_forbidden"],
+          "properties": {
+            "ai_models": {
+              "type": "array",
+              "description": "Whitelisted LLM model IDs. Code must reference exactly these strings.",
+              "items": {
+                "type": "object",
+                "required": ["provider", "model_id", "used_in_service"],
+                "properties": {
+                  "provider": { "enum": ["anthropic", "openai", "google", "deepseek"] },
+                  "model_id": { "type": "string", "minLength": 5 },
+                  "used_in_service": { "type": "string" }
+                }
+              }
+            },
+            "npm_packages_forbidden": {
+              "type": "array",
+              "description": "Known hallucinated / placeholder / deprecated packages that must not appear in any package.json.",
+              "default": ["crypto", "querystring", "punycode", "util", "assert", "buffer"],
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "agent_model": { "type": "string" },
+        "tokens_used": { "type": "integer" },
+        "duration_seconds": { "type": "number" }
+      }
+    }
+  },
+  "$defs": {
+    "field": {
+      "type": "object",
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$", "description": "Field name. Must match exactly in all consumers (case-sensitive)." },
+        "type": { "enum": ["string", "number", "integer", "boolean", "object", "array", "date", "objectid", "bytes"] },
+        "required": { "type": "boolean", "default": true },
+        "description": { "type": "string" },
+        "encrypted": { "type": "boolean", "default": false, "description": "If true, this field stores ciphertext and must have a matching entry in encryption_pairs." }
+      }
+    }
+  }
+}
