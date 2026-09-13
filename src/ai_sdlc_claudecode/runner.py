@@ -1,18 +1,22 @@
 """Pipeline Runner — Python wrapper around pipeline-executor.sh.
 
 Invokes the bash executor via subprocess, parses results from state.json,
-and handles auto-approval of human gates.
+and reports verified execution scope without granting human approval.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from .state import PipelineState
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,8 @@ class RunResult:
     cost_usd: float
     duration_seconds: float
     all_passed: bool
+    outcome: str = "unverified"
+    run_id: Optional[str] = None
 
 
 class PipelineRunner:
@@ -61,33 +67,58 @@ class PipelineRunner:
             cost_limit=cost_limit,
         )
 
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", feature_id):
+            raise ValueError("invalid feature_id")
+        state = PipelineState(self.pipeline_root / feature_id / "state.json")
+        previous_run = state.read().get("run_id")
         env = os.environ.copy()
+        env["PIPELINE_ROOT"] = str(self.pipeline_root)
         # Always set EVOLVE_ERRORS_DIR — ErrorEngine is default-on
         default_evolve_dir = self.pipeline_root / feature_id / "evolve"
         env["EVOLVE_ERRORS_DIR"] = str(evolve_errors_dir or default_evolve_dir)
 
         start_time = time.time()
 
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=env, cwd=str(self.executor_path.parent.parent), start_new_session=True)
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                env=env,
-                cwd=str(self.executor_path.parent.parent),  # project root
-            )
-            exit_code = result.returncode
-            stdout = result.stdout
-            stderr = result.stderr
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            exit_code = process.returncode
         except subprocess.TimeoutExpired:
+            # Kill the process group, including concurrent stage children.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
             exit_code = 124
-            stdout = ""
-            stderr = f"Pipeline timed out after {timeout_seconds}s"
+            stderr += f"\nPipeline timed out after {timeout_seconds}s"
+
+        except BaseException:
+            # Interrupt/shutdown must not leave an autonomous child running.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+            raise
 
         duration = time.time() - start_time
         stages_passed = self.get_stages_passed(feature_id)
-        total_stages = self._get_total_stages()
+        data = state.read()
+        total_stages = len(data.get("scope", [])) or self._get_total_stages()
+        fresh = bool(data.get("run_id")) and data["run_id"] != previous_run
+        outcome = state.outcome() if fresh else "unverified"
+        if exit_code not in (0, 3, 4):
+            outcome = "failed"
         cost_usd = self._get_cost(feature_id)
 
         return RunResult(
@@ -99,31 +130,23 @@ class PipelineRunner:
             total_stages=total_stages,
             cost_usd=cost_usd,
             duration_seconds=duration,
-            all_passed=(stages_passed >= total_stages and exit_code == 0),
+            all_passed=(fresh and outcome == "complete" and exit_code == 0),
+            outcome=outcome, run_id=data.get("run_id") if fresh else None,
         )
 
     def auto_approve_gates(self, feature_id: str) -> None:
-        """Create APPROVED files for human-required gates."""
-        feature_dir = self.pipeline_root / feature_id
-        if not feature_dir.exists():
-            return
-        for approval_file in feature_dir.rglob("APPROVAL_REQUIRED"):
-            stage_dir = approval_file.parent
-            approval_file.unlink(missing_ok=True)
-            (stage_dir / "APPROVED").write_text(
-                f"Auto-approved at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n",
-                encoding="utf-8",
-            )
+        """Compatibility entrypoint: the runner has no authority to approve human gates."""
+        raise PermissionError("human approval requires a trusted external decision")
 
     def get_stages_passed(self, feature_id: str) -> int:
-        """Count passed stages from state.json."""
-        state_file = self.pipeline_root / feature_id / "state.json"
-        if not state_file.exists():
-            return 0
+        """Count only current verified artifacts within the requested scope."""
+        state = PipelineState(self.pipeline_root / feature_id / "state.json")
         try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-            return sum(1 for s in data.get("stages", {}).values() if s.get("status") == "passed")
-        except (json.JSONDecodeError, OSError):
+            data = state.read()
+            dag = Path(os.environ.get("PIPELINE_DAG_FILE", str(self.executor_path.parent / "pipeline-dag.json")))
+            return sum(state.is_verified(data.get("stages", {}).get(s, {}), dag)
+                       for s in data.get("scope", []))
+        except (ValueError, OSError):
             return 0
 
     def _build_command(
@@ -148,11 +171,11 @@ class PipelineRunner:
     def _get_total_stages(self) -> int:
         dag_file = self.executor_path.parent / "pipeline-dag.json"
         if not dag_file.exists():
-            return 13
+            return 0
         try:
             return len(json.loads(dag_file.read_text(encoding="utf-8")).get("stages", {}))
         except (json.JSONDecodeError, OSError):
-            return 13
+            return 0
 
     def _get_cost(self, feature_id: str) -> float:
         state_file = self.pipeline_root / feature_id / "state.json"

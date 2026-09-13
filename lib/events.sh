@@ -16,7 +16,8 @@ emit_event() {
     local event_type="$2"
     local stage_id="$3"
     local message="$4"
-    local extra="${5:-{}}"
+    local extra="${5:-}"
+    [[ -n "$extra" ]] || extra='{}'
     local pipeline_root="${PIPELINE_ROOT:-docs/pipeline}"
     local event_dir="${pipeline_root}/${feature_id}"
     local event_file="${event_dir}/events.jsonl"
@@ -26,24 +27,16 @@ emit_event() {
     local timestamp
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    local escaped_msg
-    escaped_msg=$(_json_escape "$message")
-
-    local event_line
-    event_line=$(python3 -c "
-import json, sys
-event = {
-    'timestamp': '${timestamp}',
-    'event_type': '${event_type}',
-    'stage_id': '${stage_id}',
-    'feature_id': '${feature_id}',
-    'message': ${escaped_msg},
-    'extra': json.loads(sys.argv[1]) if sys.argv[1] != '{}' else {}
-}
-print(json.dumps(event, ensure_ascii=False))
-" "$extra" 2>/dev/null)
-
-    echo "$event_line" >> "$event_file"
+    python3 - "$event_file" "$timestamp" "$event_type" "$stage_id" "$feature_id" "$message" "$extra" <<'PY_EVENT'
+import fcntl, json, os, sys
+path, timestamp, kind, stage, feature, message, extra = sys.argv[1:]
+with open(path, "a") as out:
+    fcntl.flock(out, fcntl.LOCK_EX)
+    out.write(json.dumps(dict(timestamp=timestamp, event_type=kind, stage_id=stage,
+                             feature_id=feature, message=message, extra=json.loads(extra),
+                             run_id=os.environ.get("PIPELINE_RUN_ID"),
+                             attempt_id=os.environ.get("PIPELINE_ATTEMPT_ID")), ensure_ascii=False)+"\n")
+PY_EVENT
 
     # Also print to stderr for real-time visibility
     case "$event_type" in
@@ -56,7 +49,7 @@ print(json.dumps(event, ensure_ascii=False))
         dead_letter)    echo -e "\033[0;31m[${timestamp}] ☠ ${stage_id}: ${message}\033[0m" >&2 ;;
         cost_update)    echo -e "\033[0;35m[${timestamp}] $ ${message}\033[0m" >&2 ;;
         pipeline_start) echo -e "\033[1;36m[${timestamp}] ═══ Pipeline started: ${feature_id} ═══\033[0m" >&2 ;;
-        pipeline_end)   echo -e "\033[1;32m[${timestamp}] ═══ Pipeline complete: ${feature_id} ═══\033[0m" >&2 ;;
+        pipeline_end)   echo -e "\033[1;32m[${timestamp}] ═══ Pipeline stopped: ${feature_id} ═══\033[0m" >&2 ;;
         pipeline_pause) echo -e "\033[1;33m[${timestamp}] ⏸ Pipeline paused: ${feature_id}\033[0m" >&2 ;;
         pipeline_resume) echo -e "\033[1;36m[${timestamp}] ▶ Pipeline resumed: ${feature_id}\033[0m" >&2 ;;
         human_wait)     echo -e "\033[1;33m[${timestamp}] ⏸ ${stage_id}: Waiting for human approval\033[0m" >&2 ;;
@@ -71,293 +64,42 @@ print(json.dumps(event, ensure_ascii=False))
     esac
 }
 
-# Read state from state file
-# Usage: get_stage_state <feature_id> <stage_id>
+# All state writers use the same locked, atomic Python implementation.
+_pipeline_state() {
+    local command="$1" feature="$2"
+    shift 2
+    local root
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    PYTHONPATH="${root}/src${PYTHONPATH:+:${PYTHONPATH}}" python3 -m ai_sdlc_claudecode.state \
+        "$command" "${PIPELINE_ROOT:-docs/pipeline}/${feature}/state.json" "$@"
+}
+
 get_stage_state() {
-    local feat_id="$1"
-    local stg_id="$2"
-    local p_root="${PIPELINE_ROOT:-docs/pipeline}"
-    local s_file="${p_root}/${feat_id}/state.json"
-
-    if [[ ! -f "$s_file" ]]; then
-        echo "pending"
-        return
-    fi
-
-    python3 -c "
-import json
-with open('${s_file}') as f:
-    state = json.load(f)
-print(state.get('stages', {}).get('${stg_id}', {}).get('status', 'pending'))
-" 2>/dev/null || echo "pending"
+    _pipeline_state get "$1" "$2" "${DAG_FILE:-${PIPELINE_DAG_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/pipeline-dag.json}}"
 }
 
-# ErrorEngine outcome attribution (optimization 1: self-evolution feedback loop).
-# Credits/discredits the variant fix_ids recorded when augments/{stage}.json was loaded.
-# Called automatically by set_stage_state when status transitions to passed/failed/dead_letter.
-# Usage: _evolve_attribute_outcome <feature_id> <stage_id> <outcome>   (outcome: passed|failed)
-_evolve_attribute_outcome() {
-    local feat_id="$1" stg_id="$2" outcome="$3"
-    local fix_ids="${PIPELINE_LAST_APPLIED_FIXES:-}"
-    # Nothing to attribute if augment wasn't loaded for this stage run
-    [[ -z "$fix_ids" ]] && return 0
-
-    local p_root="${PIPELINE_ROOT:-docs/pipeline}"
-    local evolve_dir="${EVOLVE_ERRORS_DIR:-${p_root}/${feat_id}/evolve}"
-    local pkg_root="${PROJECT_ROOT:-}"
-    [[ -z "$pkg_root" ]] && pkg_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-    _EV_EVOLVE_DIR="$evolve_dir" _EV_STAGE="$stg_id" _EV_FIX_IDS="$fix_ids" \
-    _EV_OUTCOME="$outcome" _EV_PKG_ROOT="$pkg_root" \
-    python3 << 'PYEOF' 2>/dev/null || true
-import json, os, sys
-sys.path.insert(0, os.path.join(os.environ['_EV_PKG_ROOT'], 'src'))
-try:
-    from ai_sdlc_claudecode.engine import ErrorEngine
-except Exception:
-    sys.exit(0)
-
-evolve_dir = os.environ['_EV_EVOLVE_DIR']
-stage_id = os.environ['_EV_STAGE']
-fix_ids = [f for f in os.environ['_EV_FIX_IDS'].split(',') if f]
-outcome = os.environ['_EV_OUTCOME']
-
-from pathlib import Path
-e = ErrorEngine(Path(evolve_dir))
-if outcome == 'passed':
-    e.mark_success(stage_id, applied_fix_ids=fix_ids)
-elif outcome in ('failed', 'dead_letter'):
-    e.mark_failed(stage_id, applied_fix_ids=fix_ids)
-PYEOF
-
-    # Clear so next retry/stage starts fresh (avoids double-attribution)
-    unset PIPELINE_LAST_APPLIED_FIXES
-}
-
-# Update state file
-# Usage: set_stage_state <feature_id> <stage_id> <status> [retry_count]
 set_stage_state() {
-    local feat_id="$1"
-    local stg_id="$2"
-    local stg_status="$3"
-    local retry_cnt="${4:-0}"
-    local p_root="${PIPELINE_ROOT:-docs/pipeline}"
-    local s_file="${p_root}/${feat_id}/state.json"
-
-    # Self-evolution attribution: credit or discredit the variant we applied
-    case "$stg_status" in
-        passed)       _evolve_attribute_outcome "$feat_id" "$stg_id" "passed" ;;
-        failed|dead_letter) _evolve_attribute_outcome "$feat_id" "$stg_id" "failed" ;;
-    esac
-
-    mkdir -p "$(dirname "$s_file")"
-
-    python3 -c "
-import json, os
-from datetime import datetime
-
-state_file = '${s_file}'
-if os.path.exists(state_file):
-    with open(state_file) as f:
-        state = json.load(f)
-else:
-    state = {'feature_id': '${feat_id}', 'stages': {}, 'cost': {'total_tokens': 0, 'estimated_usd': 0.0}}
-
-state['stages']['${stg_id}'] = {
-    'status': '${stg_status}',
-    'retry_count': int('${retry_cnt}'),
-    'updated_at': datetime.utcnow().isoformat() + 'Z'
-}
-state['updated_at'] = datetime.utcnow().isoformat() + 'Z'
-
-with open(state_file, 'w') as f:
-    json.dump(state, f, indent=2, ensure_ascii=False)
-" 2>/dev/null
+    _pipeline_state stage "$1" "${PIPELINE_RUN_ID:-}" "$2" "${PIPELINE_ATTEMPT_ID:-}" "$3" "${4:-0}" "${PIPELINE_LAST_APPLIED_FIXES:-}"
 }
 
-# Update cost tracking (legacy path — char/4 estimate)
-# Usage: update_cost <feature_id> <tokens_used> <model>
-# Kept for backward compat; prefer update_cost_real when claude returns JSON usage.
+collect_evidence() {
+    _pipeline_state evidence "$1" "$PIPELINE_RUN_ID" "$2" "$PIPELINE_ATTEMPT_ID" "$3" "$4" "$5"
+}
+
 update_cost() {
-    local feature_id="$1"
-    local tokens_used="$2"
-    local model="${3:-sonnet}"
-    local pipeline_root="${PIPELINE_ROOT:-docs/pipeline}"
-    local state_file="${pipeline_root}/${feature_id}/state.json"
-
-    _UC_STATE_FILE="$state_file" _UC_FEATURE_ID="$feature_id" \
-    _UC_TOKENS="$tokens_used" _UC_MODEL="$model" \
-    python3 << 'PYEOF' 2>/dev/null
-import json, os
-
-# Pricing per 1M tokens (blended input+output average)
-PRICING = {
-    'opus': 45.0,     # avg($15 input + $75 output)
-    'sonnet': 9.0,    # avg($3 input + $15 output)
-    'haiku': 2.4      # avg($0.80 input + $4 output)
+    _pipeline_state cost "$1" estimated "${3:-sonnet}" 0 "$2" 0 0 0
 }
 
-state_file = os.environ['_UC_STATE_FILE']
-feature_id = os.environ['_UC_FEATURE_ID']
-tokens_used = int(os.environ['_UC_TOKENS'])
-model = os.environ['_UC_MODEL']
-
-if os.path.exists(state_file):
-    with open(state_file) as f:
-        state = json.load(f)
-else:
-    state = {'feature_id': feature_id, 'stages': {}, 'cost': {'total_tokens': 0, 'estimated_usd': 0.0}}
-
-rate = PRICING.get(model, 0.015)
-cost_increment = (tokens_used / 1_000_000) * rate
-
-state['cost']['total_tokens'] = state['cost'].get('total_tokens', 0) + tokens_used
-state['cost']['estimated_usd'] = round(state['cost'].get('estimated_usd', 0.0) + cost_increment, 4)
-state['cost'].setdefault('source', 'estimated')  # mark as heuristic
-
-with open(state_file, 'w') as f:
-    json.dump(state, f, indent=2, ensure_ascii=False)
-
-print(f"Tokens: +{tokens_used} | Total: {state['cost']['total_tokens']} | USD: ${state['cost']['estimated_usd']} (estimated)")
-PYEOF
-}
-
-# Update cost with real usage data from claude --output-format json
-# Usage: update_cost_real <feature_id> <total_cost_usd> <input_tokens> <output_tokens> <cache_read> <cache_creation> [model]
-# Values must be numeric; any omitted are treated as 0.
 update_cost_real() {
-    local feature_id="$1"
-    local cost_usd="$2"
-    local input_tokens="${3:-0}"
-    local output_tokens="${4:-0}"
-    local cache_read="${5:-0}"
-    local cache_creation="${6:-0}"
-    local model="${7:-unknown}"
-    local pipeline_root="${PIPELINE_ROOT:-docs/pipeline}"
-    local state_file="${pipeline_root}/${feature_id}/state.json"
-
-    _UCR_STATE_FILE="$state_file" _UCR_FEATURE_ID="$feature_id" \
-    _UCR_COST="$cost_usd" _UCR_IN="$input_tokens" _UCR_OUT="$output_tokens" \
-    _UCR_CACHE_R="$cache_read" _UCR_CACHE_C="$cache_creation" _UCR_MODEL="$model" \
-    python3 << 'PYEOF' 2>/dev/null
-import json, os
-
-state_file = os.environ['_UCR_STATE_FILE']
-feature_id = os.environ['_UCR_FEATURE_ID']
-cost = float(os.environ.get('_UCR_COST') or 0)
-tin = int(os.environ.get('_UCR_IN') or 0)
-tout = int(os.environ.get('_UCR_OUT') or 0)
-cr = int(os.environ.get('_UCR_CACHE_R') or 0)
-cc = int(os.environ.get('_UCR_CACHE_C') or 0)
-model = os.environ.get('_UCR_MODEL', 'unknown')
-
-if os.path.exists(state_file):
-    with open(state_file) as f:
-        state = json.load(f)
-else:
-    state = {'feature_id': feature_id, 'stages': {}, 'cost': {}}
-
-c = state.setdefault('cost', {})
-total_tokens = tin + tout + cr + cc
-c['total_tokens'] = c.get('total_tokens', 0) + total_tokens
-c['input_tokens'] = c.get('input_tokens', 0) + tin
-c['output_tokens'] = c.get('output_tokens', 0) + tout
-c['cache_read_input_tokens'] = c.get('cache_read_input_tokens', 0) + cr
-c['cache_creation_input_tokens'] = c.get('cache_creation_input_tokens', 0) + cc
-c['actual_usd'] = round(c.get('actual_usd', 0.0) + cost, 6)
-# keep estimated_usd in sync for backward compat
-c['estimated_usd'] = c['actual_usd']
-c['source'] = 'claude_json'
-c.setdefault('by_model', {})
-bm = c['by_model'].setdefault(model, {'usd': 0.0, 'calls': 0, 'input_tokens': 0, 'output_tokens': 0})
-bm['usd'] = round(bm['usd'] + cost, 6)
-bm['calls'] += 1
-bm['input_tokens'] += tin
-bm['output_tokens'] += tout
-
-with open(state_file, 'w') as f:
-    json.dump(state, f, indent=2, ensure_ascii=False)
-
-hit = (cr / max(tin + cr, 1)) * 100
-print(f"Real: +${cost:.6f} | in={tin} out={tout} cache_read={cr} creation={cc} | hit={hit:.1f}% | total=${c['actual_usd']:.4f}")
-PYEOF
+    _pipeline_state cost "$1" actual "${7:-unknown}" "$2" "${3:-0}" "${4:-0}" "${5:-0}" "${6:-0}"
 }
 
-# Set pipeline-level pause/resume state
-# Usage: set_pipeline_state <feature_id> <state> [reason]
 set_pipeline_state() {
-    local feat_id="$1"
-    local pipe_state="$2"
-    local reason="${3:-}"
-    local p_root="${PIPELINE_ROOT:-docs/pipeline}"
-    local s_file="${p_root}/${feat_id}/state.json"
-
-    python3 -c "
-import json, os
-from datetime import datetime
-
-state_file = '${s_file}'
-if os.path.exists(state_file):
-    with open(state_file) as f:
-        state = json.load(f)
-else:
-    state = {'feature_id': '${feat_id}', 'stages': {}, 'cost': {'total_tokens': 0, 'estimated_usd': 0.0}}
-
-state['pipeline_state'] = '${pipe_state}'
-state['pipeline_state_reason'] = '${reason}'
-state['pipeline_state_at'] = datetime.utcnow().isoformat() + 'Z'
-state['updated_at'] = datetime.utcnow().isoformat() + 'Z'
-
-with open(state_file, 'w') as f:
-    json.dump(state, f, indent=2, ensure_ascii=False)
-" 2>/dev/null
+    _pipeline_state pipeline "$1" "$2" "${3:-}"
 }
 
-# Get last passed stage for resume
-# Usage: get_resume_point <feature_id>
-# Returns the stage_id of the first non-passed stage
 get_resume_point() {
-    local feat_id="$1"
-    local p_root="${PIPELINE_ROOT:-docs/pipeline}"
-    local s_file="${p_root}/${feat_id}/state.json"
-
-    if [[ ! -f "$s_file" ]]; then
-        echo ""
-        return
-    fi
-
-    # Resolve DAG file path reliably
-    local dag_path
-    local events_dir
-    events_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    dag_path="$(cd "${events_dir}/.." && pwd)/pipeline-dag.json"
-
-    DAG_PATH="$dag_path" STATE_PATH="$s_file" python3 -c "
-import json, os
-
-with open(os.environ['STATE_PATH']) as f:
-    state = json.load(f)
-
-# All 13 stage IDs as defined in DAG
-all_stage_ids = ['S1','S2','S3','S3b','S4','S4b','S4c','S5','S6','S7','S8','S9','S10']
-try:
-    with open(os.environ['DAG_PATH']) as f:
-        dag = json.load(f)
-    all_stage_ids = sorted(
-        [s['id'] for s in dag.get('stages', {}).values()],
-        key=lambda x: (len(x), x)
-    )
-except Exception:
-    pass
-
-stages = state.get('stages', {})
-for sid in all_stage_ids:
-    if stages.get(sid, {}).get('status') != 'passed':
-        print(sid)
-        break
-else:
-    print('')
-" 2>/dev/null
+    _pipeline_state resume "$1" "${DAG_FILE:-${PIPELINE_DAG_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/pipeline-dag.json}}"
 }
 
 # Send webhook notification
@@ -366,7 +108,7 @@ send_notification() {
     local feat_id="$1"
     local event_type="$2"
     local message="$3"
-    local dag_file="${SCRIPT_DIR:-ai-sdlc-claudecode}/pipeline-dag.json"
+    local dag_file="${PIPELINE_DAG_FILE:-${SCRIPT_DIR:-ai-sdlc-claudecode}/pipeline-dag.json}"
 
     # Read webhook config
     local config

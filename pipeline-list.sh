@@ -13,8 +13,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PIPELINE_ROOT="${PROJECT_ROOT}/docs/pipeline"
+export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export PIPELINE_DAG_FILE="${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PIPELINE_ROOT="${PIPELINE_ROOT:-${PROJECT_ROOT}/docs/pipeline}"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -66,6 +68,7 @@ list_features_table() {
 
         python3 -c "
 import json, os
+from ai_sdlc_claudecode.state import PipelineState
 
 with open('${state_file}') as f:
     state = json.load(f)
@@ -80,8 +83,8 @@ if updated and updated != '-':
 
 # Count stages
 stages = state.get('stages', {})
-total = 13  # Fixed 13-stage pipeline
-passed = sum(1 for s in stages.values() if s.get('status') == 'passed')
+total = len(state.get('scope', []))
+passed = sum(PipelineState.is_verified(stages.get(sid, {}), os.environ['PIPELINE_DAG_FILE']) for sid in state.get('scope', []))
 failed = sum(1 for s in stages.values() if s.get('status') in ('failed', 'dead_letter'))
 running = sum(1 for s in stages.values() if s.get('status') in ('running', 'gate_checking'))
 
@@ -171,7 +174,9 @@ list_features_json() {
     fi
 
     python3 -c "
-import json, os, glob
+import json, os
+from ai_sdlc_claudecode.state import PipelineState
+import glob
 
 pipeline_root = '${PIPELINE_ROOT}'
 features = []
@@ -192,8 +197,8 @@ for state_file in sorted(glob.glob(os.path.join(pipeline_root, '*/state.json')))
     features.append({
         'feature_id': feature_id,
         'tech_stack': state.get('tech_stack', 'unknown'),
-        'stages_passed': sum(1 for s in stages.values() if s.get('status') == 'passed'),
-        'stages_total': 13,
+        'stages_passed': sum(PipelineState.is_verified(stages.get(sid, {}), os.environ['PIPELINE_DAG_FILE']) for sid in state.get('scope', [])),
+        'stages_total': len(state.get('scope', [])),
         'total_tokens': cost.get('total_tokens', 0),
         'total_cost_usd': cost.get('estimated_usd', 0.0),
         'pipeline_state': state.get('pipeline_state', 'unknown'),

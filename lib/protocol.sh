@@ -48,21 +48,18 @@ send_message() {
 
     mkdir -p "$(dirname "$comm_log")"
 
-    python3 -c "
-import json
-from datetime import datetime
-
-msg = {
-    'timestamp': datetime.utcnow().isoformat() + 'Z',
-    'from': '${from_agent}',
-    'to': '${to_agent}',
-    'type': '${msg_type}',
-    'priority': '${priority}',
-    'content': $(python3 -c "import json; print(json.dumps('${content}'))" 2>/dev/null || echo "\"${content}\""),
-    'artifact': '${artifact_path}' if '${artifact_path}' else None
-}
-print(json.dumps({k:v for k,v in msg.items() if v is not None}, ensure_ascii=False))
-" 2>/dev/null >> "$comm_log"
+    python3 - "$comm_log" "$from_agent" "$to_agent" "$msg_type" "$priority" "$content" "$artifact_path" <<'PY_MESSAGE'
+import fcntl, json, os, sys
+from datetime import datetime, timezone
+path, sender, recipient, kind, priority, content, artifact = sys.argv[1:]
+msg = dict(timestamp=datetime.now(timezone.utc).isoformat(),
+           **{'from':sender, 'to':recipient, 'type':kind}, priority=priority,
+           content=content, artifact=artifact or None,
+           run_id=os.environ.get('PIPELINE_RUN_ID'), attempt_id=os.environ.get('PIPELINE_ATTEMPT_ID'))
+with open(path, 'a') as out:
+    fcntl.flock(out, fcntl.LOCK_EX)
+    out.write(json.dumps(msg, ensure_ascii=False)+'\n')
+PY_MESSAGE
 
     # Pretty print to stderr
     local arrow="→"

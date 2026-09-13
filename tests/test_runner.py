@@ -50,7 +50,7 @@ class TestGetStagesPassed:
         runner = PipelineRunner(executor_path, pipeline_root)
         assert runner.get_stages_passed("nonexistent") == 0
 
-    def test_counts_passed(self, executor_path: Path, pipeline_root: Path) -> None:
+    def test_legacy_pass_is_unverified(self, executor_path: Path, pipeline_root: Path) -> None:
         runner = PipelineRunner(executor_path, pipeline_root)
         feat_dir = pipeline_root / "feat1"
         feat_dir.mkdir(parents=True)
@@ -61,7 +61,7 @@ class TestGetStagesPassed:
                 "S3": {"status": "failed"},
             }
         }))
-        assert runner.get_stages_passed("feat1") == 2
+        assert runner.get_stages_passed("feat1") == 0
 
 
 class TestAutoApprove:
@@ -71,10 +71,11 @@ class TestAutoApprove:
         stage_dir.mkdir(parents=True)
         (stage_dir / "APPROVAL_REQUIRED").write_text("waiting")
 
-        runner.auto_approve_gates("feat1")
+        with pytest.raises(PermissionError):
+            runner.auto_approve_gates("feat1")
 
-        assert not (stage_dir / "APPROVAL_REQUIRED").exists()
-        assert (stage_dir / "APPROVED").exists()
+        assert (stage_dir / "APPROVAL_REQUIRED").exists()
+        assert not (stage_dir / "APPROVED").exists()
 
 
 class TestRunResult:
@@ -88,3 +89,66 @@ class TestNotFound:
     def test_missing_executor(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
             PipelineRunner(tmp_path / "nonexistent.sh", tmp_path)
+
+
+def test_agent_runs_only_requested_feature_phase():
+    from ai_sdlc_claudecode.cli import EvolvingAgent
+    agent = EvolvingAgent.__new__(EvolvingAgent)
+    agent.start_phase = 2
+    calls = []
+    agent._preflight = agent._banner = agent._finalize = lambda: None
+    agent._phase = lambda *args, **kwargs: calls.append((args, kwargs))
+    agent.run()
+    assert len(calls) == 1
+    assert calls[0][0][0] == 2
+    assert 'feature_override' not in calls[0][1]
+
+
+@pytest.mark.parametrize('outcome', ['human_waiting', 'paused', 'partial', 'simulated', 'unverified'])
+def test_agent_checkpoints_without_advancing_or_approving(tmp_path, monkeypatch, outcome):
+    from unittest.mock import Mock
+    import ai_sdlc_claudecode.cli as cli
+    from ai_sdlc_claudecode.state import EvolveState
+    agent = cli.EvolvingAgent.__new__(cli.EvolvingAgent)
+    agent.feature_id, agent.description = 'feature', 'local'
+    agent.errors_dir = tmp_path / 'errors'
+    agent.state = EvolveState.create(tmp_path / 'evolve-state.json')
+    agent.engine = Mock()
+    agent.engine.read_failures.return_value = []
+    agent.runner = Mock()
+    agent.runner.run.return_value = RunResult('feature', 3, '', '', 0, 1, 0.25, 1, False, outcome)
+    monkeypatch.setattr(cli, 'resolve_pipeline_root', lambda: tmp_path)
+    agent._phase(2, 'fixture')
+    assert agent.runner.run.call_count == 1
+    agent.runner.auto_approve_gates.assert_not_called()
+    agent.engine.promote_to_skill.assert_not_called()
+    agent.engine.mark_success.assert_not_called()
+    assert agent.state.cost_spent_usd == 0.25
+    assert agent.state.phases[2].status != 'complete'
+
+
+def test_runner_never_reuses_success_after_entrypoint_fails(tmp_path):
+    executor = tmp_path / 'pipeline-executor.sh'
+    executor.write_text('#!/bin/sh\nexit 1\n')
+    pipeline = tmp_path / 'pipeline'
+    sf = pipeline / 'feature' / 'state.json'
+    sf.parent.mkdir(parents=True)
+    sf.write_text(json.dumps({'run_id': 'old', 'scope': ['S1'], 'pipeline_state': 'complete'}))
+    result = PipelineRunner(executor, pipeline).run('feature', 'fixture')
+    assert not result.all_passed
+    assert result.run_id is None
+    assert result.outcome == 'failed'
+
+
+def test_runner_timeout_terminates_stage_children(tmp_path):
+    import time
+    executor = tmp_path / 'pipeline-executor.sh'
+    marker = tmp_path / 'child-finished'
+    executor.write_text('#!/bin/bash\n(sleep 1; touch child-finished) &\nwait\n')
+    # Runner runs in executor.parent.parent, so use an absolute marker.
+    executor.write_text(executor.read_text().replace('touch child-finished', "touch '" + str(marker) + "'"))
+    result = PipelineRunner(executor, tmp_path / 'pipeline').run('feature', 'fixture', timeout_seconds=0.1)
+    time.sleep(1.2)
+    assert result.exit_code == 124
+    assert not result.all_passed
+    assert not marker.exists()

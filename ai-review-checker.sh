@@ -307,6 +307,12 @@ for pattern in patterns:
             try:
                 data = json.loads(match)
                 if 'scores' in data and 'overall_score' in data:
+                    score = data['overall_score']
+                    if (not isinstance(score, (int, float)) or isinstance(score, bool)
+                            or not 0 <= score <= 100 or not isinstance(data['scores'], dict)
+                            or type(data.get('passed')) is not bool):
+                        continue
+                    data['passed'] = data['passed'] and score >= float('${PASS_THRESHOLD}')
                     with open('${output_path}', 'w') as f:
                         json.dump(data, f, indent=2, ensure_ascii=False)
                     print(json.dumps(data, indent=2))
@@ -616,7 +622,7 @@ else:
     if [[ $adv_exit -ne 0 ]]; then
         echo -e "  ${RED}Adversarial review invocation failed (exit: ${adv_exit})${NC}"
         echo -e "  ${YELLOW}Falling back to structural review score only${NC}"
-        return 0  # Don't block on adversarial failure
+        return 1  # A required review failure cannot authorize a pass
     fi
 
     # Parse adversarial result
@@ -648,8 +654,8 @@ else:
     else
         echo -e "  ${RED}Failed to parse adversarial review response${NC}"
         echo "$adv_output" > "${review_dir}/ai-review-adversarial-raw-${stage_id}.txt"
-        echo -e "  ${YELLOW}Falling back to structural review score only${NC}"
-        return 0
+        echo -e "  ${RED}Required adversarial review unavailable${NC}"
+        return 1
     fi
 }
 
@@ -845,20 +851,21 @@ print(json.dumps(result, indent=2))
         if [[ -n "$feature_id" ]]; then
             emit_event "$feature_id" "ai_review_done" "$stage_id" \
                 "AI review complete: score=${overall_score}, passed=${passed}, duration=${duration}s" \
-                "{\"score\": ${overall_score}, \"passed\": ${passed}, \"duration\": ${duration}}"
+                "{\"score\": ${overall_score}, \"passed\": \"${passed}\", \"duration\": ${duration}}"
         fi
 
         if [[ "$passed" == "True" ]]; then
             # Structural review passed — check if adversarial review is needed
             local adv_result
-            adv_result=$(run_adversarial_review "$stage_id" "$output_json" "$overall_score" "$review_dir" "$feature_id" 2>&1)
-            local adv_exit=$?
+            local adv_exit=0
+            adv_result=$(run_adversarial_review "$stage_id" "$output_json" "$overall_score" "$review_dir" "$feature_id" 2>&1) || adv_exit=$?
+            [[ $adv_exit -eq 0 ]] || exit 1
 
             # Check if adversarial review produced a final score
             local adv_final_score
-            adv_final_score=$(echo "$adv_result" | grep "^ADVERSARIAL_FINAL_SCORE=" | cut -d= -f2)
+            adv_final_score=$(echo "$adv_result" | sed -n 's/^ADVERSARIAL_FINAL_SCORE=//p')
             local adv_final_passed
-            adv_final_passed=$(echo "$adv_result" | grep "^ADVERSARIAL_FINAL_PASSED=" | cut -d= -f2)
+            adv_final_passed=$(echo "$adv_result" | sed -n 's/^ADVERSARIAL_FINAL_PASSED=//p')
 
             # Print adversarial output (excluding control lines)
             echo "$adv_result" | grep -v "^ADVERSARIAL_FINAL_"

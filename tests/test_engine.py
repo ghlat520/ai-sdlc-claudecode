@@ -179,12 +179,12 @@ class TestCaptureRealtime:
         assert record.category == CATEGORY_CONTEXT_OVERFLOW
         assert "context_reduction" in record.fix_pattern
 
-    def test_marks_applied(self, engine: ErrorEngine) -> None:
+    def test_preparing_guidance_does_not_count_as_application(self, engine: ErrorEngine) -> None:
         engine.capture_realtime("S3", 1, "schema validation failed", "feat")
         # After capture_realtime, fix should be marked as applied
         records = engine.index.get("S3", [])
         assert len(records) == 1
-        assert records[0].applied_count == 1
+        assert records[0].applied_count == 0
 
 
 class TestPersistAndReload:

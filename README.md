@@ -1,54 +1,56 @@
 # SDLC Pipeline + Self-Evolving Agent
 
-AI-driven full-lifecycle software delivery pipeline with a self-evolving autonomous agent that learns from errors and never repeats mistakes.
+AI-driven full-lifecycle software delivery pipeline with an execution supervisor that records verification evidence and reuses learned guidance.
 
 ## Quick Start
 
 ```bash
-# 1. Install (zero external dependencies)
+# 1. Install (includes required JSON Schema validation)
 pip install -e .
 
 # 2. Run the evolving agent
 ai-sdlc run --feature-id my-feature --description "Add user login" --max-cost 50
 
 # 3. Check status
-ai-sdlc status
+ai-sdlc status --feature-id my-feature
 ```
 
 ## SDLC Pipeline
 
-### 13-Stage DAG
+### Execution and acceptance contract
 
-The pipeline executes software delivery as a directed acyclic graph across 13 stages:
+A stage `passed` means its artifact passed the configured supervisor checks. It does not prove a deployed version or business acceptance. Each result binds a `run_id`, `attempt_id`, artifact hash, DAG hash, collected check receipts and the artifact acceptance policy. Legacy `passed` records are unverified until rerun.
+
+`complete`, `partial`, `simulated`, `human_waiting`, `paused` and `failed` describe the requested execution scope. Skips and imported inputs never count as executed passes. Parallel and sequential stages use the same verifier and locked atomic state writer.
+
+Human gates checkpoint and return exit 3; editable `APPROVED` files are not accepted as authorization. This version has no trusted approval integration, OS sandbox or production IAM enforcement. S6 and S10 prepare artifacts; accepting those artifacts does not authorize a production release. External runtime/business feedback remains deferred.
+
+See [the state contract and five-stage mapping](docs/unattended-state-contract.md) for the evidence boundary, invariants, verification matrix and remaining integration work.
+
+### 18-Stage DAG
+
+The current `pipeline-dag.json` is authoritative:
 
 | ID | Stage | Gate | Mode |
-|----|-------|------|------|
-| S1 | Requirements Analysis | ai-review | sequential |
-| S2 | Architecture Design | ai-review | sequential |
-| S3 | Backend Development | auto | parallel with S3b |
-| S3b | Frontend Development | auto | parallel with S3 |
-| S4 | Unit Testing | auto | parallel with S4b, S4c |
-| S4b | Integration Testing | auto | parallel with S4, S4c |
-| S4c | E2E Testing | auto | parallel with S4, S4b |
-| S5 | Code Review + Security | auto | sequential |
-| S6 | Deployment | human-required | sequential |
-| S7 | Monitoring & Observability | ai-review | parallel with S8 |
-| S8 | Documentation | ai-review | parallel with S7 |
-| S9 | Performance Testing | ai-review | sequential |
-| S10 | Release & Rollout | human-required | sequential |
-
-### Execution Flow
-
-```
-S1 Requirements
-  └─> S2 Architecture
-        ├─> S3 Backend ──┬─> S4 Unit Test ────┐
-        └─> S3b Frontend ├─> S4b Integration ──├─> S5 Review
-                          └─> S4c E2E Test ────┘     └─> S6 Deploy
-                                                           ├─> S7 Monitoring ──┐
-                                                           ├─> S8 Docs ────────├─> S10 Release
-                                                           └─> S9 Performance ─┘
-```
+|---|---|---|---|
+| S0p | product-discovery | human-required | sequential |
+| S0 | strategic-review | human-required | sequential |
+| S1 | requirements | ai-review | sequential |
+| S2 | architecture | ai-review | sequential |
+| S2b | ui-design | ai-review | sequential |
+| S3 | backend | ai-review | sequential |
+| S3b | frontend | ai-review | sequential |
+| S4 | testing | ai-review | parallel |
+| S4b | integration-testing | ai-review | parallel |
+| S4c | e2e-testing | auto+ai-review | parallel |
+| S4d | smoke-test | auto | sequential |
+| S4e | browser-qa | ai-review | sequential |
+| S5 | review | ai-review | sequential |
+| S6 | deployment | ai-review | sequential |
+| S7 | monitoring | ai-review | parallel |
+| S8 | documentation | ai-review | parallel |
+| S9 | performance | ai-review | parallel |
+| S10 | release | ai-review | sequential |
 
 ### Gate Types
 
@@ -56,7 +58,7 @@ S1 Requirements
 |------|----------|---------|
 | `auto` | Runs commands, checks pass/fail automatically | compile passes, tests pass |
 | `ai-review` | AI agent evaluates output against checks | PRD covers NFRs, architecture has API contracts |
-| `human-required` | Blocks until human approval | deployment approval, release sign-off |
+| `human-required` | Checkpoints as pending; requires trusted approval integration | product intent and scope decisions |
 
 ### Multi-Tech Stack
 
@@ -72,8 +74,8 @@ Configure `tech_stack` in `pipeline-dag.json`:
 ### Key Features
 
 - **Resume/Pause** — `--start-from S3` to resume from any stage
-- **Mock Mode** — validate structure without calling Claude CLI
-- **Cost Tracking** — token estimation per stage, USD accumulation, hard limit ($150 default)
+- **Simulation** — `--skeleton` avoids model calls; `--mock-review` still runs generation but cannot produce verified passes
+- **Cost Tracking** — records actual usage when available, otherwise labels estimates; checks the budget before each stage call
 - **Dead Letter** — after 3 retries, stage enters dead letter queue for human intervention
 - **Notifications** — webhook support (DingTalk) for human_wait, dead_letter, pipeline_end
 
@@ -89,15 +91,15 @@ Run Pipeline ──> Collect Failures ──> Learn Patterns ──> Augment Nex
      └────────────────────────────────────────────────────────┘
 ```
 
-The agent **never repeats the same mistake** — every failure is recorded, analyzed, and injected as context into subsequent iterations.
+Recorded failures can guide later attempts; guidance is not a guarantee of improvement. One executed attempt contributes at most one outcome per injected fix ID, including after restart and across duplicate error records. Reading results and preparing prompts do not create learning samples. The runtime does not automatically promote guidance into global skills.
 
-### 3-Phase Execution
+### Explicit Phase Selection
 
 | Phase | Description | What Happens |
 |-------|-------------|--------------|
-| 1 | Mock Mode | Structure validation, no Claude CLI calls |
-| 2 | Real Claude CLI | Full 13-stage pipeline execution |
-| 3 | Production | Target project (e.g. ai-media-platform S3-S10) |
+| 1 | Mock review | Generation with simulated acceptance; stops after the selected phase |
+| 2 | Real Claude CLI | Selected feature, with actual configured checks and pending human gates |
+| 3 | Later stages | The same selected feature from S3; verified/imported prerequisites are required |
 
 ### Budget Controls
 
@@ -107,13 +109,13 @@ The agent **never repeats the same mistake** — every failure is recorded, anal
 | Max runtime | 4 hours | `--max-hours` |
 | Stall detection | 5 iterations without improvement | `--max-failures` |
 
-The agent saves an **atomic checkpoint** after every iteration. On SIGTERM/SIGINT, it performs graceful shutdown — saves state and generates a report before exiting.
+The agent saves an **atomic checkpoint** after every iteration. On SIGTERM/SIGINT, it performs checkpoint shutdown. The runner terminates child process groups on timeout; production supervision and external approval remain separate integration requirements.
 
 ## Project Structure
 
 ```
 ai-sdlc-claudecode/
-├── pipeline-dag.json          # 13-stage DAG definition
+├── pipeline-dag.json          # 18-stage DAG definition
 ├── pipeline-executor.sh       # Main Bash executor
 ├── pipeline-init.sh           # Initialize feature pipeline
 ├── pipeline-status.sh         # Status dashboard
@@ -171,15 +173,15 @@ Options:
   --description TEXT     Feature description
 ```
 
-### `ai-sdlc status`
+### `ai-sdlc status --feature-id <id>`
 
 Display current state: phase, iteration, cost, elapsed time, improvement trend.
 
-### `ai-sdlc report`
+### `ai-sdlc report --feature-id <id>`
 
 Generate a markdown report at `docs/pipeline/ai-sdlc-report.md`.
 
-### `ai-sdlc reset`
+### `ai-sdlc reset --feature-id <id>`
 
 Clear state for a fresh start. Use `-f` to skip confirmation.
 

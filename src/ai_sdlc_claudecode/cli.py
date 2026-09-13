@@ -57,8 +57,8 @@ class EvolvingAgent:
         executor = resolve_executor()
 
         self.errors_dir = pipeline_root / feature_id / "evolve"
-        self.state_path = pipeline_root / "ai-sdlc-state.json"
-        self.report_path = pipeline_root / "ai-sdlc-report.md"
+        self.state_path = pipeline_root / feature_id / "ai-sdlc-state.json"
+        self.report_path = pipeline_root / feature_id / "ai-sdlc-report.md"
 
         self.engine = ErrorEngine(self.errors_dir)
         self.state = EvolveState.create(
@@ -81,17 +81,10 @@ class EvolvingAgent:
         self._banner()
 
         try:
-            if self.start_phase <= 1:
-                self._phase(1, "Mock Mode (structure validation)", mock_review=True)
-            if self.start_phase <= 2:
-                self._phase(2, "Real Claude CLI (13 stages)")
-            if self.start_phase <= 3:
-                self._phase(
-                    3, "ai-media-platform (S3-S10)",
-                    start_from="S3",
-                    feature_override="ai-media-platform",
-                    description_override="Build ai-media-platform features S3-S10",
-                )
+            # The selected phase and feature are the complete authorization scope.
+            self._phase(self.start_phase, "Selected feature execution",
+                        mock_review=self.start_phase == 1,
+                        start_from="S3" if self.start_phase == 3 else None)
         finally:
             self._finalize()
 
@@ -125,8 +118,8 @@ class EvolvingAgent:
             _log(f"Phase {phase}, Iteration {iteration + 1}/{MAX_ITERATIONS_PER_PHASE}", CYAN)
 
             self.engine.write_augments()
-            self.runner.auto_approve_gates(feat)
 
+            previous_cost = self._last_cost(feat, pipeline_root)
             result = self.runner.run(
                 feature_id=feat,
                 description=desc,
@@ -134,15 +127,12 @@ class EvolvingAgent:
                 resume=(iteration > 0),
                 start_from=start_from if iteration == 0 else None,
                 evolve_errors_dir=self.errors_dir,
-                cost_limit=self.state.max_cost_usd - self.state.cost_spent_usd,
+                cost_limit=self.state.max_cost_usd,
             )
 
-            new_errors = self.engine.read_failures(iteration, phase, feat)
+            new_errors = [] if mock_review else self.engine.read_failures(iteration, phase, feat)
 
-            if result.stages_passed > 0:
-                self._mark_passed(feat, pipeline_root)
-
-            cost_delta = max(result.cost_usd - self._last_cost(feat, pipeline_root), 0.0)
+            cost_delta = max(result.cost_usd - previous_cost, 0.0)
 
             self.state = self.state.update_iteration(
                 phase=phase,
@@ -152,15 +142,15 @@ class EvolvingAgent:
             )
             self.state.checkpoint()
 
-            promoted = self.engine.promote_to_skill()
-            if promoted:
-                _log(f"Promoted {len(promoted)} fixes to skills", GREEN)
-
             _log(
                 f"Stages: {result.stages_passed}/{result.total_stages}, "
                 f"Errors: {len(new_errors)}, Cost: ${self.state.cost_spent_usd:.2f}",
                 GREEN if result.all_passed else YELLOW,
             )
+
+            if result.outcome in ("human_waiting", "paused", "partial", "simulated", "unverified"):
+                _log(f"Execution stopped: {result.outcome}; scope preserved", YELLOW)
+                break
 
             if result.all_passed:
                 _log(f"Phase {phase} COMPLETE!", GREEN + BOLD)
@@ -198,18 +188,6 @@ class EvolvingAgent:
             _log(f"Resuming: {stats['total_errors']} known errors", YELLOW)
         print()
 
-    def _mark_passed(self, feature_id: str, pipeline_root: Path) -> None:
-        sf = pipeline_root / feature_id / "state.json"
-        if not sf.exists():
-            return
-        try:
-            data = json.loads(sf.read_text(encoding="utf-8"))
-            for sid, sd in data.get("stages", {}).items():
-                if sd.get("status") == "passed":
-                    self.engine.mark_success(sid)
-        except (json.JSONDecodeError, OSError):
-            pass
-
     def _last_cost(self, feature_id: str, pipeline_root: Path) -> float:
         sf = pipeline_root / feature_id / "state.json"
         if not sf.exists():
@@ -231,7 +209,7 @@ class EvolvingAgent:
         self.state.generate_report(self.report_path)
         stats = self.engine.get_stats()
         print(f"\n{BOLD}{CYAN}{'=' * 60}{NC}")
-        _log("Evolution Complete", BOLD + GREEN)
+        _log("Evolution stopped; completion is recorded per phase", BOLD + CYAN)
         _log(f"Iterations: {self.state.current_iteration}", CYAN)
         _log(f"Cost: ${self.state.cost_spent_usd:.2f}", CYAN)
         _log(f"Errors learned: {stats['total_errors']}", CYAN)
@@ -258,7 +236,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
 def _cmd_status(args: argparse.Namespace) -> None:
     pipeline_root = resolve_pipeline_root()
-    state_file = pipeline_root / "ai-sdlc-state.json"
+    state_file = pipeline_root / args.feature_id / "ai-sdlc-state.json"
 
     if not state_file.exists():
         print("No state found. Run `ai-sdlc run` first.")
@@ -296,8 +274,8 @@ def _cmd_status(args: argparse.Namespace) -> None:
 
 def _cmd_report(args: argparse.Namespace) -> None:
     pipeline_root = resolve_pipeline_root()
-    state_file = pipeline_root / "ai-sdlc-state.json"
-    report_path = pipeline_root / "ai-sdlc-report.md"
+    state_file = pipeline_root / args.feature_id / "ai-sdlc-state.json"
+    report_path = pipeline_root / args.feature_id / "ai-sdlc-report.md"
 
     if not state_file.exists():
         print("No state found. Run `ai-sdlc run` first.")
@@ -336,7 +314,7 @@ def _cmd_extract_json(args: argparse.Namespace) -> None:
 
 def _cmd_reset(args: argparse.Namespace) -> None:
     pipeline_root = resolve_pipeline_root()
-    state_file = pipeline_root / "ai-sdlc-state.json"
+    state_file = pipeline_root / args.feature_id / "ai-sdlc-state.json"
 
     if not state_file.exists():
         print("Nothing to reset.")
@@ -351,7 +329,7 @@ def _cmd_reset(args: argparse.Namespace) -> None:
     state_file.unlink()
     print(f"Deleted: {state_file}")
 
-    report = pipeline_root / "ai-sdlc-report.md"
+    report = pipeline_root / args.feature_id / "ai-sdlc-report.md"
     if report.exists():
         report.unlink()
         print(f"Deleted: {report}")
@@ -374,17 +352,19 @@ def main() -> None:
     run_p.add_argument("--max-cost", type=float, default=50.0, help="Max cost in USD (default: 50)")
     run_p.add_argument("--max-hours", type=float, default=4.0, help="Max runtime in hours (default: 4)")
     run_p.add_argument("--max-failures", type=int, default=5, help="Max stall iterations (default: 5)")
-    run_p.add_argument("--phase", type=int, default=1, choices=[1, 2, 3], help="Start phase (1=mock, 2=real, 3=ai-media)")
+    run_p.add_argument("--phase", type=int, default=1, choices=[1, 2, 3], help="Start phase (1=mock, 2=real, 3=selected feature from S3)")
     run_p.add_argument("--feature-id", default="ai-sdlc-test", help="Feature ID (default: ai-sdlc-test)")
     run_p.add_argument("--description", default="Self-evolving agent test run", help="Feature description")
     run_p.set_defaults(func=_cmd_run)
 
     # ai-sdlc status
     status_p = sub.add_parser("status", help="Show current state")
+    status_p.add_argument("--feature-id", required=True)
     status_p.set_defaults(func=_cmd_status)
 
     # ai-sdlc report
     report_p = sub.add_parser("report", help="Generate markdown report")
+    report_p.add_argument("--feature-id", required=True)
     report_p.set_defaults(func=_cmd_report)
 
     # ai-sdlc extract-json
@@ -396,6 +376,7 @@ def main() -> None:
     # ai-sdlc reset
     reset_p = sub.add_parser("reset", help="Clear state for fresh start")
     reset_p.add_argument("-f", "--force", action="store_true", help="Skip confirmation")
+    reset_p.add_argument("--feature-id", required=True)
     reset_p.set_defaults(func=_cmd_reset)
 
     args = parser.parse_args()

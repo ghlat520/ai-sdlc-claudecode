@@ -391,8 +391,15 @@ class ErrorEngine:
                     "fail": 0,
                     "retired": False,
                 })
-                slot["success"] += int(v.get("success", 0))
-                slot["fail"] += int(v.get("fail", 0))
+                outcomes = v.get("attempt_outcomes", {})
+                # Several error records may share one fix ID; one attempt is one sample.
+                for key in ("success", "fail"):
+                    slot[key] += int(v.get(key, 0)) - sum(o == key for o in outcomes.values())
+                seen = slot.setdefault("attempt_outcomes", {})
+                for attempt, outcome in outcomes.items():
+                    if attempt not in seen:
+                        slot[outcome] += 1
+                        seen[attempt] = outcome
                 if v.get("retired"):
                     slot["retired"] = True
                 # carry through any hints
@@ -444,6 +451,36 @@ class ErrorEngine:
             return original_prompt
 
         return "".join(injections) + original_prompt
+
+    def record_outcome(self, stage_record: dict) -> None:
+        """Credit the injected variants once per executed attempt, including after restart."""
+        from .state import locked_json
+        status = stage_record.get("status")
+        evidence = stage_record.get("verification", {}).get("evidence", [])
+        if (stage_record.get("simulation") or status not in ("passed", "failed", "dead_letter") or not evidence
+                or not stage_record.get("run_id") or not stage_record.get("attempt_id")):
+            return
+        if status == "passed" and stage_record["verification"].get("status") != "verified":
+            return
+        fix_ids = set(stage_record.get("applied_fix_ids", []))
+        outcome_id = stage_record["run_id"] + ":" + stage_record["attempt_id"]
+        for path in (self.errors_dir / "records").glob("*.json"):
+            with locked_json(path) as data:
+                if data.get("stage_id") != stage_record["stage_id"]:
+                    continue
+                matched = fix_ids & {v["id"] for v in data.get("variants", [])}
+                if not matched or outcome_id in data.get("attempt_outcomes", {}):
+                    continue
+                success = status == "passed"
+                data["variants"] = list(self._score_variants(tuple(data["variants"]), matched, success=success))
+                for variant in data["variants"]:
+                    if variant["id"] in matched:
+                        variant.setdefault("attempt_outcomes", {})[outcome_id] = "success" if success else "fail"
+                data["applied_count"] = data.get("applied_count", 0) + 1
+                data["success_after_apply"] = data.get("success_after_apply", 0) + int(success)
+                data.setdefault("attempt_outcomes", {})[outcome_id] = dict(
+                    outcome=status, fix_ids=sorted(matched))
+        self._load_index()
 
     def mark_success(
         self, stage_id: str, applied_fix_ids: Optional[list[str]] = None
@@ -583,20 +620,13 @@ class ErrorEngine:
             (augments_dir / f"{stage_id}.txt").write_text(
                 injection_text, encoding="utf-8"
             )
-            (augments_dir / f"{stage_id}.json").write_text(
-                json.dumps({
-                    "stage_id": stage_id,
-                    "fix_ids": [v["id"] for v in chosen],
-                    "injection": injection_text,
-                    "variants_applied": [
-                        {"id": v["id"], "category": v.get("category", "?")}
-                        for v in chosen
-                    ],
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            self.mark_applied(stage_id)
+            from .state import locked_json
+            with locked_json(augments_dir / f"{stage_id}.json") as augment:
+                augment.clear()
+                augment.update(stage_id=stage_id, fix_ids=[v["id"] for v in chosen],
+                               injection=injection_text,
+                               variants_applied=[{"id":v["id"], "category":v.get("category", "?")} for v in chosen],
+                               timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
 
     def read_failures(self, iteration: int, phase: int, feature_id: str) -> list[ErrorRecord]:
         """Read failure files written by bash and process them."""
@@ -721,7 +751,7 @@ class ErrorEngine:
 
     def _persist_record(self, record: ErrorRecord) -> None:
         path = self.errors_dir / "records" / f"{record.error_id}.json"
-        path.write_text(json.dumps({
+        payload = {
             "error_id": record.error_id,
             "timestamp": record.timestamp,
             "iteration": record.iteration,
@@ -734,13 +764,28 @@ class ErrorEngine:
             "applied_count": record.applied_count,
             "success_after_apply": record.success_after_apply,
             "variants": list(record.variants),
-        }, indent=2, ensure_ascii=False), encoding="utf-8")
+        }
+        from .state import locked_json
+        with locked_json(path) as current:
+            # Concurrent/reloaded diagnostic capture cannot erase collected outcomes.
+            if current.get("attempt_outcomes"):
+                payload["applied_count"] = max(payload["applied_count"], current.get("applied_count", 0))
+                payload["success_after_apply"] = max(payload["success_after_apply"], current.get("success_after_apply", 0))
+                old_variants = {v["id"]: v for v in current.get("variants", [])}
+                for variant in payload["variants"]:
+                    old = old_variants.get(variant["id"], {})
+                    for key in ("success", "fail"):
+                        variant[key] = max(variant.get(key, 0), old.get(key, 0))
+                    variant.setdefault("attempt_outcomes", {}).update(old.get("attempt_outcomes", {}))
+                    variant["retired"] = variant.get("retired", False) or old.get("retired", False)
+            current.update(payload)
 
     def _persist_all_records(self, stage_id: str) -> None:
         for rec in self.index.get(stage_id, []):
             self._persist_record(rec)
 
     def _load_index(self) -> None:
+        self.index = {}
         records_dir = self.errors_dir / "records"
         if not records_dir.exists():
             return

@@ -14,12 +14,14 @@
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export PIPELINE_DAG_FILE="${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}"
 FEATURE_ID="${1:-}"
 MODE="${2:---status}"
 INTERVAL="${3:-5}"
 
 PIPELINE_ROOT="${PIPELINE_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)/docs/pipeline}"
-DAG_FILE="${SCRIPT_DIR}/pipeline-dag.json"
+DAG_FILE="${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}"
 
 if [[ -z "$FEATURE_ID" ]]; then
     echo "Usage: $0 <feature_id> [--watch [interval] | --events [count]]"
@@ -120,13 +122,15 @@ else:
     elapsed_str = "00:00"
 
 # ── Counts ──
-total = len(stages_meta)
-passed_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") == "passed"]
+from ai_sdlc_claudecode.state import PipelineState
+scope = state.get("scope", [])
+total = len(scope)
+passed_ids = [sid for sid in scope if PipelineState.is_verified(stages_state.get(sid, {}), dag_file)]
 skipped_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") == "skipped"]
 running_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") in ("running", "gate_checking")]
 failed_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") in ("failed", "dead_letter")]
 
-effective_done = len(passed_ids) + len(skipped_ids)
+effective_done = len(passed_ids)
 pct = int(effective_done / total * 100) if total > 0 else 0
 bar_len = 30
 filled = int(bar_len * effective_done / total) if total > 0 else 0

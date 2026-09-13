@@ -11,8 +11,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export PIPELINE_DAG_FILE="${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PIPELINE_ROOT="${PROJECT_ROOT}/docs/pipeline"
+PIPELINE_ROOT="${PIPELINE_ROOT:-${PROJECT_ROOT}/docs/pipeline}"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -76,21 +78,12 @@ print(f'  Tokens: {cost.get(\"total_tokens\", 0):,}')
 print()
 
 # Stage order
-STAGE_ORDER = [
-    ('S1', 'requirements'),
-    ('S2', 'architecture'),
-    ('S3', 'backend'),
-    ('S3b', 'frontend'),
-    ('S4', 'testing'),
-    ('S4b', 'integration-test'),
-    ('S4c', 'e2e-testing'),
-    ('S5', 'review'),
-    ('S6', 'deployment'),
-    ('S7', 'monitoring'),
-    ('S8', 'documentation'),
-    ('S9', 'performance'),
-    ('S10', 'release'),
-]
+from ai_sdlc_claudecode.state import PipelineState
+dag_path = os.environ['PIPELINE_DAG_FILE']
+dag = json.load(open(dag_path))
+STAGE_ORDER = [(dag['stages'][n]['id'], n) for n in PipelineState.ordered(dag)]
+print('  Outcome:', state.get('pipeline_state', 'unverified'))
+print('  Run:', state.get('run_id', 'legacy/unverified'))
 
 stages = state.get('stages', {})
 print('  Stage          Status        Retries  Updated')
@@ -99,6 +92,8 @@ print('  ─────────────  ──────────
 for sid, sname in STAGE_ORDER:
     sdata = stages.get(sid, {})
     status = sdata.get('status', 'pending')
+    if status == 'passed' and not PipelineState.is_verified(sdata, dag_path):
+        status = 'unverified'
     retries = sdata.get('retry_count', 0)
     updated = sdata.get('updated_at', '-')
     if updated != '-':
@@ -116,8 +111,8 @@ for sid, sname in STAGE_ORDER:
     print(f'  {sid} {sname:12s}  {status_str:14s}  {retry_str:>7s}  {updated}')
 
 # Count summary
-total = len(STAGE_ORDER)
-passed = sum(1 for sid, _ in STAGE_ORDER if stages.get(sid, {}).get('status') == 'passed')
+total = len(state.get('scope', []))
+passed = sum(PipelineState.is_verified(stages.get(sid, {}), dag_path) for sid in state.get('scope', []))
 failed = sum(1 for sid, _ in STAGE_ORDER if stages.get(sid, {}).get('status') in ('failed', 'dead_letter'))
 running = sum(1 for sid, _ in STAGE_ORDER if stages.get(sid, {}).get('status') in ('running', 'gate_checking'))
 waiting = sum(1 for sid, _ in STAGE_ORDER if stages.get(sid, {}).get('status') == 'human_waiting')

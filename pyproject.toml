@@ -10,8 +10,8 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 
-# Zero external dependencies — stdlib only
-dependencies = []
+# Schema validation is a required runtime acceptance check.
+dependencies = ["jsonschema>=4"]
 
 [project.optional-dependencies]
 dev = [

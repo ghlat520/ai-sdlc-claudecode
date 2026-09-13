@@ -21,7 +21,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PROJECT_ROOT  # needed by post_commands (e.g., completeness-check)
-DAG_FILE="${SCRIPT_DIR}/pipeline-dag.json"
+DAG_FILE="${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}"
+export PIPELINE_DAG_FILE="$DAG_FILE"
+export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 VALIDATE_SCRIPT="${SCRIPT_DIR}/validate-handoff.sh"
 
 # shellcheck source=lib/events.sh
@@ -35,19 +37,23 @@ PARALLEL_SCRIPT="${SCRIPT_DIR}/orchestrate-parallel.sh"
 # EVOLVE_ERRORS_DIR is set by runner.py or defaults to per-feature evolve dir
 
 # --- Config from DAG (single python3 call to parse all config + stage metadata) ---
-export PIPELINE_ROOT="${PROJECT_ROOT}/docs/pipeline"
+export PIPELINE_ROOT="${PIPELINE_ROOT:-${PROJECT_ROOT}/docs/pipeline}"
 
 # Cache DAG config and per-stage metadata in shell variables (P4: replaces ~60 python3 calls)
 eval "$(DAG_PATH="$DAG_FILE" python3 << 'PYEOF'
-import json, os
+import json, os, shlex, re
 
 with open(os.environ['DAG_PATH']) as f:
     dag = json.load(f)
 
+def assignment(key, value):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        raise ValueError("invalid DAG identifier")
+    print(key + "=" + shlex.quote(str(value)))
 cfg = dag['config']
-print(f'MAX_RETRIES={cfg["max_retries_per_stage"]}')
-print(f'COST_LIMIT={cfg["cost_limit_usd"]}')
-print(f'CONTEXT_BUDGET={cfg["context_budget_tokens"]}')
+assignment("MAX_RETRIES", int(cfg["max_retries_per_stage"]))
+assignment("COST_LIMIT", float(cfg["cost_limit_usd"]))
+assignment("CONTEXT_BUDGET", int(cfg["context_budget_tokens"]))
 
 for name, s in dag['stages'].items():
     sid = s['id']
@@ -60,31 +66,31 @@ for name, s in dag['stages'].items():
     deps = ' '.join(s.get('dependencies', []))
     # Shell-safe variable names: replace - with _ in stage names
     safe_name = name.replace('-', '_')
-    print(f'DAG_{safe_name}_id="{sid}"')
-    print(f'DAG_{safe_name}_model="{model}"')
-    print(f'DAG_{safe_name}_timeout={timeout}')
-    print(f'DAG_{safe_name}_max_retries={max_r}')
-    print(f'DAG_{safe_name}_gate="{gate}"')
-    print(f'DAG_{safe_name}_agent_type="{agent_type}"')
-    print(f'DAG_{safe_name}_deps="{deps}"')
-    post_cmds = '|'.join(s.get('post_commands', []))
-    print(f'DAG_{safe_name}_post_commands="{post_cmds}"')
+    assignment(f'DAG_{safe_name}_id', f'{sid}')
+    assignment(f'DAG_{safe_name}_model', f'{model}')
+    assignment(f'DAG_{safe_name}_timeout', int(timeout))
+    assignment(f'DAG_{safe_name}_max_retries', int(max_r))
+    assignment(f'DAG_{safe_name}_gate', f'{gate}')
+    assignment(f'DAG_{safe_name}_agent_type', f'{agent_type}')
+    assignment(f'DAG_{safe_name}_deps', f'{deps}')
+    post_cmds = json.dumps(s.get('post_commands', []))
+    assignment(f'DAG_{safe_name}_post_commands', f'{post_cmds}')
     # Review passes: sequential review agents that critique and revise primary output
     rp = s.get('review_passes', [])
     print(f'DAG_{safe_name}_review_pass_count={len(rp)}')
     for i, rpass in enumerate(rp):
-        print(f'DAG_{safe_name}_rp{i}_role="{rpass.get("role", "reviewer")}"')
-        print(f'DAG_{safe_name}_rp{i}_model="{rpass.get("model", "sonnet")}"')
-        print(f'DAG_{safe_name}_rp{i}_prompt="{rpass.get("prompt_file", "")}"')
+        assignment(f'DAG_{safe_name}_rp{i}_role', f'{rpass.get("role", "reviewer")}')
+        assignment(f'DAG_{safe_name}_rp{i}_model', f'{rpass.get("model", "sonnet")}')
+        assignment(f'DAG_{safe_name}_rp{i}_prompt', f'{rpass.get("prompt_file", "")}')
 
 # Export tech_stack_commands as TECH_CMD_<key> variables
 ts = cfg.get('tech_stack', 'node-typescript')
 cmds = cfg.get('tech_stack_commands', {}).get(ts, {})
 for key, val in cmds.items():
-    print(f'TECH_CMD_{key}="{val}"')
+    assignment(f'TECH_CMD_{key}', f'{val}')
 
 # Export evidence_required config
-print(f'EVIDENCE_REQUIRED="{str(cfg.get("evidence_required", False)).lower()}"')
+assignment(f'EVIDENCE_REQUIRED', f'{str(cfg.get("evidence_required", False)).lower()}')
 PYEOF
 )"
 
@@ -192,14 +198,16 @@ else:
     elapsed_str = "00:00"
 
 # ── Counts ──
-total = len(stages_meta)
-passed_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") == "passed"]
+from ai_sdlc_claudecode.state import PipelineState
+scope = state.get("scope", [])
+total = len(scope)
+passed_ids = [sid for sid in scope if PipelineState.is_verified(stages_state.get(sid, {}), dag_file)]
 skipped_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") == "skipped"]
 running_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") in ("running", "gate_checking")]
 failed_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") in ("failed", "dead_letter")]
 waiting_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") == "human_waiting"]
 
-effective_done = len(passed_ids) + len(skipped_ids)
+effective_done = len(passed_ids)
 pct = int(effective_done / total * 100) if total > 0 else 0
 bar_len = 30
 filled = int(bar_len * effective_done / total) if total > 0 else 0
@@ -544,7 +552,7 @@ for dep in stage.get('dependencies', []):
     dep_stage = dag['stages'][dep]
     dep_id = dep_stage['id']
     dep_dir = os.path.join(out_dir, '{}-{}'.format(dep_id, dep))
-    json_files = glob.glob(os.path.join(dep_dir, '*.json'))
+    json_files = [os.path.join(dep_dir, 'output.json')] if os.path.isfile(os.path.join(dep_dir, 'output.json')) else []
     if json_files:
         with open(json_files[0]) as f:
             upstream_data['{}_output'.format(dep_id)] = json.dumps(json.load(f), indent=2, ensure_ascii=False)
@@ -626,110 +634,95 @@ PYEOF
 # Resolves {{compile}}, {{test}}, {{lint}} templates from TECH_CMD_* variables
 # Returns 0 if all pass (or no commands), 1 if any fail
 run_post_commands() {
-    local stage_name="$1"
-    local feature_id="$2"
-    local stage_id="$3"
-
-    local post_cmds_raw
-    post_cmds_raw=$(dag_get "$stage_name" "post_commands")
-    [[ -z "$post_cmds_raw" ]] && return 0
-
-    echo -e "  ${YELLOW}Running post-commands (evidence gate)...${NC}"
-
-    local all_pass=true
-    local cmd_output=""
-    IFS='|' read -ra CMD_TEMPLATES <<< "$post_cmds_raw"
-    for tmpl in "${CMD_TEMPLATES[@]}"; do
-        [[ -z "$tmpl" ]] && continue
-        # Resolve {{key}} to TECH_CMD_key
-        local resolved="$tmpl"
+    local stage_name="$1" feature_id="$2" stage_id="$3"
+    local templates tmpl resolved key var cmd_exit cmd_dir
+    templates=$(dag_get "$stage_name" post_commands) || return 1
+    local log_file="${output_dir}/post-commands.log"
+    : > "$log_file"
+    local all_pass=0
+    while IFS= read -r tmpl; do
+        [[ -n "$tmpl" ]] || continue
+        resolved="$tmpl"
         if [[ "$tmpl" =~ ^\{\{([a-z_]+)\}\}$ ]]; then
-            local key="${BASH_REMATCH[1]}"
-            local var="TECH_CMD_${key}"
-            resolved="${!var}"
+            key="${BASH_REMATCH[1]}"
+            var="TECH_CMD_${key}"
+            resolved="${!var:-}"
             if [[ -z "$resolved" ]]; then
-                echo -e "    ${YELLOW}⚠ No command for {{${key}}} in tech stack ${PIPELINE_TECH_STACK}, skipping${NC}"
+                printf 'Missing configured command: %s\n' "$tmpl" >> "$log_file"
+                all_pass=1
                 continue
             fi
         fi
-        echo -e "    Running: ${resolved}"
-        local cmd_exit=0
-        local cmd_result=""
-        local cmd_dir="${PROJECT_CODE_DIR:-$PROJECT_ROOT}"
-        cmd_result=$(cd "$cmd_dir" && eval "$resolved" 2>&1) || cmd_exit=$?
-        if [[ $cmd_exit -eq 0 ]]; then
-            echo -e "    ${GREEN}✓ Passed${NC}"
-        else
-            echo -e "    ${RED}✗ Failed (exit: ${cmd_exit})${NC}"
-            cmd_output+="Command '${resolved}' failed (exit ${cmd_exit}):\n${cmd_result}\n\n"
-            all_pass=false
-        fi
-    done
-
-    if $all_pass; then
-        emit_event "$feature_id" "post_cmd_pass" "$stage_id" "All post-commands passed"
-        return 0
-    else
-        emit_event "$feature_id" "post_cmd_fail" "$stage_id" "Post-command(s) failed"
-        # Store output for caller to use as prev_error_output
-        POST_CMD_ERROR_OUTPUT="$cmd_output"
-        return 1
-    fi
+        printf 'Command: %s\n' "$resolved" >> "$log_file"
+        cmd_exit=0
+        cmd_dir="${PROJECT_CODE_DIR:-$PROJECT_ROOT}"
+        (cd "$cmd_dir" && eval "$resolved") >> "$log_file" 2>&1 || cmd_exit=$?
+        printf 'Exit: %s\n' "$cmd_exit" >> "$log_file"
+        [[ $cmd_exit -eq 0 ]] || all_pass=1
+    done < <(python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])))' "$templates")
+    collect_evidence "$feature_id" "$stage_id" post_commands "$all_pass" "$log_file" || return 1
+    POST_CMD_ERROR_OUTPUT=$(tail -40 "$log_file")
+    return "$all_pass"
 }
 
-# --- Check evidence in agent output (Layer 2: evidence extraction) ---
-# Looks for VERIFICATION_EVIDENCE block in claude output
-# Writes evidence.json if found; emits warning if missing
-check_evidence() {
-    local claude_output="$1"
-    local output_dir="$2"
-    local feature_id="$3"
-    local stage_id="$4"
-
-    if echo "$claude_output" | grep -q "VERIFICATION_EVIDENCE"; then
-        # Extract evidence table into JSON
-        python3 -c "
-import re, json, sys
-
-text = sys.stdin.read()
-
-# Find the VERIFICATION_EVIDENCE table
-table_pattern = r'VERIFICATION_EVIDENCE.*?\n(\|.*\|[\s\S]*?\n)(?:\n|###|$)'
-match = re.search(table_pattern, text)
-
-evidence = {'found': True, 'entries': [], 'status': 'UNKNOWN'}
-
-if match:
-    lines = match.group(1).strip().split('\n')
-    for line in lines:
-        cols = [c.strip() for c in line.strip('|').split('|')]
-        if len(cols) >= 3 and cols[0] not in ('Command', '---', ''):
-            evidence['entries'].append({
-                'command': cols[0],
-                'exit_code': cols[1],
-                'key_output': cols[2] if len(cols) > 2 else ''
-            })
-
-# Find VERIFICATION_STATUS
-status_match = re.search(r'VERIFICATION_STATUS:\s*(VERIFIED|UNVERIFIED|PARTIAL)', text)
-if status_match:
-    evidence['status'] = status_match.group(1)
-
-with open('${output_dir}/evidence.json', 'w') as f:
-    json.dump(evidence, f, indent=2, ensure_ascii=False)
-print('Evidence extracted')
-" <<< "$claude_output" 2>/dev/null || true
-        emit_event "$feature_id" "evidence_found" "$stage_id" "Verification evidence found in output"
-        echo -e "  ${GREEN}✓ Verification evidence found${NC}"
-    else
-        emit_event "$feature_id" "evidence_missing" "$stage_id" "No VERIFICATION_EVIDENCE block in output"
-        echo -e "  ${YELLOW}⚠ No VERIFICATION_EVIDENCE block in agent output${NC}"
-        if [[ "$EVIDENCE_REQUIRED" == "true" ]]; then
-            echo -e "  ${RED}✗ Evidence required but missing — blocking${NC}"
-            return 1
-        fi
+# Required checks collect their own exits; agent self-reports are not acceptance receipts.
+verify_stage() {
+    local stage_name="$1" feature_id="$2" stage_id="$3" output_dir="$4" gate_type="$5"
+    local output_json="${output_dir}/output.json" code=0 log_file="${output_dir}/schema.log"
+    bash "$VALIDATE_SCRIPT" "$stage_id" "$output_json" > "$log_file" 2>&1 || code=$?
+    collect_evidence "$feature_id" "$stage_id" schema "$code" "$log_file" || return 1
+    [[ $code -eq 0 ]] || return 1
+    run_post_commands "$stage_name" "$feature_id" "$stage_id" || return 1
+    if [[ "$stage_id" == S3 || "$stage_id" == S3b ]]; then
+        local contracts_json="${PIPELINE_ROOT}/${feature_id}/S2-architecture/contracts.json"
+        code=0
+        python3 -m ai_sdlc_claudecode.contract_validator "$contracts_json" "${PROJECT_CODE_DIR:-$PROJECT_ROOT}" \
+            > "${output_dir}/contract_violations.json" 2> "${output_dir}/contract_violations.txt" || code=$?
+        collect_evidence "$feature_id" "$stage_id" contracts "$code" "${output_dir}/contract_violations.json" || return 1
+        [[ $code -eq 0 ]] || return 1
     fi
-    return 0
+    if [[ "$stage_id" == S4 || "$stage_id" == S4b || "$stage_id" == S4c ]]; then
+        code=0
+        bash "${SCRIPT_DIR}/lib/tdd-gate.sh" "$feature_id" "${PIPELINE_TECH_STACK:-node-typescript}" 80 \
+            > "${output_dir}/tdd.log" 2>&1 || code=$?
+        collect_evidence "$feature_id" "$stage_id" tdd "$code" "${output_dir}/tdd.log" || return 1
+        [[ $code -eq 0 ]] || return 1
+    fi
+    if [[ "$gate_type" == human-required ]]; then
+        printf 'Approval pending for run %s, attempt %s.\nTrusted approval integration is required; local marker files do not grant authorization.\n' \
+            "$PIPELINE_RUN_ID" "$PIPELINE_ATTEMPT_ID" > "${output_dir}/APPROVAL_REQUIRED"
+        return 3
+    fi
+    log_file="${output_dir}/gate.log"
+    : > "$log_file"
+    code=0
+    case "$gate_type" in
+        auto|auto+ai-review)
+            local commands cmd
+            commands=$(python3 - "$DAG_FILE" "$stage_name" <<'PY_GATE'
+import json, sys
+commands = json.load(open(sys.argv[1]))['stages'][sys.argv[2]]['gate'].get('commands', [])
+if not commands:
+    raise ValueError('automatic gate requires actual commands')
+print('\n'.join(commands))
+PY_GATE
+) || code=$?
+            if [[ $code -eq 0 ]]; then
+                while IFS= read -r cmd; do
+                    printf 'Command: %s\n' "$cmd" >> "$log_file"
+                    (cd "${PROJECT_CODE_DIR:-$PROJECT_ROOT}" && eval "$cmd") >> "$log_file" 2>&1 || code=$?
+                done <<< "$commands"
+            fi
+            ;;
+        ai-review) ;;
+        *) code=2; printf 'Unknown gate type\n' >> "$log_file" ;;
+    esac
+    if [[ $code -eq 0 && ( "$gate_type" == ai-review || "$gate_type" == auto+ai-review ) ]]; then
+        bash "${SCRIPT_DIR}/ai-review-checker.sh" "$stage_id" "$output_json" --model haiku --feature-id "$feature_id" \
+            >> "$log_file" 2>&1 || code=$?
+    fi
+    collect_evidence "$feature_id" "$stage_id" gate "$code" "$log_file" || return 1
+    return "$code"
 }
 
 # --- Review Passes: Sequential multi-agent review loop ---
@@ -769,9 +762,8 @@ run_review_passes() {
         # Load review prompt from file
         if [[ -n "$rp_prompt_file" ]]; then
             local rp_path="${SCRIPT_DIR}/${rp_prompt_file}"
-            if [[ -f "$rp_path" ]]; then
-                review_prompt=$(cat "$rp_path")
-            fi
+            [[ -f "$rp_path" ]] || return 1
+            review_prompt=$(cat "$rp_path") || return 1
         fi
 
         # Inject the primary output as context
@@ -806,7 +798,7 @@ REVIEW_EOF
 
         if [[ "${PIPELINE_SKELETON_MODE:-false}" == "true" ]]; then
             echo -e "    ${YELLOW}[SKELETON] Skipping review pass${NC}"
-            ((i++))
+            i=$((i + 1))
             continue
         fi
 
@@ -820,7 +812,8 @@ REVIEW_EOF
         if [[ $review_exit -eq 0 ]]; then
             # Try to extract revised JSON and replace output.json
             local revised_json="${output_dir}/review-${rp_role}.json"
-            echo "$review_output" | python3 -m ai_sdlc_claudecode extract-json "$revised_json" 2>/dev/null || true
+            rm -f "$revised_json"
+            echo "$review_output" | python3 -m ai_sdlc_claudecode extract-json "$revised_json" 2>/dev/null || return 1
 
             if [[ -f "$revised_json" ]]; then
                 # Validate the revised JSON has the correct stage_id
@@ -833,16 +826,19 @@ REVIEW_EOF
                     local rp_tokens=$(( (${#full_review_prompt} + ${#review_output}) / 4 ))
                     update_cost "$feature_id" "$rp_tokens" "$rp_model" || true
                 else
-                    echo -e "    ${YELLOW}⚠ Review pass ${rp_role}: revised output invalid, keeping original${NC}"
+                    echo -e "    ${RED}Review pass ${rp_role}: invalid revision${NC}"
+                    return 1
                 fi
             else
-                echo -e "    ${YELLOW}⚠ Review pass ${rp_role}: no JSON extracted, keeping original${NC}"
+                echo -e "    ${RED}Review pass ${rp_role}: no revision${NC}"
+                return 1
             fi
         else
-            echo -e "    ${YELLOW}⚠ Review pass ${rp_role}: agent failed (exit ${review_exit}), keeping original${NC}"
+            echo -e "    ${RED}Review pass ${rp_role}: agent failed (exit ${review_exit})${NC}"
+            return 1
         fi
 
-        ((i++))
+        i=$((i + 1))
     done
 
     echo -e "  ${MAGENTA}Review passes complete${NC}"
@@ -882,6 +878,12 @@ execute_stage() {
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${NC}"
 
     while [[ $retry_count -le $max_retry ]]; do
+        PIPELINE_ATTEMPT_ID=$(_pipeline_state begin "$feature_id" "$PIPELINE_RUN_ID" "$stage_id" "$output_dir" "$retry_count") || return 1
+        export PIPELINE_ATTEMPT_ID
+        if ! _pipeline_state dependencies "$feature_id" "$stage_id" "$DAG_FILE"; then
+            set_stage_state "$feature_id" "$stage_id" unverified "$retry_count" || return 1
+            return 4
+        fi
         # Check cost limit
         if ! check_cost_limit "$feature_id" "$COST_LIMIT" >/dev/null 2>&1; then
             emit_event "$feature_id" "cost_exceeded" "$stage_id" "Cost limit exceeded, stopping pipeline"
@@ -895,7 +897,6 @@ execute_stage() {
             emit_event "$feature_id" "retry" "$stage_id" "Retry ${retry_count}/${max_retry}"
         fi
 
-        set_stage_state "$feature_id" "$stage_id" "running" "$retry_count"
         emit_event "$feature_id" "stage_start" "$stage_id" "Starting ${stage_name} (attempt $((retry_count + 1)))"
 
         # Protocol: Commander dispatches task to Agent
@@ -932,7 +933,8 @@ execute_stage() {
         local aug_suffix=""
         if [[ -f "${evolve_dir}/augments/${stage_id}.json" ]]; then
             local augment_json aug_txt aug_ids
-            augment_json="${evolve_dir}/augments/${stage_id}.json"
+            augment_json="${output_dir}/.attempts/${PIPELINE_ATTEMPT_ID}/augment.json"
+            cp "${evolve_dir}/augments/${stage_id}.json" "$augment_json" || return 1
             aug_txt=$(python3 -c "import json; d=json.load(open('${augment_json}')); print(d.get('injection',''), end='')" 2>/dev/null || cat "${evolve_dir}/augments/${stage_id}.txt" 2>/dev/null)
             aug_ids=$(python3 -c "import json; d=json.load(open('${augment_json}')); print(','.join(d.get('fix_ids',[])))" 2>/dev/null || echo "")
             if [[ -n "$aug_txt" ]]; then
@@ -1098,7 +1100,7 @@ SKELPYEOF
                     send_notification "$feature_id" "dead_letter" "Stage ${stage_id} timed out after ${stage_timeout}s"
                     prev_error_output="TIMEOUT after ${stage_timeout}s. Partial output: ${claude_raw: -500}"
                     prev_exit_code="124 (timeout)"
-                    ((retry_count++))
+                    retry_count=$((retry_count + 1))
                     continue
                 fi
             else
@@ -1188,6 +1190,8 @@ PYEOF
         fi
 
         if [[ $claude_exit -ne 0 ]]; then
+            printf '%s\n' "$claude_output" > "${output_dir}/agent-failure.log"
+            collect_evidence "$feature_id" "$stage_id" agent "$claude_exit" "${output_dir}/agent-failure.log" || return 1
             echo -e "  ${RED}Claude invocation failed (exit: ${claude_exit})${NC}"
             emit_event "$feature_id" "stage_fail" "$stage_id" "Agent failed with exit code ${claude_exit}"
             set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
@@ -1196,7 +1200,11 @@ PYEOF
             prev_error_output="$claude_output"
             prev_exit_code="$claude_exit"
 
-            # Real-time error capture + augment (always enabled)
+            if [[ "${PIPELINE_MOCK_REVIEW:-false}" == true ]]; then
+                retry_count=$((retry_count + 1))
+                continue
+            fi
+            # Real-time error capture for an actual failed invocation.
             local evolve_dir="${EVOLVE_ERRORS_DIR:-${PIPELINE_ROOT}/${feature_id}/evolve}"
             mkdir -p "${evolve_dir}/failures"
             local fail_ts
@@ -1217,7 +1225,7 @@ except Exception:
     pass
 " <<< "$claude_output" 2>/dev/null || true
 
-            ((retry_count++))
+            retry_count=$((retry_count + 1))
             continue
         fi
 
@@ -1232,374 +1240,40 @@ except Exception:
             }
         fi
 
-        # Layer 0.5: Review passes — sequential multi-agent review loop
-        # Review agents critique and revise the primary output before post-commands
-        run_review_passes "$stage_name" "$feature_id" "$output_dir" "$stage_id"
+        if [[ "${PIPELINE_SKELETON_MODE:-false}" == true || "${PIPELINE_MOCK_REVIEW:-false}" == true ]]; then
+            set_stage_state "$feature_id" "$stage_id" simulated "$retry_count" || return 1
+            return 0
+        fi
 
-        # Layer 1: Post-commands hard gate (compile/test/lint)
-        # Skip in skeleton mode — no real code to compile
-        POST_CMD_ERROR_OUTPUT=""
-        if [[ "${PIPELINE_SKELETON_MODE:-false}" == "true" ]]; then
-            echo -e "  ${YELLOW}[SKELETON] Skipping post-commands${NC}"
-        elif ! run_post_commands "$stage_name" "$feature_id" "$stage_id"; then
-            prev_error_output="Post-command verification failed:\n${POST_CMD_ERROR_OUTPUT}"
-            prev_exit_code="post_cmd_fail"
-            set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
-            ((retry_count++))
+        # Refinement belongs to generation; only verify_stage accepts the final artifact.
+        local refinement_exit=0
+        run_review_passes "$stage_name" "$feature_id" "$output_dir" "$stage_id" > "${output_dir}/refinement.log" 2>&1 || refinement_exit=$?
+        if [[ $(dag_get "$stage_name" review_pass_count) -gt 0 ]]; then
+            collect_evidence "$feature_id" "$stage_id" refinement "$refinement_exit" "${output_dir}/refinement.log" || return 1
+        fi
+        if [[ $refinement_exit -ne 0 ]]; then
+            set_stage_state "$feature_id" "$stage_id" failed "$retry_count" || return 1
+            prev_error_output="Configured refinement review failed"
+            prev_exit_code="review_pass_failed"
+            retry_count=$((retry_count + 1))
             continue
         fi
-
-        # Layer 2: Evidence extraction (check agent output for verification proof)
-        if ! check_evidence "$claude_output" "$output_dir" "$feature_id" "$stage_id"; then
-            prev_error_output="VERIFICATION_EVIDENCE block missing from output. You MUST include verification evidence."
-            prev_exit_code="evidence_missing"
-            set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
-            ((retry_count++))
-            continue
+        local check_exit=0
+        verify_stage "$stage_name" "$feature_id" "$stage_id" "$output_dir" "$gate_type" || check_exit=$?
+        if [[ $check_exit -eq 3 && "$gate_type" == human-required ]]; then
+            set_stage_state "$feature_id" "$stage_id" human_waiting "$retry_count" || return 1
+            set_pipeline_state "$feature_id" human_waiting "Approval required: ${stage_id}" || return 1
+            emit_event "$feature_id" human_wait "$stage_id" "Approval request saved; no approval was granted"
+            return 3
+        elif [[ $check_exit -eq 0 ]]; then
+            set_stage_state "$feature_id" "$stage_id" passed "$retry_count" || return 1
+            emit_event "$feature_id" stage_pass "$stage_id" "Configured stage checks passed; business acceptance not evaluated"
+            return 0
         fi
-
-        # Validate handoff
-        echo -e "  ${YELLOW}Validating output...${NC}"
-        set_stage_state "$feature_id" "$stage_id" "gate_checking" "$retry_count"
-
-        if [[ -f "$output_json" ]]; then
-            local validate_result
-            validate_result=$(bash "$VALIDATE_SCRIPT" "$stage_id" "$output_json" 2>&1) || true
-
-            if echo "$validate_result" | grep -q "\[PASS\]"; then
-                echo -e "  ${GREEN}✓ Schema validation passed${NC}"
-            else
-                echo -e "  ${YELLOW}⚠ Schema validation issues (non-blocking for now):${NC}"
-                echo "$validate_result" | head -10 | sed 's/^/    /'
-            fi
-        fi
-
-        # Contract Hard Gate: cross-service contract drift check (S3, S3b)
-        # Catches C1/C2/C3-class bugs (ai-media-platform 2026-03-19): encrypt/decrypt mismatch,
-        # duplicate services with divergent schemas, cross-service message field drift.
-        if [[ "$stage_id" == "S3" || "$stage_id" == "S3b" ]] && [[ "${PIPELINE_SKELETON_MODE:-false}" != "true" ]]; then
-            local contracts_json
-            contracts_json=$(find "${PIPELINE_ROOT:-./pipeline}/${feature_id}" -path "*/S2-*/contracts.json" -type f 2>/dev/null | head -1)
-            local code_root="${PROJECT_CODE_DIR:-$PROJECT_ROOT}"
-            if [[ -n "$contracts_json" && -f "$contracts_json" && -d "$code_root" ]]; then
-                echo -e "  ${YELLOW}Running Contract Hard Gate (cross-service drift check)...${NC}"
-                local contract_report="${output_dir}/contract_violations.json"
-                local contract_exit=0
-                PYTHONPATH="${SCRIPT_DIR}/src" python3 -m ai_sdlc_claudecode.contract_validator \
-                    "$contracts_json" "$code_root" > "$contract_report" 2> "${output_dir}/contract_violations.txt" || contract_exit=$?
-
-                if [[ $contract_exit -eq 0 ]]; then
-                    echo -e "  ${GREEN}✓ Contract Gate PASSED${NC}"
-                    emit_event "$feature_id" "contract_gate_pass" "$stage_id" "Contract validator passed"
-                elif [[ $contract_exit -eq 1 ]]; then
-                    local blocking_count
-                    blocking_count=$(python3 -c "import json; print(json.load(open('$contract_report'))['blocking'])" 2>/dev/null || echo "?")
-                    echo -e "  ${RED}✗ Contract Gate FAILED — $blocking_count blocking violation(s)${NC}"
-                    head -15 "${output_dir}/contract_violations.txt" | sed 's/^/    /' >&2
-                    emit_event "$feature_id" "contract_gate_fail" "$stage_id" "Contract violations: $blocking_count blocking"
-                    prev_error_output="Contract Hard Gate failed with $blocking_count blocking violation(s). See ${contract_report} for the full list. You MUST fix these cross-service contract violations: service names must match contracts.services[]; encrypted fields must be decrypted before external use; cross-service message field names must match contracts.cross_service_messages[].payload_fields exactly; shared models have one owner_service only; no hallucinated npm packages or LLM model IDs."
-                    prev_exit_code="contract_gate_fail"
-                    set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
-                    ((retry_count++))
-                    continue
-                else
-                    echo -e "  ${YELLOW}⚠ Contract Gate: validator error (exit $contract_exit), treating as non-blocking${NC}"
-                fi
-            else
-                echo -e "  ${YELLOW}⚠ Contract Gate: no contracts.json found (S2 skipped? legacy feature?), skipping${NC}"
-            fi
-        fi
-
-        # TDD Hard Gate: enforce coverage threshold for testing stages (S4, S4b, S4c)
-        if [[ "$stage_id" == "S4" || "$stage_id" == "S4b" || "$stage_id" == "S4c" ]]; then
-            local tdd_gate_script="${SCRIPT_DIR}/lib/tdd-gate.sh"
-            if [[ -f "$tdd_gate_script" ]]; then
-                echo -e "  ${YELLOW}Running TDD Hard Gate (coverage check)...${NC}"
-                local tdd_result=""
-                local tdd_exit=0
-                tdd_result=$(bash "$tdd_gate_script" "$feature_id" "${PIPELINE_TECH_STACK:-node-typescript}" 80 2>&1) || tdd_exit=$?
-
-                echo "$tdd_result" | grep '^\[TDD-GATE\]' | sed 's/^/  /'
-
-                if [[ $tdd_exit -eq 1 ]]; then
-                    echo -e "  ${RED}✗ TDD Hard Gate FAILED — coverage below 80%${NC}"
-                    emit_event "$feature_id" "tdd_gate_fail" "$stage_id" "Coverage below threshold"
-                    prev_error_output="TDD Hard Gate: coverage below 80% threshold. ${tdd_result}"
-                    prev_exit_code="tdd_gate_fail"
-                    set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
-                    ((retry_count++))
-                    continue
-                elif [[ $tdd_exit -eq 0 ]]; then
-                    echo -e "  ${GREEN}✓ TDD Hard Gate PASSED${NC}"
-                    emit_event "$feature_id" "tdd_gate_pass" "$stage_id" "Coverage meets threshold"
-                else
-                    echo -e "  ${YELLOW}⚠ TDD Hard Gate: could not determine coverage (non-blocking)${NC}"
-                fi
-            fi
-        fi
-
-        # Gate check
-        echo -e "  ${YELLOW}Checking gate (${gate_type})...${NC}"
-        case "$gate_type" in
-            auto)
-                # Run automatic commands
-                local gate_commands
-                gate_commands=$(DAG_PATH="$DAG_FILE" STG="$stage_name" python3 -c "
-import json, os
-stage = json.load(open(os.environ['DAG_PATH']))['stages'][os.environ['STG']]
-cmds = stage.get('gate', {}).get('commands', [])
-print('\n'.join(cmds))
-" 2>/dev/null)
-
-                local gate_pass=true
-                if [[ -n "$gate_commands" ]]; then
-                    while IFS= read -r cmd; do
-                        [[ -z "$cmd" ]] && continue
-                        echo -e "    Running: ${cmd}"
-                        if eval "$cmd" >/dev/null 2>&1; then
-                            echo -e "    ${GREEN}✓ Passed${NC}"
-                        else
-                            echo -e "    ${RED}✗ Failed${NC}"
-                            gate_pass=false
-                        fi
-                    done <<< "$gate_commands"
-                fi
-
-                if $gate_pass; then
-                    emit_event "$feature_id" "gate_pass" "$stage_id" "Auto gate passed"
-                    set_stage_state "$feature_id" "$stage_id" "passed" "$retry_count"
-                    send_message "$feature_id" "$agent_type" "Commander" "$MSG_RESPONSE" \
-                        "${stage_name} complete, gate passed" "${output_dir}/output.json"
-                    send_message "$feature_id" "Commander" "GateCheck" "$MSG_GATE" \
-                        "${stage_id} auto gate: PASSED"
-                    echo -e "  ${GREEN}✓ Gate PASSED${NC}"
-                    return 0
-                else
-                    emit_event "$feature_id" "gate_fail" "$stage_id" "Auto gate failed"
-                    set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
-                    prev_error_output="Auto gate check failed. Gate commands did not pass."
-                    prev_exit_code="gate_fail"
-                    ((retry_count++))
-                    continue
-                fi
-                ;;
-
-            auto+ai-review)
-                # Skeleton mode: skip auto commands and auto-pass
-                if [[ "${PIPELINE_SKELETON_MODE:-false}" == "true" ]]; then
-                    echo -e "  ${YELLOW}[SKELETON] Auto-passing auto+ai-review gate${NC}"
-                    emit_event "$feature_id" "gate_pass" "$stage_id" "Auto+AI-review gate auto-passed (skeleton mode)"
-                    set_stage_state "$feature_id" "$stage_id" "passed" "$retry_count"
-                    echo -e "  ${GREEN}✓ Gate PASSED (auto+ai-review, skeleton)${NC}"
-                    return 0
-                fi
-                # Phase 1: Run auto commands first
-                local gate_commands_mixed
-                gate_commands_mixed=$(DAG_PATH="$DAG_FILE" STG="$stage_name" python3 -c "
-import json, os
-stage = json.load(open(os.environ['DAG_PATH']))['stages'][os.environ['STG']]
-cmds = stage.get('gate', {}).get('commands', [])
-print('\n'.join(cmds))
-" 2>/dev/null)
-
-                local auto_pass=true
-                if [[ -n "$gate_commands_mixed" ]]; then
-                    echo -e "  ${YELLOW}Phase 1: Running auto commands...${NC}"
-                    while IFS= read -r cmd; do
-                        [[ -z "$cmd" ]] && continue
-                        echo -e "    Running: ${cmd}"
-                        if eval "$cmd" >/dev/null 2>&1; then
-                            echo -e "    ${GREEN}✓ Passed${NC}"
-                        else
-                            echo -e "    ${RED}✗ Failed${NC}"
-                            auto_pass=false
-                        fi
-                    done <<< "$gate_commands_mixed"
-                fi
-
-                if ! $auto_pass; then
-                    emit_event "$feature_id" "gate_fail" "$stage_id" "Auto+AI-review gate failed (auto phase)"
-                    set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
-                    prev_error_output="Auto gate commands failed in auto+ai-review gate."
-                    prev_exit_code="gate_fail"
-                    ((retry_count++))
-                    continue
-                fi
-
-                echo -e "  ${GREEN}Phase 1: Auto commands passed${NC}"
-                echo -e "  ${YELLOW}Phase 2: Running AI review...${NC}"
-
-                # Phase 2: AI review (same as ai-review gate)
-                local ai_review_script_mixed="${SCRIPT_DIR}/ai-review-checker.sh"
-                if [[ -f "$output_json" && -x "$ai_review_script_mixed" ]]; then
-                    local ai_review_exit_mixed=0
-                    local review_flags_mixed=(--model "haiku" --feature-id "$feature_id")
-                    if [[ "${PIPELINE_MOCK_REVIEW:-false}" == "true" ]]; then
-                        review_flags_mixed+=(--mock)
-                    fi
-                    bash "$ai_review_script_mixed" "$stage_id" "$output_json" \
-                        "${review_flags_mixed[@]}" 2>&1 || ai_review_exit_mixed=$?
-
-                    if [[ $ai_review_exit_mixed -eq 0 ]]; then
-                        emit_event "$feature_id" "gate_pass" "$stage_id" "Auto+AI-review gate passed"
-                        set_stage_state "$feature_id" "$stage_id" "passed" "$retry_count"
-                        send_message "$feature_id" "$agent_type" "Commander" "$MSG_RESPONSE" \
-                            "${stage_name} complete, auto+AI review passed" "${output_dir}/output.json"
-                        send_message "$feature_id" "Commander" "GateCheck" "$MSG_GATE" \
-                            "${stage_id} auto+ai-review gate: PASSED"
-                        echo -e "  ${GREEN}✓ Gate PASSED (auto+ai-review)${NC}"
-                        return 0
-                    fi
-                fi
-
-                emit_event "$feature_id" "gate_fail" "$stage_id" "Auto+AI-review gate failed (AI phase)"
-                prev_error_output="AI review phase failed in auto+ai-review gate."
-                prev_exit_code="gate_fail"
-                ((retry_count++))
-                continue
-                ;;
-
-            ai-review)
-                # AI-review gate: run semantic evaluation via ai-review-checker.sh
-                local ai_review_script="${SCRIPT_DIR}/ai-review-checker.sh"
-                if [[ -f "$output_json" && -x "$ai_review_script" ]]; then
-                    local ai_review_exit=0
-                    local review_flags=(--model "haiku" --feature-id "$feature_id")
-                    if [[ "${PIPELINE_MOCK_REVIEW:-false}" == "true" ]]; then
-                        review_flags+=(--mock)
-                    fi
-                    bash "$ai_review_script" "$stage_id" "$output_json" \
-                        "${review_flags[@]}" 2>&1 || ai_review_exit=$?
-
-                    if [[ $ai_review_exit -eq 0 ]]; then
-                        emit_event "$feature_id" "gate_pass" "$stage_id" "AI-review gate passed"
-                        set_stage_state "$feature_id" "$stage_id" "passed" "$retry_count"
-                        send_message "$feature_id" "$agent_type" "Commander" "$MSG_RESPONSE" \
-                            "${stage_name} complete, AI review passed" "${output_dir}/output.json"
-                        send_message "$feature_id" "Commander" "GateCheck" "$MSG_GATE" \
-                            "${stage_id} ai-review gate: PASSED"
-                        echo -e "  ${GREEN}✓ Gate PASSED (AI-review)${NC}"
-                        return 0
-                    else
-                        echo -e "  ${YELLOW}AI review failed, falling back to structural check...${NC}"
-                        # Fallback: pass if output exists and has valid structure
-                        if python3 -c "import json; d=json.load(open('${output_json}')); assert d.get('stage_id') == '${stage_id}'" 2>/dev/null; then
-                            emit_event "$feature_id" "gate_pass" "$stage_id" "AI-review gate passed (structural fallback)"
-                            set_stage_state "$feature_id" "$stage_id" "passed" "$retry_count"
-                            send_message "$feature_id" "$agent_type" "Commander" "$MSG_RESPONSE" \
-                                "${stage_name} complete" "${output_dir}/output.json"
-                            send_message "$feature_id" "Commander" "GateCheck" "$MSG_GATE" \
-                                "${stage_id} ai-review gate: PASSED (fallback)"
-                            echo -e "  ${GREEN}✓ Gate PASSED (structural fallback)${NC}"
-                            return 0
-                        fi
-                    fi
-                elif [[ -f "$output_json" ]]; then
-                    # No ai-review-checker.sh available, pass if output exists
-                    emit_event "$feature_id" "gate_pass" "$stage_id" "AI-review gate passed (output valid)"
-                    set_stage_state "$feature_id" "$stage_id" "passed" "$retry_count"
-                    send_message "$feature_id" "$agent_type" "Commander" "$MSG_RESPONSE" \
-                        "${stage_name} complete" "${output_dir}/output.json"
-                    send_message "$feature_id" "Commander" "GateCheck" "$MSG_GATE" \
-                        "${stage_id} ai-review gate: PASSED"
-                    echo -e "  ${GREEN}✓ Gate PASSED (AI-review)${NC}"
-                    return 0
-                fi
-                emit_event "$feature_id" "gate_fail" "$stage_id" "AI-review gate failed"
-                prev_error_output="AI-review gate rejected the output. Review checker did not pass quality threshold."
-                prev_exit_code="gate_fail"
-                ((retry_count++))
-                continue
-                ;;
-
-            human-required)
-                # Skeleton mode: auto-approve human gates
-                if [[ "${PIPELINE_SKELETON_MODE:-false}" == "true" ]]; then
-                    echo -e "  ${YELLOW}[SKELETON] Auto-approving human gate for ${stage_id}${NC}"
-                    emit_event "$feature_id" "gate_pass" "$stage_id" "Human gate auto-approved (skeleton mode)"
-                    set_stage_state "$feature_id" "$stage_id" "passed" "$retry_count"
-                    echo -e "  ${GREEN}✓ Gate PASSED (human-required, skeleton auto-approved)${NC}"
-                    return 0
-                fi
-                # Create approval request file with quantitative scorecard
-                local approval_file="${output_dir}/APPROVAL_REQUIRED"
-                local scorecard_script="${SCRIPT_DIR}/lib/review-scorecard.py"
-                local review_content=""
-
-                # Generate quantitative scorecard if script exists
-                if [[ -f "$scorecard_script" ]]; then
-                    review_content=$(python3 "$scorecard_script" "$PIPELINE_ROOT" "$feature_id" "$stage_id" 2>/dev/null) || true
-                fi
-
-                # Fallback to basic notification if scorecard failed
-                if [[ -z "$review_content" ]]; then
-                    review_content=$(DAG_PATH="$DAG_FILE" STG="$stage_name" python3 -c "
-import json, os
-stage = json.load(open(os.environ['DAG_PATH']))['stages'][os.environ['STG']]
-print(stage.get('gate', {}).get('notification', 'Human approval required'))
-" 2>/dev/null)
-                fi
-
-                cat > "$approval_file" <<APPROVAL
-${review_content}
-
-To approve:  rm ${approval_file} && touch ${output_dir}/APPROVED
-To reject:   rm ${approval_file} && touch ${output_dir}/REJECTED
-APPROVAL
-
-                emit_event "$feature_id" "human_wait" "$stage_id" "Waiting for human approval"
-                set_stage_state "$feature_id" "$stage_id" "human_waiting" "$retry_count"
-                send_notification "$feature_id" "human_wait" "Stage ${stage_id} requires human approval. Review: ${output_dir}/"
-
-                echo -e "  ${BOLD}${YELLOW}⏸ Human approval required.${NC}"
-                echo -e "  ${YELLOW}  Review output at: ${output_dir}/${NC}"
-                echo -e "  ${YELLOW}  To approve: rm ${approval_file} && touch ${output_dir}/APPROVED${NC}"
-                echo -e "  ${YELLOW}  To reject:  rm ${approval_file} && touch ${output_dir}/REJECTED${NC}"
-
-                # Poll for approval (check every 10 seconds, timeout after 24 hours)
-                local wait_count=0
-                local max_wait=8640  # 8640 * 10s = 24 hours
-                while [[ $wait_count -lt $max_wait ]]; do
-                    if [[ -f "${output_dir}/APPROVED" ]]; then
-                        rm -f "${output_dir}/APPROVED" "$approval_file"
-                        emit_event "$feature_id" "gate_pass" "$stage_id" "Human approved"
-                        set_stage_state "$feature_id" "$stage_id" "passed" "$retry_count"
-                        echo -e "  ${GREEN}✓ Approved!${NC}"
-                        return 0
-                    elif [[ -f "${output_dir}/REJECTED" ]]; then
-                        rm -f "${output_dir}/REJECTED" "$approval_file"
-                        emit_event "$feature_id" "gate_fail" "$stage_id" "Human rejected"
-                        set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
-                        echo -e "  ${RED}✗ Rejected${NC}"
-                        ((retry_count++))
-                        continue 2
-                    fi
-                    sleep 10
-                    ((wait_count++))
-                done
-
-                echo -e "  ${RED}Approval timeout (24 hours)${NC}"
-                emit_event "$feature_id" "dead_letter" "$stage_id" "Approval timeout"
-                set_stage_state "$feature_id" "$stage_id" "dead_letter" "$retry_count"
-
-                # Capture timeout for evolve learning
-                local evolve_dir="${PIPELINE_ROOT}/${feature_id}/evolve/failures"
-                mkdir -p "$evolve_dir"
-                cat > "${evolve_dir}/${stage_id}-$(date +%s).json" <<EVOLVE_TIMEOUT
-{
-  "stage_id": "${stage_id}",
-  "stage_name": "${stage_name}",
-  "feature_id": "${feature_id}",
-  "failure_type": "human_approval_timeout",
-  "timeout_seconds": $((max_wait * 10)),
-  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-}
-EVOLVE_TIMEOUT
-                emit_event "$feature_id" "evolve_capture" "$stage_id" "Approval timeout captured for evolve learning"
-
-                return 1
-                ;;
-        esac
+        set_stage_state "$feature_id" "$stage_id" failed "$retry_count" || return 1
+        prev_error_output="Required verification failed (exit ${check_exit}); inspect ${output_dir}/*.log"
+        prev_exit_code="$check_exit"
+        retry_count=$((retry_count + 1))
     done
 
     # Max retries exceeded → dead letter
@@ -1703,6 +1377,11 @@ main() {
         usage
     fi
 
+    if [[ ! "$feature_id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+        echo "Invalid feature_id: use letters, numbers, underscore or hyphen" >&2
+        return 2
+    fi
+
     # Resolve project_dir: CLI arg > state.json > default (sibling of ai-sdlc-claudecode)
     if [[ -z "$project_dir" ]]; then
         # Try reading from state.json
@@ -1723,19 +1402,9 @@ main() {
         exit 1
     fi
 
-    # Auto-resume: find last passed stage and continue from there
-    if $auto_resume; then
-        local resume_point
-        resume_point=$(get_resume_point "$feature_id")
-        if [[ -n "$resume_point" ]]; then
-            start_from="$resume_point"
-            echo -e "${CYAN}Auto-resume: continuing from ${resume_point}${NC}"
-            emit_event "$feature_id" "pipeline_resume" "PIPE" "Resuming from ${resume_point}"
-            set_pipeline_state "$feature_id" "running" "Resumed from ${resume_point}"
-        else
-            echo -e "${GREEN}All stages already passed. Nothing to resume.${NC}"
-            exit 0
-        fi
+    # Resume retains the originally selected scope; each invocation still has a fresh run ID.
+    if $auto_resume && [[ -z "$specific_stages" && -z "$start_from" && -f "${PIPELINE_ROOT}/${feature_id}/state.json" ]]; then
+        specific_stages=$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1])).get("scope", [])))' "${PIPELINE_ROOT}/${feature_id}/state.json")
     fi
 
     # Read tech_stack from DAG config if not overridden
@@ -1824,31 +1493,10 @@ print(f'{passed}/{total} stages passed, last updated: {last_update}')
         exit 1
     fi
 
-    emit_event "$feature_id" "pipeline_start" "PIPE" "Starting pipeline for: ${feature_description}"
-
-    # Initialize state — skip if resuming (preserve existing passed stages)
-    if [[ "$auto_resume" == "true" || -n "$start_from" ]]; then
-        echo -e "${CYAN}Preserving existing state.json (resume mode)${NC}"
-    else
-        # Fresh start or force restart — initialize clean state
-        FEAT_ID="$feature_id" FEAT_DESC="$feature_description" \
-        STATE_FILE="$state_file" \
-        COST_LIM="$COST_LIMIT" MAX_R="$MAX_RETRIES" python3 << 'PYEOF'
-import json, os
-state = {
-    'feature_id': os.environ['FEAT_ID'],
-    'feature_description': os.environ['FEAT_DESC'],
-    'stages': {},
-    'cost': {'total_tokens': 0, 'estimated_usd': 0.0},
-    'config': {
-        'cost_limit_usd': float(os.environ['COST_LIM']),
-        'max_retries': int(os.environ['MAX_R'])
-    }
-}
-with open(os.environ['STATE_FILE'], 'w') as f:
-    json.dump(state, f, indent=2, ensure_ascii=False)
-PYEOF
-    fi
+    PIPELINE_RUN_ID=$(_pipeline_state start "$feature_id" "$feature_id" "$DAG_FILE" "$specific_stages" "$start_from" "$mock_review" "$PROJECT_CODE_DIR" "$$" "$feature_description" "$COST_LIMIT" "$MAX_RETRIES") || return 1
+    export PIPELINE_RUN_ID
+    _pipeline_state replay "$feature_id" || return 1
+    emit_event "$feature_id" pipeline_start PIPE "Starting requested execution scope"
 
     echo -e "\n${BOLD}Starting SDLC Pipeline${NC}"
     echo -e "  Feature:    ${feature_id}"
@@ -1890,7 +1538,7 @@ with open(os.path.join(out_dir, 'output.json'), 'w') as f:
 
 print(f'Imported spec from {spec_file}')
 PYEOF
-        set_stage_state "$feature_id" "S1" "passed" 0
+        set_stage_state "$feature_id" "S1" "imported" 0
         emit_event "$feature_id" "stage_skip" "S1" "Using external spec: ${spec_file}"
         echo -e "  ${GREEN}✓ S1 requirements: imported from ${spec_file}${NC}"
         # Auto-skip S1
@@ -1929,7 +1577,7 @@ with open(os.path.join(out_dir, 'output.json'), 'w') as f:
 
 print(f'Imported plan from {plan_file}')
 PYEOF
-        set_stage_state "$feature_id" "S2" "passed" 0
+        set_stage_state "$feature_id" "S2" "imported" 0
         emit_event "$feature_id" "stage_skip" "S2" "Using external plan: ${plan_file}"
         echo -e "  ${GREEN}✓ S2 architecture: imported from ${plan_file}${NC}"
         # Auto-skip S2
@@ -1969,159 +1617,59 @@ for item in dag['execution_order']:
 PYEOF
 )
 
+    source "$PARALLEL_SCRIPT"
     while IFS= read -r exec_item <&3; do
-        local exec_mode="${exec_item%%:*}"
-        local exec_target="${exec_item#*:}"
-
-        if [[ "$exec_mode" == "parallel" ]]; then
-            # Parallel execution group
-            local parallel_stages="${exec_target//|/,}"
-
-            # Skip logic for parallel groups (--start-from)
-            if [[ -n "$skip_until" ]]; then
-                local found_start=false
-                IFS=',' read -ra par_arr <<< "$parallel_stages"
-                for ps in "${par_arr[@]}"; do
-                    local ps_id
-                    ps_id=$(dag_get "$ps" "id")
-                    if [[ "$ps_id" == "$skip_until" || "$ps" == "$skip_until" ]]; then
-                        found_start=true
-                        break
-                    fi
-                done
-                if $found_start; then
-                    skip_until=""
-                else
-                    echo -e "  ${YELLOW}Skipping parallel group ${parallel_stages} (resuming from ${start_from})${NC}"
-                    continue
-                fi
+        local exec_mode="${exec_item%%:*}" exec_target="${exec_item#*:}"
+        local selected_names=() stage stage_id current
+        local group_names=()
+        IFS='|' read -ra group_names <<< "$exec_target"
+        for stage in "${group_names[@]}"; do
+            stage_id=$(dag_get "$stage" id)
+            _pipeline_state selected "$feature_id" "$stage_id" || continue
+            if [[ ",${skip_stages}," == *",${stage},"* || ",${skip_stages}," == *",${stage_id},"* ]]; then
+                set_stage_state "$feature_id" "$stage_id" skipped 0 || return 1
+                continue
             fi
-
-            # Check if ALL stages in this parallel group are skipped via --skip-stage
-            if [[ -n "$skip_stages" ]]; then
-                local all_skipped=true
-                local remaining_stages=""
-                IFS=',' read -ra par_arr <<< "$parallel_stages"
-                for ps in "${par_arr[@]}"; do
-                    local ps_id
-                    ps_id=$(dag_get "$ps" "id")
-                    if echo "$skip_stages" | tr ',' '\n' | grep -qw "$ps_id" || \
-                       echo "$skip_stages" | tr ',' '\n' | grep -qw "$ps"; then
-                        # This stage is skipped
-                        set_stage_state "$feature_id" "$ps_id" "passed" 0
-                        emit_event "$feature_id" "stage_skip" "$ps_id" "Skipped via --skip-stage flag"
-                    else
-                        all_skipped=false
-                        if [[ -n "$remaining_stages" ]]; then
-                            remaining_stages="${remaining_stages},${ps}"
-                        else
-                            remaining_stages="$ps"
-                        fi
-                    fi
-                done
-
-                if $all_skipped; then
-                    echo -e "  ${YELLOW}Skipping entire parallel group [${parallel_stages}] (all stages in --skip-stage)${NC}"
-                    emit_event "$feature_id" "parallel_skip" "PAR" "Entire parallel group skipped: ${parallel_stages}"
-                    continue
-                fi
-
-                # If only some stages are skipped, run the remaining ones
-                if [[ "$remaining_stages" != "$parallel_stages" ]]; then
-                    parallel_stages="$remaining_stages"
-                    echo -e "  ${YELLOW}Partial parallel group: running only [${parallel_stages}]${NC}"
-                fi
+            current=$(get_stage_state "$feature_id" "$stage_id") || return 1
+            if $auto_resume && [[ "$current" == passed ]]; then
+                continue
             fi
-
-            echo -e "\n${BOLD}${MAGENTA}▶ Executing parallel group: ${parallel_stages}${NC}"
-            if ! /opt/homebrew/bin/bash "$PARALLEL_SCRIPT" "$feature_id" "$feature_description" "$parallel_stages"; then
-                pipeline_success=false
-                echo -e "${RED}Parallel group failed: ${parallel_stages}${NC}"
-                emit_event "$feature_id" "pipeline_fail" "PIPE" "Pipeline halted: parallel group ${parallel_stages} failed"
-                render_dashboard "$feature_id"
-                break
+            if $auto_resume && [[ "$current" == human_waiting ]]; then
+                break 2
             fi
-            render_dashboard "$feature_id"
+            selected_names+=("$stage")
+        done
+        [[ ${#selected_names[@]} -gt 0 ]] || continue
+        local stage_exit=0
+        if [[ "$exec_mode" == parallel ]]; then
+            execute_parallel_group "$feature_id" "$feature_description" "${selected_names[@]}" || stage_exit=$?
         else
-            # Sequential execution (existing logic)
-            local stage="$exec_target"
-            local stage_id
-            stage_id=$(dag_get "$stage" "id")
-
-            # Skip stages if --start-from specified
-            if [[ -n "$skip_until" ]]; then
-                if [[ "$stage_id" == "$skip_until" || "$stage" == "$skip_until" ]]; then
-                    skip_until=""
-                else
-                    echo -e "  ${YELLOW}Skipping ${stage_id} ${stage} (resuming from ${start_from})${NC}"
-                    continue
-                fi
+            execute_stage "${selected_names[0]}" "$feature_id" "$feature_description" || stage_exit=$?
+        fi
+        render_dashboard "$feature_id"
+        if [[ $stage_exit -ne 0 ]]; then
+            if [[ $stage_exit -ne 3 && $stage_exit -ne 4 ]]; then
+                set_pipeline_state "$feature_id" failed "Stage execution failed" || return 1
             fi
-
-            # Skip stages not in --stages list
-            if [[ -n "$specific_stages" ]]; then
-                if ! echo "$specific_stages" | tr ',' '\n' | grep -qw "$stage"; then
-                    continue
-                fi
-            fi
-
-            # Skip stages in --skip-stage list
-            if [[ -n "$skip_stages" ]]; then
-                if echo "$skip_stages" | tr ',' '\n' | grep -qw "$stage_id" || \
-                   echo "$skip_stages" | tr ',' '\n' | grep -qw "$stage"; then
-                    echo -e "  ${YELLOW}Skipping ${stage_id} ${stage} (--skip-stage)${NC}"
-                    set_stage_state "$feature_id" "$stage_id" "passed" 0
-                    emit_event "$feature_id" "stage_skip" "$stage_id" "Skipped via --skip-stage flag"
-                    continue
-                fi
-            fi
-
-            if ! execute_stage "$stage" "$feature_id" "$feature_description"; then
-                pipeline_success=false
-                local dead_state
-                dead_state=$(get_stage_state "$feature_id" "$stage_id")
-                render_dashboard "$feature_id"
-                if [[ "$dead_state" == "dead_letter" ]]; then
-                    echo -e "${RED}Pipeline halted at ${stage_id} (dead letter)${NC}"
-                    break
-                fi
-            else
-                render_dashboard "$feature_id"
-            fi
-
-            # Pause after stage if --pause flag set
-            if $pause_after; then
-                emit_event "$feature_id" "pipeline_pause" "PIPE" "Paused after ${stage_id}"
-                set_pipeline_state "$feature_id" "paused" "Paused after ${stage_id}"
-                echo -e "${YELLOW}Pipeline paused after ${stage_id}. Resume with: --resume${NC}"
-                exit 0
-            fi
+            break
+        fi
+        if $pause_after; then
+            set_pipeline_state "$feature_id" paused "Paused after requested stage/group" || return 1
+            break
         fi
     done 3<<< "$exec_items"
 
-    # Pipeline summary
-    if $pipeline_success; then
-        emit_event "$feature_id" "pipeline_end" "PIPE" "Pipeline completed successfully"
-        send_notification "$feature_id" "pipeline_end" "Pipeline COMPLETE for ${feature_id}"
-    else
-        emit_event "$feature_id" "pipeline_end" "PIPE" "Pipeline completed with failures"
-        send_notification "$feature_id" "pipeline_end" "Pipeline FAILED for ${feature_id}"
-    fi
-
-    # Final dashboard
-    echo ""
+    local outcome
+    outcome=$(_pipeline_state finish "$feature_id") || return 1
+    emit_event "$feature_id" pipeline_end PIPE "Execution outcome: ${outcome} (configured stage checks only)"
     render_dashboard "$feature_id"
-
-    if $pipeline_success; then
-        echo -e "\n${GREEN}${BOLD}✅ Pipeline COMPLETE for ${feature_id}${NC}"
-    else
-        echo -e "\n${RED}${BOLD}❌ Pipeline FAILED for ${feature_id}${NC}"
-    fi
-
-    echo -e "  Logs:   ${PIPELINE_ROOT}/${feature_id}/events.jsonl"
-    echo -e "  State:  ${PIPELINE_ROOT}/${feature_id}/state.json"
-
-    $pipeline_success
+    printf '\nPipeline outcome: %s\nState: %s/%s/state.json\n' "$outcome" "$PIPELINE_ROOT" "$feature_id"
+    case "$outcome" in
+        complete|simulated) return 0 ;;
+        human_waiting) return 3 ;;
+        paused|partial) return 4 ;;
+        *) return 1 ;;
+    esac
 }
 
 main "$@"

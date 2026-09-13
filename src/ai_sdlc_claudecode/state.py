@@ -239,3 +239,360 @@ class EvolveState:
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+# The Bash supervisor owns these records. They are local audit evidence, not IAM.
+import fcntl
+import hashlib
+import os
+import re
+import uuid
+from contextlib import contextmanager
+
+
+def _sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+@contextmanager
+def locked_json(path):
+    """Serialize the complete read/modify/replace operation across processes."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(path.suffix + ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = json.loads(path.read_text()) if path.exists() else {}
+        try:
+            yield data
+            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".state-")
+            try:
+                with os.fdopen(fd, "w") as out:
+                    json.dump(data, out, indent=2, ensure_ascii=False)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(tmp, path)
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+class PipelineState:
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def read(self):
+        return json.loads(self.path.read_text()) if self.path.exists() else {}
+
+    @staticmethod
+    def ordered(dag):
+        return [name for item in dag["execution_order"]
+                for name in item.get("stages", [item.get("stage")]) if name]
+
+    def start_run(self, feature, dag_path, scope, **metadata):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", feature):
+            raise ValueError("feature_id must be a simple identifier")
+        dag_path = Path(dag_path).resolve()
+        dag = json.loads(dag_path.read_text())
+        ids = {s["id"] for s in dag["stages"].values()}
+        if not scope or not set(scope) <= ids:
+            raise ValueError("empty or unknown execution scope")
+        run = uuid.uuid4().hex
+        with locked_json(self.path) as data:
+            owner = data.get("owner_pid")
+            if owner:
+                try:
+                    os.kill(owner, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise ValueError("feature already has a live execution owner")
+            data.setdefault("stages", {})
+            data.setdefault("cost", {})
+            data.update(feature_id=feature, contract_version=2, run_id=run,
+                        dag_path=str(dag_path), dag_sha256=_sha(dag_path),
+                        scope=list(scope), pipeline_state="running", updated_at=_now())
+            data.update(metadata)
+            data["invoked_by"] = {"os_uid": os.getuid(), "process_id": metadata.get("owner_pid"),
+                                  "mechanism": "local_cli", "identity_assurance": "same_user_process"}
+        return run
+
+    def begin_attempt(self, run, stage, output_dir, retry=0):
+        attempt = uuid.uuid4().hex
+        output_dir = Path(output_dir).resolve()
+        with locked_json(self.path) as data:
+            if data.get("run_id") != run:
+                raise ValueError("stale run")
+            old = data["stages"].get(stage)
+            if old:
+                data.setdefault("history", []).append(old)
+            dag = json.loads(Path(data["dag_path"]).read_text())
+            config = next(s for s in dag["stages"].values() if s["id"] == stage)
+            checks = sorted(self.expected_checks(config))
+            archive = output_dir / ".attempts" / attempt
+            archive.mkdir(parents=True, exist_ok=False)
+            # Old output is retained in its previous result archive, never reused as new work.
+            previous_output = output_dir / "output.json"
+            if previous_output.exists():
+                (archive / "previous-output.json").write_bytes(previous_output.read_bytes())
+            for name in ("output.json", "evidence.json", f"ai-review-{stage}.json"):
+                (output_dir / name).unlink(missing_ok=True)
+            data["stages"][stage] = dict(
+                contract_version=2, run_id=run, attempt_id=attempt, stage_id=stage,
+                status="running", retry_count=retry, updated_at=_now(),
+                dag_sha256=data["dag_sha256"], output_dir=str(output_dir),
+                archive=str(archive), required_checks=checks,
+                verification={"status": "pending", "scope": "configured_stage_checks",
+                              "collector": "pipeline_supervisor", "evidence": []},
+                authorization={"source": data["dag_path"], "sha256": data["dag_sha256"],
+                               "type": config["gate"]["type"], "decision": "pending",
+                               "actor": None, "scope": "accept_stage_artifact"},
+                business_acceptance="not_evaluated", applied_fix_ids=[], dependencies=[],
+                simulation=data.get("simulation", False))
+            for name in config.get("dependencies", []):
+                sid = dag["stages"][name]["id"]
+                dep_path = self.path.parent / f"{sid}-{name}" / "output.json"
+                if dep_path.exists():
+                    data["stages"][stage]["dependencies"].append(
+                        dict(stage_id=sid, path=str(dep_path), sha256=_sha(dep_path)))
+        return attempt
+
+    @staticmethod
+    def _attempt(data, run, stage, attempt):
+        record = data.get("stages", {}).get(stage, {})
+        if data.get("run_id") != run or record.get("run_id") != run or record.get("attempt_id") != attempt:
+            raise ValueError("stale run or attempt")
+        return record
+
+    def add_evidence(self, run, stage, attempt, check, exit_code, evidence_file):
+        with locked_json(self.path) as data:
+            record = self._attempt(data, run, stage, attempt)
+            if record["status"] not in ("running", "gate_checking"):
+                raise ValueError("attempt is already terminal")
+            evidence = record["verification"]["evidence"]
+            source = Path(evidence_file)
+            snapshot = Path(record["archive"]) / f"check-{len(evidence)}.log"
+            snapshot.write_bytes(source.read_bytes())
+            output = Path(record["output_dir"]) / "output.json"
+            evidence.append(dict(check=check, exit_code=int(exit_code), path=str(snapshot),
+                                 sha256=_sha(snapshot), timestamp=_now(), run_id=run,
+                                 attempt_id=attempt,
+                                 artifact_sha256=_sha(output) if output.exists() else None))
+
+    def finish_attempt(self, run, stage, attempt, status, output=None, fix_ids=()):
+        with locked_json(self.path) as data:
+            record = self._attempt(data, run, stage, attempt)
+            if status == "passed" and (data.get("simulation") or
+                                        record["authorization"]["type"] == "human-required"):
+                raise ValueError("simulation or human-required authorization cannot pass")
+            record["status"] = status
+            record["updated_at"] = _now()
+            record["applied_fix_ids"] = list(fix_ids)
+            if output and Path(output).exists():
+                snapshot = Path(record["archive"]) / "output.json"
+                snapshot.write_bytes(Path(output).read_bytes())
+                record["result"] = {"path": str(Path(output).resolve()), "sha256": _sha(output),
+                                    "archive": str(snapshot), "scope": "stage_artifact"}
+            if status == "passed":
+                record["authorization"].update(decision="accepted", actor="configured_policy")
+                record["verification"]["status"] = "verified"
+                if not self.is_verified(record, data["dag_path"]):
+                    raise ValueError("missing, failed or stale verification evidence")
+            elif status != "gate_checking":
+                record["verification"]["status"] = "unverified"
+            return deepcopy(record)
+
+    @staticmethod
+    def expected_checks(config):
+        checks = {"schema", "gate"}
+        if config.get("post_commands"):
+            checks.add("post_commands")
+        if config.get("review_passes"):
+            checks.add("refinement")
+        if config["id"] in ("S3", "S3b"):
+            checks.add("contracts")
+        if config["id"] in ("S4", "S4b", "S4c"):
+            checks.add("tdd")
+        return checks
+
+    @staticmethod
+    def is_verified(record, dag_path):
+        try:
+            if (record.get("contract_version") != 2 or record.get("status") != "passed"
+                    or not record.get("run_id") or not record.get("attempt_id")
+                    or record["dag_sha256"] != _sha(dag_path)
+                    or record["authorization"]["type"] == "human-required"
+                    or record["authorization"]["decision"] != "accepted"
+                    or record["verification"]["status"] != "verified"):
+                return False
+            result = record["result"]
+            if result["sha256"] != _sha(result["path"]):
+                return False
+            dag = json.loads(Path(dag_path).read_text())
+            config = next(s for s in dag["stages"].values() if s["id"] == record["stage_id"])
+            if record["authorization"]["type"] != config["gate"]["type"]:
+                return False
+            if record["authorization"]["sha256"] != _sha(dag_path):
+                return False
+            if any(d["sha256"] != _sha(d["path"]) for d in record.get("dependencies", [])):
+                return False
+            receipts = record["verification"]["evidence"]
+            if not PipelineState.expected_checks(config) <=  {r["check"] for r in receipts}:
+                return False
+            return bool(receipts) and all(
+                r["exit_code"] == 0 and r["run_id"] == record["run_id"]
+                and r["attempt_id"] == record["attempt_id"] and r["sha256"] == _sha(r["path"])
+                and r["artifact_sha256"] == result["sha256"] for r in receipts)
+        except (KeyError, OSError, TypeError, ValueError, StopIteration):
+            return False
+
+    def outcome(self):
+        data = self.read()
+        stages = [data.get("stages", {}).get(s, {}) for s in data.get("scope", [])]
+        statuses = {s.get("status", "pending") for s in stages}
+        if "human_waiting" in statuses:
+            return "human_waiting"
+        if statuses & {"failed", "dead_letter"}:
+            return "failed"
+        if data.get("pipeline_state") == "paused":
+            return "paused"
+        if data.get("pipeline_state") == "failed":
+            return "failed"
+        if data.get("simulation"):
+            return "simulated" if stages and statuses <= {"simulated"} else "partial"
+        return ("complete" if stages and all(self.is_verified(s, data["dag_path"]) for s in stages)
+                else "partial")
+
+
+def _pipeline_cli():
+    import sys
+    command, path, *args = sys.argv[1:]
+    state = PipelineState(path)
+    if command == "start":
+        feature, dag_path, selected, start_from, simulation, project, owner, description, cost, retries = args
+        dag = json.loads(Path(dag_path).read_text())
+        names = state.ordered(dag)
+        if start_from:
+            names = names[next(i for i, n in enumerate(names)
+                               if start_from in (n, dag["stages"][n]["id"])):]
+        if selected:
+            selectors = set(selected.split(","))
+            known = {v for n in names for v in (n, dag["stages"][n]["id"])}
+            if not selectors <= known:
+                raise ValueError("unknown selected stages")
+            names = [n for n in names if selectors & {n, dag["stages"][n]["id"]}]
+        print(state.start_run(feature, dag_path, [dag["stages"][n]["id"] for n in names],
+                              simulation=simulation == "true", project_dir=project, owner_pid=int(owner),
+                              feature_description=description,
+                              config={"cost_limit_usd":float(cost), "max_retries":int(retries)}))
+    elif command == "replay":
+        from .engine import ErrorEngine
+        data = state.read()
+        errors = Path(os.environ.get("EVOLVE_ERRORS_DIR", str(state.path.parent / "evolve")))
+        engine = ErrorEngine(errors)
+        for record in data.get("stages", {}).values():
+            if record.get("status") == "passed" and not state.is_verified(record, data["dag_path"]):
+                continue
+            engine.record_outcome(record)
+    elif command == "begin":
+        print(state.begin_attempt(*args[:3], retry=int(args[3])))
+    elif command == "evidence":
+        run, stage, attempt, check, code, source = args
+        state.add_evidence(run, stage, attempt, check, int(code), source)
+    elif command == "stage":
+        run, stage, attempt, status, retry, fixes = args
+        if status in ("skipped", "imported"):
+            with locked_json(path) as data:
+                if data.get("run_id") != run:
+                    raise ValueError("stale stage writer")
+                old = data["stages"].get(stage, {})
+                if status == "skipped" and old.get("status") == "imported":
+                    return
+                data["stages"][stage] = dict(contract_version=2, run_id=run, attempt_id=None,
+                                             status=status, verification={"status": "unverified"},
+                                             authorization={"decision": "not_evaluated"},
+                                             business_acceptance="not_evaluated", updated_at=_now())
+                if status == "imported":
+                    dag = json.loads(Path(data["dag_path"]).read_text())
+                    name = next(n for n, s in dag["stages"].items() if s["id"] == stage)
+                    output = state.path.parent / f"{stage}-{name}" / "output.json"
+                    data["stages"][stage]["result"] = dict(path=str(output), sha256=_sha(output), scope="imported_input")
+        else:
+            output = Path(state.read()["stages"][stage]["output_dir"]) / "output.json"
+            record = state.finish_attempt(run, stage, attempt, status, output,
+                                          [f for f in fixes.split(",") if f])
+            if status in ("passed", "failed", "dead_letter") and record["applied_fix_ids"]:
+                from .engine import ErrorEngine
+                errors = Path(os.environ.get("EVOLVE_ERRORS_DIR", str(state.path.parent / "evolve")))
+                ErrorEngine(errors).record_outcome(record)
+    elif command == "get":
+        stage, dag_path = args
+        record = state.read().get("stages", {}).get(stage, {})
+        status = record.get("status", "pending")
+        print("unverified" if status == "passed" and not state.is_verified(record, dag_path) else status)
+    elif command == "resume":
+        dag_path = args[0]
+        dag = json.loads(Path(dag_path).read_text())
+        data = state.read()
+        for name in state.ordered(dag):
+            sid = dag["stages"][name]["id"]
+            if not state.is_verified(data.get("stages", {}).get(sid, {}), dag_path):
+                print(sid)
+                break
+    elif command == "dependencies":
+        stage, dag_path = args
+        data = state.read()
+        dag = json.loads(Path(dag_path).read_text())
+        config = next(s for s in dag["stages"].values() if s["id"] == stage)
+        for name in config.get("dependencies", []):
+            dep = data.get("stages", {}).get(dag["stages"][name]["id"], {})
+            imported = dep.get("status") == "imported" and dep.get("result")
+            if imported:
+                imported = dep["result"]["sha256"] == _sha(dep["result"]["path"])
+            simulated = data.get("simulation") and dep.get("status") == "simulated"
+            if not (state.is_verified(dep, dag_path) or imported or simulated):
+                print("unverified prerequisite: " + name, file=sys.stderr)
+                sys.exit(1)
+    elif command == "selected":
+        sys.exit(0 if args[0] in state.read().get("scope", []) else 1)
+    elif command == "pipeline":
+        with locked_json(path) as data:
+            if os.environ.get("PIPELINE_RUN_ID") != data.get("run_id"):
+                raise ValueError("stale pipeline writer")
+            data.update(pipeline_state=args[0], pipeline_state_reason=args[1], updated_at=_now())
+    elif command == "finish":
+        outcome = state.outcome()
+        with locked_json(path) as data:
+            if os.environ.get("PIPELINE_RUN_ID") != data.get("run_id"):
+                raise ValueError("stale finalization writer")
+            data.update(pipeline_state=outcome, owner_pid=None, updated_at=_now())
+        print(outcome)
+    elif command == "cost":
+        kind, model, usd, tin, tout, cr, cc = args
+        tin, tout, cr, cc = map(int, (tin, tout, cr, cc))
+        with locked_json(path) as data:
+            if os.environ.get("PIPELINE_RUN_ID") != data.get("run_id"):
+                raise ValueError("stale cost writer")
+            c = data.setdefault("cost", {})
+            for key, value in (("total_tokens", tin+tout+cr+cc), ("input_tokens", tin),
+                               ("output_tokens", tout), ("cache_read_input_tokens", cr),
+                               ("cache_creation_input_tokens", cc)):
+                c[key] = c.get(key, 0) + value
+            amount = float(usd) if kind == "actual" else tin / 1e6 * {"opus":45, "sonnet":9, "haiku":2.4}.get(model, 9)
+            c["estimated_usd"] = round(c.get("estimated_usd", 0) + amount, 6)
+            if kind == "actual":
+                c["actual_usd"] = round(c.get("actual_usd", 0) + amount, 6)
+            c["source"] = kind if c.get("source", kind) == kind else "mixed"
+            bm = c.setdefault("by_model", {}).setdefault(model, {"usd":0, "calls":0})
+            bm["usd"] = round(bm["usd"] + amount, 6)
+            bm["calls"] += 1
+    else:
+        raise ValueError("unknown state command")
+
+
+if __name__ == "__main__":
+    _pipeline_cli()

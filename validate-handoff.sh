@@ -30,23 +30,12 @@ usage() {
 
 # --- Map stage ID to schema file ---
 get_schema_path() {
-    local stage_id="$1"
-    case "$stage_id" in
-        S1)  echo "${SCHEMAS_DIR}/requirements-output.json" ;;
-        S2)  echo "${SCHEMAS_DIR}/architecture-output.json" ;;
-        S3)  echo "${SCHEMAS_DIR}/backend-output.json" ;;
-        S3b) echo "${SCHEMAS_DIR}/frontend-output.json" ;;
-        S4)  echo "${SCHEMAS_DIR}/testing-output.json" ;;
-        S4b) echo "${SCHEMAS_DIR}/integration-test-output.json" ;;
-        S4c) echo "${SCHEMAS_DIR}/e2e-test-output.json" ;;
-        S5)  echo "${SCHEMAS_DIR}/review-output.json" ;;
-        S6)  echo "${SCHEMAS_DIR}/deployment-output.json" ;;
-        S7)  echo "${SCHEMAS_DIR}/monitoring-output.json" ;;
-        S8)  echo "${SCHEMAS_DIR}/documentation-output.json" ;;
-        S9)  echo "${SCHEMAS_DIR}/performance-output.json" ;;
-        S10) echo "${SCHEMAS_DIR}/release-output.json" ;;
-        *)   echo ""; return 1 ;;
-    esac
+    python3 - "$1" "${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}" "$SCRIPT_DIR" <<'PY_SCHEMA'
+import json, sys
+from pathlib import Path
+stage = next(s for s in json.load(open(sys.argv[2]))['stages'].values() if s['id'] == sys.argv[1])
+print(Path(sys.argv[3]) / stage['output_schema'])
+PY_SCHEMA
 }
 
 # --- Validate JSON syntax ---
@@ -274,10 +263,11 @@ main() {
     # Step 2: Schema validation
     echo -e "\n${YELLOW}[2/3]${NC} Validating against schema..."
     local schema_result
-    schema_result=$(validate_schema "$schema_path" "$json_path" 2>&1) || true
+    local schema_exit=0
+    schema_result=$(validate_schema "$schema_path" "$json_path" 2>&1) || schema_exit=$?
     echo "  $schema_result"
 
-    if echo "$schema_result" | grep -q "VALIDATION FAILED"; then
+    if [[ $schema_exit -ne 0 ]]; then
         echo -e "\n${RED}[FAIL]${NC} Schema validation failed"
         exit 1
     fi
