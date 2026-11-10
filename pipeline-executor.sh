@@ -470,6 +470,7 @@ PRICING = {
 
 total_tokens = 0
 total_cost = 0.0
+unknown_cost_stages = 0
 
 for name, stage in dag['stages'].items():
     est = stage.get('estimated_tokens', {})
@@ -477,20 +478,28 @@ for name, stage in dag['stages'].items():
     output_tok = est.get('output', 10000)
     total_tok = est.get('total', input_tok + output_tok)
     model = stage['agents'][0].get('model', 'sonnet')
-    rates = PRICING.get(model, PRICING['sonnet'])
+    provider = dag['config'].get('model_routes', {}).get(model, {}).get('provider', 'claude')
+    rates = PRICING.get(model) if provider == 'claude' else None
+    total_tokens += int(total_tok * 1.5)
+    if rates is None:
+        unknown_cost_stages += 1
+        print('  {} {:22s} ~{:>7,} tok  {}  USD cost unknown'.format(
+            stage['id'], name, total_tok, model))
+        continue
 
     cost_input = (input_tok / 1_000_000) * rates['input']
     cost_output = (output_tok / 1_000_000) * rates['output']
     cost = cost_input + cost_output
     cost_with_retries = cost * 1.5
-    total_tokens += int(total_tok * 1.5)
     total_cost += cost_with_retries
     print('  {} {:22s} ~{:>7,} tok  {:6s}  ${:.3f} (w/retry: ${:.3f})'.format(
         stage['id'], name, total_tok, model, cost, cost_with_retries))
 
 print('')
-print('  {:22s}   Total: ~{:>7,} tok  ${:.2f}'.format('', total_tokens, total_cost))
+print('  {:22s}   Tokens: ~{:>7,}; known price subtotal: ${:.2f}'.format('', total_tokens, total_cost))
 print('  {:22s}   Limit: ${:.2f}'.format('', cost_limit))
+if unknown_cost_stages:
+    print('  USD cost unavailable for {} stages; dollar limit covers known costs only.'.format(unknown_cost_stages))
 
 if total_cost > cost_limit * 0.8:
     print('  Warning: Estimated cost is >80% of limit!')
@@ -613,7 +622,13 @@ if os.path.exists(methods_map_path):
 
 prompt += '\n\nCRITICAL: Your FINAL output MUST contain a valid JSON object conforming to this schema:\n'
 prompt += json.dumps(schema, indent=2)
-prompt += '\n\nIMPORTANT: Output the JSON directly in your response inside a ```json code block. Do NOT attempt to write files. Your response will be parsed to extract the JSON. The JSON block must be complete and valid — do NOT truncate or summarize it.\n'
+if stage.get('writes_code', stage_id in ('S3', 'S3b')):
+    prompt += '\n\nWrite implementation and test source files in the project directory within the assigned scope. '
+    prompt += 'Return the stage metadata JSON in your final response; the supervisor writes output.json. '
+    prompt += 'Do not claim checks passed unless you actually ran them.\n'
+else:
+    prompt += '\n\nDo NOT attempt to write files. Return the requested artifact JSON in your final response.\n'
+prompt += '\nIMPORTANT: Output the complete metadata JSON directly inside a ```json code block. Your response will be parsed; do not truncate it.\n'
 prompt += 'Output format:\n```json\n{...your complete JSON here...}\n```\n'
 
 # P0: Inject shared memory context from parallel agents
@@ -718,7 +733,7 @@ PY_GATE
         *) code=2; printf 'Unknown gate type\n' >> "$log_file" ;;
     esac
     if [[ $code -eq 0 && ( "$gate_type" == ai-review || "$gate_type" == auto+ai-review ) ]]; then
-        bash "${SCRIPT_DIR}/ai-review-checker.sh" "$stage_id" "$output_json" --model haiku --feature-id "$feature_id" \
+        bash "${SCRIPT_DIR}/ai-review-checker.sh" "$stage_id" "$output_json" --feature-id "$feature_id" \
             >> "$log_file" 2>&1 || code=$?
     fi
     collect_evidence "$feature_id" "$stage_id" gate "$code" "$log_file" || return 1
@@ -803,11 +818,10 @@ REVIEW_EOF
         fi
 
         local rp_timeout=300  # 5 min per review pass
-        if command -v timeout >/dev/null 2>&1; then
-            review_output=$(timeout "${rp_timeout}" claude --print --model "${rp_model}" "$full_review_prompt" 2>&1) || review_exit=$?
-        else
-            review_output=$(perl -e 'alarm shift; exec @ARGV' "${rp_timeout}" claude --print --model "${rp_model}" "$full_review_prompt" 2>&1) || review_exit=$?
-        fi
+        local rp_receipt="${output_dir}/.attempts/${PIPELINE_ATTEMPT_ID}/refinement-${i}-model.json"
+        review_output=$(printf '%s' "$full_review_prompt" | python3 -m ai_sdlc_claudecode.agent \
+            --dag "$DAG_FILE" --model "$rp_model" --project-dir "${PROJECT_CODE_DIR:-$PROJECT_ROOT}" \
+            --sandbox read-only --output-format text --timeout "$rp_timeout" --receipt "$rp_receipt" 2>&1) || review_exit=$?
 
         if [[ $review_exit -eq 0 ]]; then
             # Try to extract revised JSON and replace output.json
@@ -822,9 +836,14 @@ REVIEW_EOF
                     echo -e "    ${GREEN}✓ Review pass ${rp_role}: output revised${NC}"
                     emit_event "$feature_id" "review_pass" "$stage_id" "Review pass ${rp_role} revised output"
 
-                    # Estimate tokens for cost tracking
-                    local rp_tokens=$(( (${#full_review_prompt} + ${#review_output}) / 4 ))
-                    update_cost "$feature_id" "$rp_tokens" "$rp_model" || true
+                    local rp_provider
+                    rp_provider=$(python3 -m ai_sdlc_claudecode.agent --dag "$DAG_FILE" --model "$rp_model" --inspect provider) || return 1
+                    if [[ "$rp_provider" == codex ]]; then
+                        emit_event "$feature_id" token_usage "$stage_id" "Refinement usage in ${rp_receipt}; USD cost unknown" || true
+                    else
+                        local rp_tokens=$(( (${#full_review_prompt} + ${#review_output}) / 4 ))
+                        update_cost "$feature_id" "$rp_tokens" "$rp_model" || true
+                    fi
                 else
                     echo -e "    ${RED}Review pass ${rp_role}: invalid revision${NC}"
                     return 1
@@ -1081,96 +1100,45 @@ SKELPYEOF
 ) || claude_exit=$?
             claude_output="$skeleton_json"
         else
-            echo -e "  ${YELLOW}Invoking Claude (${agent_model}, timeout: ${stage_timeout}s)...${NC}"
+            echo -e "  ${YELLOW}Invoking model (${agent_model}, timeout: ${stage_timeout}s)...${NC}"
+            local response_file="${output_dir}/agent-response.json"
+            local model_receipt="${output_dir}/.attempts/${PIPELINE_ATTEMPT_ID}/agent-model.json"
+            local dispatch_log="${output_dir}/agent-dispatch.log"
+            printf '%s' "$prompt" | python3 -m ai_sdlc_claudecode.agent \
+                --dag "$DAG_FILE" --model "$agent_model" --project-dir "${PROJECT_CODE_DIR:-$PROJECT_ROOT}" \
+                --sandbox workspace-write --output-format json --timeout "$stage_timeout" \
+                --receipt "$model_receipt" > "$response_file" 2> "$dispatch_log" || claude_exit=$?
 
-            # Use --output-format json when available (claude >=2026-Q1) to get real usage+cost.
-            # Opt-out with AI_SDLC_CLAUDE_JSON=0 for old claude binaries.
-            local use_json="${AI_SDLC_CLAUDE_JSON:-1}"
-            local claude_raw=""
-            if command -v timeout >/dev/null 2>&1; then
-                if [[ "$use_json" == "1" ]]; then
-                    claude_raw=$(timeout "${stage_timeout}" claude --print --output-format json --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
-                else
-                    claude_raw=$(timeout "${stage_timeout}" claude --print --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
-                fi
-                if [[ $claude_exit -eq 124 ]]; then
-                    echo -e "  ${RED}Stage timed out after ${stage_timeout}s${NC}"
-                    emit_event "$feature_id" "stage_timeout" "$stage_id" "Timed out after ${stage_timeout}s"
-                    set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
-                    send_notification "$feature_id" "dead_letter" "Stage ${stage_id} timed out after ${stage_timeout}s"
-                    prev_error_output="TIMEOUT after ${stage_timeout}s. Partial output: ${claude_raw: -500}"
-                    prev_exit_code="124 (timeout)"
-                    retry_count=$((retry_count + 1))
-                    continue
-                fi
+            local parsed_cost="" parsed_in="" parsed_out="" parsed_cr="" parsed_cc="" parsed_provider=""
+            local metrics
+            metrics=$(python3 - "$response_file" <<'PY_METRICS'
+import json, sys
+with open(sys.argv[1]) as stream:
+    response = json.load(stream)
+usage = response.get('usage') or {}
+cost = response.get('total_cost_usd')
+print(cost if cost is not None else 'unknown', usage.get('input_tokens', 0),
+      usage.get('output_tokens', 0), usage.get('cache_read_input_tokens', 0),
+      usage.get('cache_creation_input_tokens', 0), response.get('provider', 'unknown'), sep='\t')
+PY_METRICS
+) || metrics=""
+            if [[ -n "$metrics" ]]; then
+                IFS=$'\t' read -r parsed_cost parsed_in parsed_out parsed_cr parsed_cc parsed_provider <<< "$metrics"
+                [[ "$parsed_cost" == unknown ]] && parsed_cost=""
+                claude_output=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("result", ""))' "$response_file") || claude_exit=1
             else
-                # macOS may not have timeout; use perl wrapper
-                if [[ "$use_json" == "1" ]]; then
-                    claude_raw=$(perl -e 'alarm shift; exec @ARGV' "${stage_timeout}" claude --print --output-format json --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
-                else
-                    claude_raw=$(perl -e 'alarm shift; exec @ARGV' "${stage_timeout}" claude --print --model "${agent_model}" "$prompt" 2>&1) || claude_exit=$?
-                fi
+                claude_output=$(cat "$dispatch_log" "$response_file")
+                [[ $claude_exit -ne 0 ]] || claude_exit=1
             fi
-
-            # Parse JSON envelope if enabled; otherwise raw stays as-is.
-            # Fallback chain: try jq → try python3 → treat as plain text.
-            local parsed_cost="" parsed_in="" parsed_out="" parsed_cr="" parsed_cc=""
-            local parsed_ok=0
-            if [[ "$use_json" == "1" && -n "$claude_raw" ]]; then
-                # Try jq first (fast path)
-                if command -v jq >/dev/null 2>&1; then
-                    local jq_result
-                    jq_result=$(echo "$claude_raw" | jq -r '
-                        if (.type == "result" and .result != null) then
-                            [.result,
-                             (.total_cost_usd // 0),
-                             (.usage.input_tokens // 0),
-                             (.usage.output_tokens // 0),
-                             (.usage.cache_read_input_tokens // 0),
-                             (.usage.cache_creation_input_tokens // 0)]
-                            | @tsv
-                        else empty end
-                    ' 2>/dev/null)
-                    if [[ -n "$jq_result" ]]; then
-                        claude_output=$(printf '%s' "$jq_result" | cut -f1)
-                        parsed_cost=$(printf '%s' "$jq_result" | cut -f2)
-                        parsed_in=$(printf '%s' "$jq_result" | cut -f3)
-                        parsed_out=$(printf '%s' "$jq_result" | cut -f4)
-                        parsed_cr=$(printf '%s' "$jq_result" | cut -f5)
-                        parsed_cc=$(printf '%s' "$jq_result" | cut -f6)
-                        parsed_ok=1
-                    fi
-                fi
-                # Python fallback if jq missing or failed (env var carries data; heredoc carries program)
-                if [[ "$parsed_ok" != "1" ]]; then
-                    local py_out
-                    py_out=$(CLAUDE_RAW="$claude_raw" python3 << 'PYEOF' 2>/dev/null || true
-import json, os
-raw = os.environ.get("CLAUDE_RAW", "")
-try:
-    d = json.loads(raw)
-    if d.get("type") == "result" and d.get("result") is not None:
-        u = d.get("usage", {}) or {}
-        print("__AI_SDLC_METRICS__", d.get("total_cost_usd", 0), u.get("input_tokens", 0),
-              u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0),
-              u.get("cache_creation_input_tokens", 0), sep="\t")
-        print(d["result"])
-except Exception:
-    pass
-PYEOF
-)
-                    if [[ "$py_out" == __AI_SDLC_METRICS__* ]]; then
-                        local first_line="${py_out%%$'\n'*}"
-                        local rest="${py_out#*$'\n'}"
-                        IFS=$'\t' read -r _ parsed_cost parsed_in parsed_out parsed_cr parsed_cc <<< "$first_line"
-                        claude_output="$rest"
-                        parsed_ok=1
-                    fi
-                fi
-            fi
-            if [[ "$parsed_ok" != "1" ]]; then
-                # Couldn't parse JSON — treat as plain text (old claude binary or non-JSON error)
-                claude_output="$claude_raw"
+            if [[ $claude_exit -eq 124 ]]; then
+                echo -e "  ${RED}Stage timed out after ${stage_timeout}s${NC}"
+                emit_event "$feature_id" "stage_timeout" "$stage_id" "Timed out after ${stage_timeout}s"
+                set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
+                send_notification "$feature_id" "dead_letter" "Stage ${stage_id} timed out after ${stage_timeout}s"
+                prev_error_output="TIMEOUT after ${stage_timeout}s. ${claude_output: -500}"
+                prev_exit_code="124 (timeout)"
+                retry_count=$((retry_count + 1))
+                continue
             fi
         fi
 
@@ -1183,6 +1151,9 @@ PYEOF
             update_cost_real "$feature_id" "$parsed_cost" "$parsed_in" "$parsed_out" "$parsed_cr" "$parsed_cc" "$agent_model" || true
             local total_t=$((${parsed_in:-0} + ${parsed_out:-0} + ${parsed_cr:-0} + ${parsed_cc:-0}))
             emit_event "$feature_id" "cost_update" "$stage_id" "Real: \$${parsed_cost} (${total_t}t, cache_read=${parsed_cr:-0})" "{\"cost_usd\": ${parsed_cost}, \"input\": ${parsed_in:-0}, \"output\": ${parsed_out:-0}, \"cache_read\": ${parsed_cr:-0}, \"cache_creation\": ${parsed_cc:-0}, \"duration\": ${duration}, \"source\": \"claude_json\"}" || true
+        elif [[ "${parsed_provider:-}" == codex ]]; then
+            emit_event "$feature_id" token_usage "$stage_id" "Codex token usage recorded; USD cost unknown" \
+                "{\"cost_usd\": null, \"input\": ${parsed_in:-0}, \"output\": ${parsed_out:-0}, \"cache_read\": ${parsed_cr:-0}, \"duration\": ${duration}, \"source\": \"codex_json\"}" || true
         else
             local est_tokens=$(( (${#prompt} + ${#claude_output}) / 4 ))
             update_cost "$feature_id" "$est_tokens" "$agent_model" || true
@@ -1192,7 +1163,7 @@ PYEOF
         if [[ $claude_exit -ne 0 ]]; then
             printf '%s\n' "$claude_output" > "${output_dir}/agent-failure.log"
             collect_evidence "$feature_id" "$stage_id" agent "$claude_exit" "${output_dir}/agent-failure.log" || return 1
-            echo -e "  ${RED}Claude invocation failed (exit: ${claude_exit})${NC}"
+            echo -e "  ${RED}Model invocation failed (exit: ${claude_exit})${NC}"
             emit_event "$feature_id" "stage_fail" "$stage_id" "Agent failed with exit code ${claude_exit}"
             set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
 
@@ -1554,8 +1525,10 @@ PYEOF
         local s2_dir="${PIPELINE_ROOT}/${feature_id}/S2-architecture"
         mkdir -p "$s2_dir"
         # Convert external plan to pipeline-compatible output.json
-        PLAN_FILE="$plan_file" OUT_DIR="$s2_dir" python3 << 'PYEOF'
-import json, os, datetime
+        PLAN_FILE="$plan_file" OUT_DIR="$s2_dir" DAG_PATH="$DAG_FILE" FEATURE_ID="$feature_id" SCHEMA_BASE="$SCRIPT_DIR" python3 << 'PYEOF'
+import json, os, datetime, hashlib
+from pathlib import Path
+from jsonschema import Draft202012Validator
 
 plan_file = os.environ['PLAN_FILE']
 out_dir = os.environ['OUT_DIR']
@@ -1572,6 +1545,21 @@ output = {
     "content": plan_content,
     "artifacts": [os.path.basename(plan_file)]
 }
+
+# Imported designs can reuse explicit, versioned contracts from the project DAG.
+# Including the digest in the imported artifact binds the dependency to this input.
+contracts = json.loads(Path(os.environ['DAG_PATH']).read_text()).get('config', {}).get('imported_contracts')
+if contracts is not None:
+    document = {
+        'stage_id': 'S2', 'feature_id': os.environ['FEATURE_ID'],
+        'timestamp': output['timestamp'], 'contracts': contracts,
+    }
+    schema = json.loads((Path(os.environ['SCHEMA_BASE']) / 'schemas/contracts-output.json').read_text())
+    Draft202012Validator(schema).validate(document)
+    contract_path = Path(out_dir) / 'contracts.json'
+    contract_path.write_text(json.dumps(document, indent=2, ensure_ascii=False))
+    output['artifacts'].append('contracts.json')
+    output['contracts_sha256'] = hashlib.sha256(contract_path.read_bytes()).hexdigest()
 
 with open(os.path.join(out_dir, 'output.json'), 'w') as f:
     json.dump(output, f, indent=2, ensure_ascii=False)

@@ -20,6 +20,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+DAG_FILE="${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}"
 
 # shellcheck source=lib/events.sh
 source "${SCRIPT_DIR}/lib/events.sh"
@@ -36,6 +38,15 @@ NC='\033[0m'
 DEFAULT_MODEL="haiku"
 PASS_THRESHOLD=70  # minimum score (0-100) to pass
 
+invoke_review_model() {
+    local requested_model="$1" prompt="$2" output_json="$3" label="$4" timeout_seconds="${5:-}"
+    local receipt="$(dirname "$output_json")/.attempts/${PIPELINE_ATTEMPT_ID:-standalone}/${label}-model.json"
+    local command=(python3 -m ai_sdlc_claudecode.agent --dag "$DAG_FILE" --model "$requested_model"
+        --project-dir "${PROJECT_CODE_DIR:-$PWD}" --sandbox read-only --output-format text --receipt "$receipt")
+    [[ -z "$timeout_seconds" ]] || command+=(--timeout "$timeout_seconds")
+    printf '%s' "$prompt" | "${command[@]}"
+}
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") <stage_id> <output_json_path> [options]
@@ -45,7 +56,7 @@ Arguments:
   output_json_path    Path to the stage output JSON file
 
 Options:
-  --model <model>     Claude model to use (default: ${DEFAULT_MODEL})
+  --model <model>     Model to use (default: config.review_model or ${DEFAULT_MODEL})
   --threshold <N>     Pass threshold 0-100 (default: ${PASS_THRESHOLD})
   --feature-id <id>   Feature ID for event logging
   --mock              Return synthetic scores (80/100) without calling Claude (for CI)
@@ -469,7 +480,7 @@ except Exception:
 # --- Load adversarial config from DAG ---
 get_adversarial_config() {
     local stage_id="$1"
-    local dag_file="${SCRIPT_DIR}/pipeline-dag.json"
+    local dag_file="$DAG_FILE"
 
     if [[ ! -f "$dag_file" ]]; then
         echo ""
@@ -606,14 +617,14 @@ else:
     local adv_prompt
     adv_prompt=$(build_adversarial_prompt "$stage_id" "$output_json" "$adv_focus")
 
-    # Call Claude with adversarial model
-    echo -e "  ${YELLOW}Invoking Claude (${adv_model}) for adversarial review...${NC}"
+    # Use the same configured dispatcher for every review pass.
+    echo -e "  ${YELLOW}Invoking model (${adv_model}) for adversarial review...${NC}"
     local adv_start
     adv_start=$(date +%s)
 
     local adv_output=""
     local adv_exit=0
-    adv_output=$(claude --print --model "${adv_model}" "$adv_prompt" 2>&1) || adv_exit=$?
+    adv_output=$(invoke_review_model "$adv_model" "$adv_prompt" "$output_json" gate-adversarial 2>&1) || adv_exit=$?
 
     local adv_end
     adv_end=$(date +%s)
@@ -621,7 +632,7 @@ else:
 
     if [[ $adv_exit -ne 0 ]]; then
         echo -e "  ${RED}Adversarial review invocation failed (exit: ${adv_exit})${NC}"
-        echo -e "  ${YELLOW}Falling back to structural review score only${NC}"
+        echo -e "  ${YELLOW}Required adversarial review unavailable${NC}"
         return 1  # A required review failure cannot authorize a pass
     fi
 
@@ -663,7 +674,7 @@ else:
 main() {
     local stage_id=""
     local output_json=""
-    local model="$DEFAULT_MODEL"
+    local model=""
     local threshold="$PASS_THRESHOLD"
     local feature_id=""
     local dry_run=false
@@ -694,6 +705,10 @@ main() {
     if [[ ! -f "$output_json" ]]; then
         echo -e "${RED}ERROR: Output file not found: ${output_json}${NC}"
         exit 1
+    fi
+
+    if [[ -z "$model" ]]; then
+        model=$(python3 -m ai_sdlc_claudecode.agent --dag "$DAG_FILE" --inspect model) || exit 1
     fi
 
     PASS_THRESHOLD="$threshold"
@@ -775,21 +790,29 @@ print(json.dumps(result, indent=2))
             "Starting AI review (model: ${model}, threshold: ${threshold})"
     fi
 
-    # Pre-check: verify Claude CLI and model connectivity
-    echo -e "  ${YELLOW}Checking Claude model (${model}) connectivity...${NC}"
+    # A configured route must not silently switch providers on a failed probe.
+    local route_configured
+    route_configured=$(python3 -m ai_sdlc_claudecode.agent --dag "$DAG_FILE" --model "$model" --inspect configured) || exit 1
+    echo -e "  ${YELLOW}Checking model (${model}) connectivity...${NC}"
     local precheck_exit=0
     local precheck_output=""
-    precheck_output=$(timeout 30 claude --print --model "${model}" "Reply with exactly: OK" 2>&1) || precheck_exit=$?
+    precheck_output=$(invoke_review_model "$model" 'Reply with exactly: OK' "$output_json" gate-probe 30 2>&1) || precheck_exit=$?
 
-    if [[ $precheck_exit -ne 0 ]] || ! echo "$precheck_output" | grep -qi "OK"; then
+    if [[ $precheck_exit -ne 0 || "$precheck_output" != OK ]]; then
         echo -e "  ${RED}Model '${model}' is not reachable (exit: ${precheck_exit})${NC}"
+
+        if [[ "$route_configured" == true ]]; then
+            echo -e "  ${RED}Configured model route failed; review cannot proceed.${NC}"
+            exit 1
+        fi
 
         # Try fallback to sonnet
         if [[ "$model" != "sonnet" ]]; then
             echo -e "  ${YELLOW}Falling back to 'sonnet' model...${NC}"
             local fallback_exit=0
-            timeout 30 claude --print --model "sonnet" "Reply with exactly: OK" >/dev/null 2>&1 || fallback_exit=$?
-            if [[ $fallback_exit -eq 0 ]]; then
+            local fallback_output=""
+            fallback_output=$(invoke_review_model sonnet 'Reply with exactly: OK' "$output_json" gate-fallback-probe 30 2>&1) || fallback_exit=$?
+            if [[ $fallback_exit -eq 0 && "$fallback_output" == OK ]]; then
                 echo -e "  ${GREEN}Fallback to 'sonnet' succeeded${NC}"
                 model="sonnet"
             else
@@ -812,21 +835,20 @@ print(json.dumps(result, indent=2))
         echo -e "  ${GREEN}Model '${model}' is reachable${NC}"
     fi
 
-    # Call Claude
-    echo -e "  ${YELLOW}Invoking Claude (${model}) for semantic review...${NC}"
+    echo -e "  ${YELLOW}Invoking model (${model}) for semantic review...${NC}"
     local start_time
     start_time=$(date +%s)
 
     local claude_output=""
     local claude_exit=0
-    claude_output=$(claude --print --model "${model}" "$prompt" 2>&1) || claude_exit=$?
+    claude_output=$(invoke_review_model "$model" "$prompt" "$output_json" gate-review 2>&1) || claude_exit=$?
 
     local end_time
     end_time=$(date +%s)
     local duration=$((end_time - start_time))
 
     if [[ $claude_exit -ne 0 ]]; then
-        echo -e "  ${RED}Claude invocation failed (exit: ${claude_exit})${NC}"
+        echo -e "  ${RED}Model invocation failed (exit: ${claude_exit})${NC}"
         if [[ -n "$feature_id" ]]; then
             emit_event "$feature_id" "ai_review_fail" "$stage_id" \
                 "AI review failed (exit: ${claude_exit})"

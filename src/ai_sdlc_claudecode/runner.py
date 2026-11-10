@@ -86,12 +86,19 @@ class PipelineRunner:
             stdout, stderr = process.communicate(timeout=timeout_seconds)
             exit_code = process.returncode
         except subprocess.TimeoutExpired:
-            # Kill the process group, including concurrent stage children.
+            # Let dispatchers stop their detached model groups before escalation.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            stdout, stderr = process.communicate()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = process.communicate()
             exit_code = 124
             stderr += f"\nPipeline timed out after {timeout_seconds}s"
 

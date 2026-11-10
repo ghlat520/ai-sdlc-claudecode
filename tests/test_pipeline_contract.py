@@ -116,7 +116,7 @@ def executor_case(tmp_path):
     fake = bindir / 'claude'
     fake.write_text('''#!/usr/bin/env python3
 import json, os, re, sys
-prompt = sys.argv[-1]
+prompt = sys.stdin.read() or sys.argv[-1]
 mode = os.environ.get('FAKE_MODE', 'valid')
 if prompt == 'Reply with exactly: OK':
     print('OK')
@@ -165,6 +165,47 @@ else:
         (tmp_path / 'last-output.log').write_text(result.stdout + result.stderr)
         return result, data
     return dag, dag_path, env, run
+
+
+def test_code_stage_can_write_source_and_returns_metadata(executor_case):
+    dag, path, env, run = executor_case
+    dag['stages']['first']['writes_code'] = True
+    fake_cli = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    fake_cli.write_text(fake_cli.read_text().replace(
+        "mode = os.environ.get('FAKE_MODE', 'valid')",
+        "Path(os.environ['FAKE_CALLS'] + '.prompt').write_text(prompt)\nmode = os.environ.get('FAKE_MODE', 'valid')"
+    ).replace('import json, os, re, sys', 'import json, os, re, sys\nfrom pathlib import Path'))
+    result, data = run('--stages', 'S8')
+    assert result.returncode == 0, result.stdout + result.stderr
+    prompt = Path(env['FAKE_CALLS'] + '.prompt').read_text()
+    assert 'Write implementation and test source files' in prompt
+    assert 'Do NOT attempt to write files.' not in prompt
+    assert 'metadata JSON' in prompt
+
+
+def test_imported_architecture_materializes_configured_contracts(executor_case, tmp_path):
+    dag, path, env, run = executor_case
+    dag['stages']['architecture'] = {**dag['stages']['first'], 'id': 'S2'}
+    dag['stages']['first']['dependencies'] = ['architecture']
+    dag['config']['imported_contracts'] = {
+        'services': [{'name': 'backend', 'responsibility': 'Linji modular monolith application',
+                      'language': 'java', 'port': 8080}],
+        'api_endpoints': [], 'cross_service_messages': [], 'encryption_pairs': [],
+        'shared_models': [], 'external_refs': {'ai_models': [], 'npm_packages_forbidden': []},
+    }
+    plan = tmp_path / 'approved-design.md'
+    plan.write_text('Existing approved architecture; do not redesign.')
+    result, data = run('--stages', 'S8', '--plan-file', str(plan))
+    assert result.returncode == 0, result.stdout + result.stderr
+    imported = Path(env['PIPELINE_ROOT']) / 'fixture' / 'S2-architecture'
+    artifact = json.loads((imported / 'contracts.json').read_text())
+    output = json.loads((imported / 'output.json').read_text())
+    assert artifact['contracts'] == dag['config']['imported_contracts']
+    assert artifact['stage_id'] == 'S2'
+    assert artifact['feature_id'] == 'fixture'
+    assert 'contracts.json' in output['artifacts']
+    assert output['contracts_sha256']
+    assert data['stages']['S2']['status'] == 'imported'
 
 
 @pytest.mark.parametrize('group_mode', ['sequential', 'parallel'])

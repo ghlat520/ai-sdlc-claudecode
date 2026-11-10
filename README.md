@@ -27,6 +27,26 @@ Human gates checkpoint and return exit 3; editable `APPROVED` files are not acce
 
 See [the state contract and five-stage mapping](docs/unattended-state-contract.md) for the evidence boundary, invariants, verification matrix and remaining integration work.
 
+### Model routing and existing project inputs
+
+Project DAGs can route models to Codex while retaining the existing Claude path for unmapped models:
+
+```json
+{
+  "config": {
+    "review_model": "gpt-6.1-sol",
+    "model_routes": {
+      "gpt-6.1-sol": {"provider": "codex", "reasoning_effort": "max"},
+      "glm-5.3": {"provider": "codex", "profile": "glm", "reasoning_effort": "max"}
+    }
+  }
+}
+```
+
+The selected Codex profile must already be configured. Invocation preserves host approval, hook trust and Git checks; code runs in the project workspace sandbox and review calls use read-only mode. Prompts use stdin. Each attempt records the requested model/profile/effort, observed completion and usage, plus references to private raw logs. `actual_model` remains unknown when the CLI does not report it. Codex dollar cost is unknown rather than zero; displayed cost is a known-cost subtotal, not an all-in billing cap.
+
+Set `writes_code: true` on implementation/test nodes so the model writes source while returning metadata JSON for the supervisor. Standard S3/S3b code nodes already use this behavior; artifact-only nodes retain response-only output. When importing an existing architecture with `--plan-file`, optional `config.imported_contracts` supplies the validated contracts object for `S2-architecture/contracts.json`; its digest is included in the imported metadata. Imported inputs remain `imported`, never executed passes.
+
 ### 18-Stage DAG
 
 The current `pipeline-dag.json` is authoritative:

@@ -152,3 +152,47 @@ def test_runner_timeout_terminates_stage_children(tmp_path):
     assert result.exit_code == 124
     assert not result.all_passed
     assert not marker.exists()
+
+
+def test_runner_timeout_allows_dispatcher_to_stop_detached_model(tmp_path, monkeypatch):
+    import os
+    import shlex
+    import signal
+    import sys
+
+    project = tmp_path / 'project'
+    project.mkdir()
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    pid_file = tmp_path / 'model.pid'
+    codex = bindir / 'codex'
+    codex.write_text('#!' + sys.executable + '\nimport os,time\nfrom pathlib import Path\nPath(' + repr(str(pid_file)) + ').write_text(str(os.getpid()))\ntime.sleep(30)\n')
+    codex.chmod(0o755)
+    dag = tmp_path / 'dag.json'
+    dag.write_text(json.dumps({'config': {'model_routes': {
+        'gpt-6.1-sol': {'provider': 'codex', 'reasoning_effort': 'max'},
+    }}}))
+    receipt = tmp_path / 'receipt.json'
+    command = [sys.executable, '-m', 'ai_sdlc_claudecode.agent', '--dag', str(dag),
+               '--model', 'gpt-6.1-sol', '--project-dir', str(project), '--receipt', str(receipt)]
+    executor = tmp_path / 'pipeline-executor.sh'
+    executor.write_text('#!/bin/bash\n' + ' '.join(shlex.quote(arg) for arg in command) + " <<<'fixture prompt' &\nwait\n")
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv('PYTHONPATH', str(root / 'src'))
+    monkeypatch.setenv('PATH', str(bindir) + os.pathsep + os.environ['PATH'])
+    try:
+        result = PipelineRunner(executor, tmp_path / 'pipeline').run('fixture', 'local only', timeout_seconds=1)
+        assert pid_file.exists(), 'fake model must have started before the runner timeout'
+        pid = int(pid_file.read_text())
+        assert result.exit_code == 124
+        assert not result.all_passed
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        assert receipt.exists(), result.stdout + result.stderr
+        assert json.loads(receipt.read_text())['status'] == 'failed'
+    finally:
+        if pid_file.exists():
+            try:
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
