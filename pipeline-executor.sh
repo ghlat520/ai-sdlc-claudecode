@@ -1448,13 +1448,14 @@ for item in dag['execution_order']:
         pair_str = ' + '.join('{} {}'.format(i, n) for i, n in zip(ids, stages_list))
         dep_str = ', '.join(deps) or 'none'
         print('  {}. PARALLEL [{}] (depends: {})'.format(idx, pair_str, dep_str))
+        idx += 1
     else:
-        s = item['stage']
-        sid = dag['stages'][s]['id']
-        d = ', '.join(dag['stages'][s].get('dependencies', [])) or 'none'
-        gate = dag['stages'][s]['gate']['type']
-        print('  {}. {} {} (depends: {}) [gate: {}]'.format(idx, sid, s, d, gate))
-    idx += 1
+        for s in item.get('stages', [item.get('stage')]):
+            sid = dag['stages'][s]['id']
+            d = ', '.join(dag['stages'][s].get('dependencies', [])) or 'none'
+            gate = dag['stages'][s]['gate']['type']
+            print('  {}. {} {} (depends: {}) [gate: {}]'.format(idx, sid, s, d, gate))
+            idx += 1
 PYEOF
         echo -e "\n  ${CYAN}Communication protocol: MetaGPT-style message passing enabled${NC}"
         echo -e "  ${CYAN}  Commander -> Agent: request with upstream artifacts${NC}"

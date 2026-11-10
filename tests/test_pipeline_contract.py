@@ -167,6 +167,31 @@ else:
     return dag, dag_path, env, run
 
 
+@pytest.mark.parametrize('group_mode', ['sequential', 'parallel'])
+def test_dry_run_renders_stage_groups_without_execution(executor_case, group_mode):
+    dag, path, env, run = executor_case
+    dag['execution_order'] = [{'stages': ['first', 'second'], 'mode': group_mode}]
+    fake_cli = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    fake_cli.write_text('''#!/usr/bin/env python3
+import os
+from pathlib import Path
+Path(os.environ['FAKE_CALLS']).write_text('unexpected model call')
+raise SystemExit(99)
+''')
+    result, data = run('--dry-run')
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    plan = result.stdout.split('=== Dry Run: Execution Plan ===', 1)[1]
+    if group_mode == 'sequential':
+        assert '1. S8 first ' in plan
+        assert '2. S9 second ' in plan
+    else:
+        assert '1. PARALLEL [S8 first + S9 second]' in plan
+    assert data == {}
+    assert not Path(env['FAKE_CALLS']).exists()
+    assert not Path(env['PIPELINE_ROOT']).exists()
+
+
 def test_actual_executor_records_success_and_scope(executor_case):
     dag, path, env, run = executor_case
     result, data = run('--stages', 'S8')
