@@ -76,7 +76,9 @@ def _codex_result(path: Path) -> dict:
             if kind == "turn.completed":
                 result["completed"] = True
                 result["usage"] = event.get("usage")
-            if kind in ("error", "turn.failed"):
+            # CLI retry progress is nonterminal; final completion and process exit remain required.
+            reconnecting = kind == "error" and isinstance(event.get("message"), str) and event["message"].startswith("Reconnecting... ")
+            if kind == "turn.failed" or (kind == "error" and not reconnecting):
                 result["error"] = "Codex reported a failed turn"
     if not result["completed"] or not result["result"].strip():
         result["error"] = result["error"] or "Codex did not complete with a final message"

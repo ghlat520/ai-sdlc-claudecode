@@ -181,6 +181,44 @@ def test_codex_failures_never_become_success(agent_case, mode):
     assert record["total_cost_usd"] is None
 
 
+@pytest.mark.parametrize("ending,exit_code,expected_success", [
+    ("completed", 0, True),
+    ("turn_failed", 0, False),
+    ("incomplete", 0, False),
+    ("completed", 7, False),
+    ("fatal_then_completed", 0, False),
+])
+def test_reconnect_progress_requires_successful_cli_and_final_turn(agent_case, ending, exit_code, expected_success):
+    run, executable, _, receipt, _ = agent_case
+    events = [
+        {"type": "thread.started", "thread_id": "reconnecting-fixture"},
+        {"type": "turn.started"},
+        {"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion: request timed out)"},
+    ]
+    if ending == "fatal_then_completed":
+        events.append({"type": "error", "message": "Model request was rejected"})
+    if ending in ("completed", "fatal_then_completed"):
+        events.extend([
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "finished after reconnect"}},
+            {"type": "turn.completed"},
+        ])
+    elif ending == "turn_failed":
+        events.append({"type": "turn.failed", "error": {"message": "Retries exhausted"}})
+    executable.write_text(
+        "#!" + sys.executable + "\nimport json,sys\nsys.stdin.read()\n"
+        + "events = json.loads(" + repr(json.dumps(events)) + ")\n"
+        + "for event in events: print(json.dumps(event))\n"
+        + "raise SystemExit(" + str(exit_code) + ")\n"
+    )
+    executable.chmod(0o755)
+    result = run("glm-5.3")
+    record = json.loads(receipt.read_text())
+    assert (result.returncode == 0) is expected_success
+    assert record["status"] == ("complete" if expected_success else "failed")
+    assert json.loads(result.stdout)["is_error"] is not expected_success
+    assert "Reconnecting..." in Path(record["raw_output_path"]).read_text()
+
+
 def test_executor_routes_main_refinement_and_ai_gate_through_codex(executor_case):
     dag, path, env, run = executor_case
     dag["config"].update({"review_model": "glm-5.3", "model_routes": {
