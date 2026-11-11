@@ -24,21 +24,30 @@ class _Interrupted(BaseException):
         self.signum = signum
 
 
-def _stop_process(process: subprocess.Popen) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # The process group already exited.
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
-    # The CLI may exit before a descendant that ignored SIGTERM.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+def _stop_process(process: subprocess.Popen) -> dict:
+    cleanup = {"scope": "process_group", "group_signal_errors": [], "direct_signal_errors": []}
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        # The CLI may exit before a descendant that ignored SIGTERM.
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            cleanup["scope"] = "direct_child"
+            cleanup["group_signal_errors"].append({"signal": signum, "error": str(exc)})
+            if process.poll() is None:
+                try:
+                    process.send_signal(signum)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as child_exc:
+                    cleanup["direct_signal_errors"].append({"signal": signum, "error": str(child_exc)})
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    cleanup["direct_child_exited"] = process.poll() is not None
+    return cleanup
 
 
 def _write_private(path: Path, value: dict) -> None:
@@ -202,8 +211,8 @@ def main(argv: list[str] | None = None) -> int:
                 process.communicate(sys.stdin.read(), timeout=args.timeout)
                 code = process.returncode
             except subprocess.TimeoutExpired:
-                _stop_process(process)
                 code, error = 124, "Model invocation timed out"
+                record["cleanup"] = _stop_process(process)
         parsed = _codex_result(raw_path) if provider == "codex" else _claude_result(raw_path)
         record.update({key: parsed[key] for key in ("session_id", "actual_model", "usage", "completed")})
         record["total_cost_usd"] = parsed.get("total_cost_usd")
@@ -217,13 +226,13 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         code, error = 1, str(exc)
         if process is not None:
-            _stop_process(process)
+            record["cleanup"] = _stop_process(process)
     except BaseException as exc:
         # Codex has its own process group; forward shutdown rather than orphan it.
         for sig in previous_handlers:
             signal.signal(sig, signal.SIG_IGN)
         if process is not None:
-            _stop_process(process)
+            record["cleanup"] = _stop_process(process)
         if not isinstance(exc, _Interrupted):
             raise
         code, error = 128 + exc.signum, f"Model invocation interrupted by signal {exc.signum}"
