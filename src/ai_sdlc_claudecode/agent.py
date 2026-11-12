@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sandbox", choices=("read-only", "workspace-write"), default="workspace-write")
     parser.add_argument("--output-format", choices=("json", "text"), default="json")
     parser.add_argument("--receipt", type=Path)
-    parser.add_argument("--timeout", type=float)
+    parser.add_argument("--timeout", type=float, help="Wall-clock seconds; 0 disables the limit")
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.dag.read_text()).get("config", {})
@@ -193,6 +193,8 @@ def main(argv: list[str] | None = None) -> int:
               "raw_output_path": str(raw_path), "stderr_path": str(stderr_path),
               "started_at": datetime.now(timezone.utc).isoformat()}
     start = time.monotonic()
+    timeout = None if args.timeout == 0 else args.timeout
+    record["timeout_seconds"] = timeout
     code, error, normalized, output = 1, None, {}, ""
     process = None
 
@@ -208,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                                        stderr=stderr, text=True, cwd=project,
                                        start_new_session=True)
             try:
-                process.communicate(sys.stdin.read(), timeout=args.timeout)
+                process.communicate(sys.stdin.read(), timeout=timeout)
                 code = process.returncode
             except subprocess.TimeoutExpired:
                 code, error = 124, "Model invocation timed out"

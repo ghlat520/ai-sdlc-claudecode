@@ -99,6 +99,13 @@ Configure `tech_stack` in `pipeline-dag.json`:
 - **Dead Letter** — after 3 retries, stage enters dead letter queue for human intervention
 - **Notifications** — webhook support (DingTalk) for human_wait, dead_letter, pipeline_end
 
+For direct `pipeline-executor.sh` runs, `PIPELINE_STAGE_TIMEOUT_SECONDS` overrides
+the primary model invocation's wall-clock limit for that run. Set it to `0` to
+run without this time limit; leave it unset to use the DAG's configured seconds.
+Schema, post-command and gate verification still run, and SIGINT/SIGTERM still
+stop the owned model process group. The dispatch log prints the effective limit;
+an unlimited model receipt records `timeout_seconds: null`.
+
 ## Self-Evolving Agent
 
 The `ai-sdlc` command wraps the SDLC pipeline with an autonomous learning loop.

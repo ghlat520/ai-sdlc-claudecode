@@ -26,6 +26,11 @@ export PIPELINE_DAG_FILE="$DAG_FILE"
 export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 VALIDATE_SCRIPT="${SCRIPT_DIR}/validate-handoff.sh"
 
+if [[ -n "${PIPELINE_STAGE_TIMEOUT_SECONDS:-}" && ! "${PIPELINE_STAGE_TIMEOUT_SECONDS}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo 'PIPELINE_STAGE_TIMEOUT_SECONDS must be an integer number of seconds; 0 disables the stage limit.' >&2
+    exit 2
+fi
+
 # shellcheck source=lib/events.sh
 source "${SCRIPT_DIR}/lib/events.sh"
 # shellcheck source=lib/protocol.sh
@@ -1021,7 +1026,7 @@ ${diag_suffix}"
 
         # Get stage timeout (from DAG cache)
         local stage_timeout
-        stage_timeout=$(dag_get "$stage_name" "timeout")
+        stage_timeout="${PIPELINE_STAGE_TIMEOUT_SECONDS:-$(dag_get "$stage_name" "timeout")}"
 
         local claude_output
         local claude_exit=0
@@ -1100,7 +1105,9 @@ SKELPYEOF
 ) || claude_exit=$?
             claude_output="$skeleton_json"
         else
-            echo -e "  ${YELLOW}Invoking model (${agent_model}, timeout: ${stage_timeout}s)...${NC}"
+            local timeout_label="${stage_timeout}s"
+            [[ "$stage_timeout" != 0 ]] || timeout_label="unlimited"
+            echo -e "  ${YELLOW}Invoking model (${agent_model}, timeout: ${timeout_label})...${NC}"
             local response_file="${output_dir}/agent-response.json"
             local model_receipt="${output_dir}/.attempts/${PIPELINE_ATTEMPT_ID}/agent-model.json"
             local dispatch_log="${output_dir}/agent-dispatch.log"
@@ -1130,7 +1137,7 @@ PY_METRICS
                 claude_output=$(cat "$dispatch_log" "$response_file")
                 [[ $claude_exit -ne 0 ]] || claude_exit=1
             fi
-            if [[ $claude_exit -eq 124 ]]; then
+            if [[ $claude_exit -eq 124 && "$stage_timeout" != 0 ]]; then
                 echo -e "  ${RED}Stage timed out after ${stage_timeout}s${NC}"
                 emit_event "$feature_id" "stage_timeout" "$stage_id" "Timed out after ${stage_timeout}s"
                 set_stage_state "$feature_id" "$stage_id" "failed" "$retry_count"
