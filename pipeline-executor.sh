@@ -19,6 +19,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PIPELINE_TOOL_DIR="$SCRIPT_DIR"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PROJECT_ROOT  # needed by post_commands (e.g., completeness-check)
 DAG_FILE="${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}"

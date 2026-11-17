@@ -109,6 +109,57 @@ from concurrent.futures import ProcessPoolExecutor
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('source,expected', [
+    ('export const answer = () => {\n return 42;\n};', 0),
+    ('export const answer = () => {};', 1),
+    ('export function answer() { /* unfinished */ }', 1),
+    ('export const answer = () => {;};', 1),
+    ('listen(() => { /* completeness-allow-empty: optional notification hook */ });', 0),
+    ('export const answer = () => { /* completeness-allow-empty: not a callback */ };', 1),
+    ('export const text = "() => {}";', 0),
+    ('class Value { constructor(public value: number) {} }', 0),
+    ('export const answer = ( => {};', 2),
+])
+def test_completeness_checks_function_body(tmp_path, source, expected):
+    (tmp_path / 'sample.ts').write_text(source)
+    (tmp_path / 'node_modules').symlink_to(ROOT / 'node_modules', target_is_directory=True)
+    result = subprocess.run(['bash', str(ROOT / 'scripts/completeness-check.sh'), str(tmp_path)],
+                            capture_output=True, text=True)
+    assert result.returncode == expected, result.stdout + result.stderr
+
+
+def test_completeness_parser_absence_and_vue(tmp_path):
+    target = tmp_path / 'source'
+    target.mkdir()
+    (target / 'sample.vue').write_text('<script setup lang="ts">const answer = () => {};</script>')
+    command = ['bash', str(ROOT / 'scripts/completeness-check.sh'), str(target)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'Required parser typescript unavailable' in result.stderr
+    (target / 'node_modules').symlink_to(ROOT / 'node_modules', target_is_directory=True)
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert 'B-Stub sample.vue:1' in result.stdout
+
+
+@pytest.mark.parametrize('source,code', [('export const answer = () => 42;', 0),
+                                       ('export const answer = () => {};', 1),
+                                       ('export const answer = ( => {};', 1)])
+def test_default_completeness_command_runs_in_supervisor(executor_case, tmp_path, source, code):
+    dag, path, env, run = executor_case
+    (tmp_path / 'node_modules').symlink_to(ROOT / 'node_modules', target_is_directory=True)
+    (tmp_path / 'sample.ts').write_text(source)
+    default = json.loads((ROOT / 'pipeline-dag.json').read_text())
+    command = next(c for s in default['stages'].values() for c in s.get('post_commands', [])
+                   if 'completeness-check.sh' in c)
+    dag['stages']['first']['post_commands'] = [command]
+    result, data = run('--stages', 'S8')
+    assert result.returncode == code, result.stdout + result.stderr
+    log = Path(data['stages']['S8']['output_dir'], 'post-commands.log').read_text()
+    assert '[CHECK]' in log or '[ERROR]' in log
+    assert 'No such file' not in log
+
+
 @pytest.fixture
 def executor_case(tmp_path):
     """Real supervisor/validator; only the model is a deterministic local executable."""
