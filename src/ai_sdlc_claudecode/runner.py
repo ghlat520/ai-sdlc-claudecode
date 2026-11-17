@@ -12,6 +12,7 @@ import re
 import signal
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,7 @@ class RunResult:
     all_passed: bool
     outcome: str = "unverified"
     run_id: Optional[str] = None
+    project_acceptance: Optional[dict] = None
 
 
 class PipelineRunner:
@@ -72,6 +74,8 @@ class PipelineRunner:
         state = PipelineState(self.pipeline_root / feature_id / "state.json")
         previous_run = state.read().get("run_id")
         env = os.environ.copy()
+        invocation = uuid.uuid4().hex
+        env['PIPELINE_INVOCATION_ID'] = invocation
         env["PIPELINE_ROOT"] = str(self.pipeline_root)
         # Always set EVOLVE_ERRORS_DIR — ErrorEngine is default-on
         default_evolve_dir = self.pipeline_root / feature_id / "evolve"
@@ -116,14 +120,23 @@ class PipelineRunner:
                 except ProcessLookupError:
                     pass
                 process.communicate()
+            data = state.read()
+            if data.get('invocation_id') == invocation:
+                state.record_executor_exit(data['run_id'], invocation, 130)
             raise
 
         duration = time.time() - start_time
-        stages_passed = self.get_stages_passed(feature_id)
         data = state.read()
-        total_stages = len(data.get("scope", [])) or self._get_total_stages()
-        fresh = bool(data.get("run_id")) and data["run_id"] != previous_run
-        outcome = state.outcome() if fresh else "unverified"
+        fresh = (bool(data.get("run_id")) and data["run_id"] != previous_run
+                 and data.get('invocation_id') == invocation)
+        if fresh:
+            fresh = state.record_executor_exit(data['run_id'], invocation, exit_code)
+        summary = state.summary()
+        fresh = fresh and summary['run_id'] == data['run_id']
+        stages_passed = summary['stages_passed'] if fresh else 0
+        total_stages = summary['stages_total'] or self._get_total_stages()
+        outcome = summary['execution_outcome'] if fresh else "unverified"
+        project = summary['project_acceptance'] if fresh else dict(status='not_evaluated', reasons=['No fresh run'])
         if exit_code not in (0, 3, 4):
             outcome = "failed"
         cost_usd = self._get_cost(feature_id)
@@ -139,6 +152,7 @@ class PipelineRunner:
             duration_seconds=duration,
             all_passed=(fresh and outcome == "complete" and exit_code == 0),
             outcome=outcome, run_id=data.get("run_id") if fresh else None,
+            project_acceptance=project,
         )
 
     def auto_approve_gates(self, feature_id: str) -> None:
@@ -149,10 +163,7 @@ class PipelineRunner:
         """Count only current verified artifacts within the requested scope."""
         state = PipelineState(self.pipeline_root / feature_id / "state.json")
         try:
-            data = state.read()
-            dag = Path(os.environ.get("PIPELINE_DAG_FILE", str(self.executor_path.parent / "pipeline-dag.json")))
-            return sum(state.is_verified(data.get("stages", {}).get(s, {}), dag)
-                       for s in data.get("scope", []))
+            return state.summary()['stages_passed']
         except (ValueError, OSError):
             return 0
 

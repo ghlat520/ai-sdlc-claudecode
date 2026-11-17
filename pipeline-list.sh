@@ -83,8 +83,9 @@ if updated and updated != '-':
 
 # Count stages
 stages = state.get('stages', {})
-total = len(state.get('scope', []))
-passed = sum(PipelineState.is_verified(stages.get(sid, {}), os.environ['PIPELINE_DAG_FILE']) for sid in state.get('scope', []))
+summary = PipelineState('${state_file}').summary()
+total = summary['stages_total']
+passed = summary['stages_passed']
 failed = sum(1 for s in stages.values() if s.get('status') in ('failed', 'dead_letter'))
 running = sum(1 for s in stages.values() if s.get('status') in ('running', 'gate_checking'))
 
@@ -95,6 +96,8 @@ if running > 0:
     progress += f' ({running}R)'
 
 print(f'  {feature_id:<25s} {tech_stack:<15s} {progress:<10s} \${cost_usd:<11.2f} {updated}')
+for line in PipelineState.format_summary(summary):
+    print('    ' + line)
 " 2>/dev/null
     done
 
@@ -111,10 +114,6 @@ list_features_verbose() {
         return 0
     fi
 
-    local stage_order=("S1:requirements" "S2:architecture" "S3:backend" "S3b:frontend"
-        "S4:testing" "S4b:integration-test" "S4c:e2e-testing" "S5:review"
-        "S6:deployment" "S7:monitoring" "S8:documentation" "S9:performance" "S10:release")
-
     for state_file in "${PIPELINE_ROOT}"/*/state.json; do
         [[ -f "$state_file" ]] || continue
 
@@ -127,6 +126,7 @@ list_features_verbose() {
 
         python3 -c "
 import json
+from ai_sdlc_claudecode.state import PipelineState
 
 with open('${state_file}') as f:
     state = json.load(f)
@@ -139,13 +139,9 @@ print(f'  Tech Stack:  {tech}')
 print(f'  Cost:        \${cost.get(\"estimated_usd\", 0):.2f} ({cost.get(\"total_tokens\", 0):,} tokens)')
 print()
 
-STAGE_ORDER = [
-    ('S1', 'requirements'), ('S2', 'architecture'), ('S3', 'backend'),
-    ('S3b', 'frontend'), ('S4', 'testing'), ('S4b', 'integration-test'),
-    ('S4c', 'e2e-testing'), ('S5', 'review'), ('S6', 'deployment'),
-    ('S7', 'monitoring'), ('S8', 'documentation'), ('S9', 'performance'),
-    ('S10', 'release'),
-]
+summary = PipelineState('${state_file}').summary()
+for line in PipelineState.format_summary(summary):
+    print('  ' + line)
 
 stages = state.get('stages', {})
 icons = {
@@ -154,14 +150,10 @@ icons = {
     'human_waiting': '\033[0;33m?\033[0m', 'pending': '\033[2m.\033[0m'
 }
 
-print('  Stages: ', end='')
-for sid, sname in STAGE_ORDER:
-    s = stages.get(sid, {})
-    status = s.get('status', 'pending')
+for sid in summary['scope']:
+    status = summary['stage_statuses'][sid]
     icon = icons.get(status, '.')
-    print(f'{icon}', end='')
-print()
-print('          S1 S2 S3 3b S4 4b 4c S5 S6 S7 S8 S9 S10')
+    print(f'  {icon} {sid}: {status}')
 " 2>/dev/null
     done
     echo ""
@@ -193,15 +185,17 @@ for state_file in sorted(glob.glob(os.path.join(pipeline_root, '*/state.json')))
     feature_id = state.get('feature_id', feature_dir)
     stages = state.get('stages', {})
     cost = state.get('cost', {})
+    summary = PipelineState(state_file).summary()
 
     features.append({
         'feature_id': feature_id,
         'tech_stack': state.get('tech_stack', 'unknown'),
-        'stages_passed': sum(PipelineState.is_verified(stages.get(sid, {}), os.environ['PIPELINE_DAG_FILE']) for sid in state.get('scope', [])),
-        'stages_total': len(state.get('scope', [])),
+        'stages_passed': summary['stages_passed'],
+        'stages_total': summary['stages_total'],
         'total_tokens': cost.get('total_tokens', 0),
         'total_cost_usd': cost.get('estimated_usd', 0.0),
-        'pipeline_state': state.get('pipeline_state', 'unknown'),
+        'pipeline_state': summary['execution_outcome'],
+        'project_acceptance': summary['project_acceptance'],
         'last_updated': state.get('updated_at', '-'),
     })
 

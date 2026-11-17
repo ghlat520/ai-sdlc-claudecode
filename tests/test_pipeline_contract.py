@@ -50,6 +50,7 @@ def test_pass_has_execution_evidence_and_policy_scope(contract):
     assert record["authorization"]["scope"] == "accept_stage_artifact"
     assert record["business_acceptance"] == "not_evaluated"
     assert state.is_verified(record, dag)
+    assert state.project_acceptance()['status'] == 'not_evaluated'
 
 
 def test_no_receipts_cannot_become_passed(contract):
@@ -173,6 +174,10 @@ def test_code_stage_can_write_source_and_returns_metadata(executor_case, templat
     if template_has_description:
         dag["stages"]["first"]["agents"][0]["prompt_template"] += "\n{{feature_description}}"
     dag['stages']['first']['writes_code'] = True
+    dag['config']['project_completion'] = {
+        'goal': 'A repeatable purchase has one durable result',
+        'authority': ['docs/approved-spec.md'], 'excluded_until_approved': ['production rollout'],
+    }
     fake_cli = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
     fake_cli.write_text(fake_cli.read_text().replace(
         "mode = os.environ.get('FAKE_MODE', 'valid')",
@@ -185,6 +190,10 @@ def test_code_stage_can_write_source_and_returns_metadata(executor_case, templat
     assert 'Do NOT attempt to write files.' not in prompt
     assert 'metadata JSON' in prompt
     assert prompt.count('local only') == 1
+    assert 'Delivery responsibilities' in prompt
+    assert 'docs/approved-spec.md' in prompt
+    assert 'production rollout' in prompt
+    assert 'The supervisor decides acceptance' in prompt
 
 
 def test_imported_architecture_materializes_configured_contracts(executor_case, tmp_path):
@@ -585,6 +594,289 @@ def test_resume_from_suffix_preserves_unfinished_goal(executor_case):
     assert Path(env['FAKE_CALLS']).read_text().splitlines() == ['S9']
 
 
+@pytest.fixture
+def project_acceptance_case(executor_case, tmp_path):
+    dag, path, env, run = executor_case
+    (tmp_path / 'app').mkdir()
+    (tmp_path / 'app/application.py').write_text('VERSION = 1\n')
+    driver = tmp_path / 'acceptance_driver.py'
+    driver.write_text('''import json, os
+from pathlib import Path
+report = {
+    'run_id': os.environ['PIPELINE_RUN_ID'],
+    'attempt_id': os.environ['PIPELINE_ATTEMPT_ID'],
+    'checks': {'business': {'create': 'passed', 'replay': 'passed'}},
+    'findings': {},
+}
+Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']).write_text(json.dumps(report))
+''')
+    dag['config']['project_acceptance'] = {
+        'scope': 'fixture-business', 'stage_id': 'S9',
+        'candidate_inputs': ['app', 'acceptance_driver.py'],
+        'required_checks': {'business': ['create', 'replay']},
+        'blocking_findings': {},
+    }
+    dag['stages']['second']['post_commands'] = ['python3 acceptance_driver.py']
+    return dag, path, env, run, tmp_path, driver
+
+
+def test_project_acceptance_binds_actual_checks_to_current_candidate(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    result, data = run('--stages', 'S8,S9')
+    assert result.returncode == 0, result.stdout + result.stderr
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    acceptance = state.project_acceptance()
+    assert acceptance['status'] == 'passed'
+    assert acceptance['scope'] == 'fixture-business'
+    assert acceptance['candidate_sha256']
+    assert acceptance['passed_cases'] == 2
+    assert PipelineState.is_verified(data['stages']['S9'], path)
+
+
+@pytest.mark.parametrize('mutation', ['changed', 'added', 'deleted', 'report', 'package', 'config'])
+def test_candidate_or_receipt_drift_invalidates_only_final_acceptance(project_acceptance_case, mutation):
+    dag, path, env, run, project, driver = project_acceptance_case
+    if mutation in ('package', 'config'):
+        bound_input = project / mutation
+        bound_input.write_text('original candidate input\n')
+        dag['config']['project_acceptance']['candidate_inputs'].append(mutation)
+    result, data = run('--stages', 'S8,S9')
+    assert result.returncode == 0, result.stdout + result.stderr
+    source = project / 'app/application.py'
+    if mutation == 'changed':
+        source.write_text('VERSION = 2\n')
+    elif mutation == 'added':
+        (source.parent / 'new_untracked.py').write_text('NEW = True\n')
+    elif mutation == 'deleted':
+        source.unlink()
+    elif mutation == 'report':
+        Path(data['stages']['S9']['project_acceptance']['report_path']).write_text('{}')
+    else:
+        bound_input.write_text('modified candidate input\n')
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.project_acceptance()['status'] == 'incomplete'
+    assert state.outcome() == 'partial'
+    assert PipelineState.is_verified(data['stages']['S8'], path)
+    assert not PipelineState.is_verified(data['stages']['S9'], path)
+
+
+@pytest.mark.parametrize('change, expected', [
+    ("report['checks']['business']['replay'] = 'failed'", 'failed'),
+    ("report['checks']['business'] = {}", 'incomplete'),
+    ("report['checks']['business']['replay'] = 'skipped'", 'incomplete'),
+    ("report['attempt_id'] = 'previous-attempt'", 'incomplete'),
+    ("report['findings'] = {'R1': {'status': 'fix_submitted'}}", 'failed'),
+    ("report['checks']['extra'] = {'discovered_failure': 'failed'}", 'failed'),
+    ("report['checks']['business'] = {'create': 'failed'}", 'failed'),
+    ("report['run_id'] = 'previous-run'", 'incomplete'),
+])
+def test_project_acceptance_rejects_incomplete_or_failed_results(project_acceptance_case, change, expected):
+    dag, path, env, run, project, driver = project_acceptance_case
+    driver.write_text(driver.read_text().replace("Path(os.environ", change + "\nPath(os.environ"))
+    result, data = run('--stages', 'S8,S9')
+    assert result.returncode != 0, result.stdout + result.stderr
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.project_acceptance()['status'] == expected
+    assert not PipelineState.is_verified(data['stages']['S9'], path)
+
+
+def test_known_blocker_survives_repair_attempt_until_verified(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    original = driver.read_text()
+    driver.write_text(original.replace("Path(os.environ", "report['findings'] = {'R1': {'status': 'open'}}\nPath(os.environ"))
+    result, _ = run('--stages', 'S8,S9')
+    assert result.returncode != 0
+    driver.write_text(original)
+    result, _ = run('--resume')
+    assert result.returncode != 0, 'Omitting an already observed blocker must not close it'
+    driver.write_text(original.replace("Path(os.environ", "report['findings'] = {'R1': {'status': 'verified_closed', 'checks': ['business']}}\nPath(os.environ"))
+    result, _ = run('--resume')
+    assert result.returncode == 0, result.stdout + result.stderr
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.project_acceptance()['status'] == 'passed'
+
+
+def test_drift_does_not_erase_a_newly_observed_blocker(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    original = driver.read_text()
+    driver.write_text(original.replace("Path(os.environ", "Path('app/application.py').write_text('VERSION = 2\\n')\n"
+                      "report['findings'] = {'R1': {'status': 'open'}}\nPath(os.environ"))
+    result, data = run('--stages', 'S8,S9')
+    assert result.returncode != 0
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.project_acceptance()['status'] == 'incomplete'
+    driver.write_text(original)
+    result, _ = run('--resume')
+    assert result.returncode != 0, 'A stale report must still preserve observed blocking findings'
+    assert 'R1' in state.project_acceptance()['known_findings']
+
+
+def test_candidate_directory_symlink_is_not_silently_omitted(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    shared = project / 'shared'
+    shared.mkdir()
+    (shared / 'lib.py').write_text('VERSION = 1\n')
+    (project / 'app/shared').symlink_to(shared, target_is_directory=True)
+    result, data = run('--stages', 'S8,S9')
+    assert result.returncode != 0, 'Unsupported source traversal must fail closed'
+    assert not PipelineState.is_verified(data['stages']['S9'], path)
+
+
+def test_duplicate_case_keys_cannot_hide_a_failure(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    driver.write_text(driver.read_text().replace('json.dumps(report)',
+        '''json.dumps(report).replace('"create": "passed"', '"create": "failed", "create": "passed"')'''))
+    result, data = run('--stages', 'S8,S9')
+    assert result.returncode != 0
+    assert not PipelineState.is_verified(data['stages']['S9'], path)
+
+
+@pytest.mark.parametrize('mode, expected_exit, expected_acceptance', [
+    ('subset', 0, 'incomplete'), ('skip', 4, 'incomplete'),
+    ('simulation', 0, 'not_evaluated'), ('human', 3, 'incomplete'),
+    ('missing_report', 1, 'incomplete'), ('command_error', 1, 'failed'),
+    ('command_error_no_report', 1, 'failed'), ('command_error_bad_report', 1, 'failed'),
+])
+def test_project_acceptance_scope_and_execution_boundaries(project_acceptance_case, mode, expected_exit, expected_acceptance):
+    dag, path, env, run, project, driver = project_acceptance_case
+    flags = ['--stages', 'S8,S9']
+    if mode == 'subset':
+        flags = ['--stages', 'S8']
+    elif mode == 'skip':
+        flags += ['--skip-stage', 'S9']
+    elif mode == 'simulation':
+        flags += ['--mock-review']
+    elif mode == 'human':
+        dag['stages']['second']['gate'] = {'type': 'human-required'}
+    elif mode == 'missing_report':
+        dag['stages']['second']['post_commands'] = ['true']
+    elif mode == 'command_error_no_report':
+        dag['stages']['second']['post_commands'] = ['exit 7']
+    elif mode == 'command_error_bad_report':
+        driver.write_text(driver.read_text().replace('json.dumps(report)', "'invalid JSON'"))
+        dag['stages']['second']['post_commands'].append('exit 7')
+    else:
+        dag['stages']['second']['post_commands'].append('exit 2')
+    result, _ = run(*flags)
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.project_acceptance()['status'] == expected_acceptance
+
+
+@pytest.mark.parametrize('fails', [False, True])
+def test_parallel_project_acceptance_uses_the_same_gate(project_acceptance_case, fails):
+    dag, path, env, run, project, driver = project_acceptance_case
+    dag['execution_order'] = [{'stages': ['first', 'second'], 'mode': 'parallel'}]
+    if fails:
+        driver.write_text(driver.read_text().replace("'replay': 'passed'", "'replay': 'failed'"))
+    result, data = run('--stages', 'S8,S9')
+    assert (result.returncode == 0) is not fails, result.stdout + result.stderr
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.project_acceptance()['status'] == ('failed' if fails else 'passed')
+    assert PipelineState.is_verified(data['stages']['S8'], path)
+
+
+def test_resume_reverifies_changed_candidate_without_redoing_unrelated_stage(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    result, before = run('--stages', 'S8,S9')
+    assert result.returncode == 0
+    (project / 'app/application.py').write_text('VERSION = 2\n')
+    result, after = run('--resume')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert before['stages']['S8']['attempt_id'] == after['stages']['S8']['attempt_id']
+    assert before['stages']['S9']['attempt_id'] != after['stages']['S9']['attempt_id']
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.project_acceptance()['status'] == 'passed'
+    record = after['stages']['S9']
+    for operation, extra in [(state.prepare_acceptance, ()), (state.collect_acceptance, (0,))]:
+        with pytest.raises(ValueError, match='terminal'):
+            operation(record['run_id'], 'S9', record['attempt_id'], *extra)
+
+
+def test_runner_exposes_project_acceptance_separately(project_acceptance_case, monkeypatch):
+    from ai_sdlc_claudecode.runner import PipelineRunner
+    dag, path, env, run, project, driver = project_acceptance_case
+    result, _ = run('--stages', 'S8,S9')
+    assert result.returncode == 0
+    # Resume retrieves the original project directory through the real runner entrypoint.
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    (project / 'app/application.py').write_text('VERSION = 2\n')
+    runner = PipelineRunner(ROOT / 'pipeline-executor.sh', Path(env['PIPELINE_ROOT']))
+    result = runner.run('fixture', 'local only', resume=True, timeout_seconds=25)
+    assert result.all_passed and result.outcome == 'complete', result.stdout + result.stderr
+    assert result.project_acceptance['status'] == 'passed'
+    assert result.project_acceptance['run_id'] == result.run_id
+    driver.write_text(driver.read_text().replace("'replay': 'passed'", "'replay': 'failed'"))
+    result = runner.run('fixture', 'local only', resume=True, timeout_seconds=25)
+    assert not result.all_passed and result.outcome == 'failed'
+    assert result.project_acceptance['status'] == 'failed'
+
+
+def test_runner_terminal_failure_is_visible_in_every_summary(project_acceptance_case, monkeypatch):
+    import shlex
+    from ai_sdlc_claudecode.runner import PipelineRunner
+    dag, path, env, run, project, driver = project_acceptance_case
+    path.write_text(json.dumps(dag))
+    wrapper = project / 'wrapper.sh'
+    wrapper.write_text('bash ' + shlex.quote(str(ROOT / 'pipeline-executor.sh'))
+                       + ' "$@" --project-dir ' + shlex.quote(str(project)) + '\nexit 7\n')
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    result = PipelineRunner(wrapper, Path(env['PIPELINE_ROOT'])).run('fixture', 'local only', timeout_seconds=25)
+    assert result.exit_code == 7 and result.outcome == 'failed'
+    assert result.project_acceptance['status'] == 'incomplete'
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.summary()['execution_outcome'] == result.outcome
+    assert state.summary()['project_acceptance']['status'] == result.project_acceptance['status']
+    # The next real invocation owns a new process outcome and may reuse valid stage proofs.
+    result, _ = run('--resume')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert state.summary()['project_acceptance']['status'] == 'passed'
+
+
+def test_reports_recompute_acceptance_after_candidate_changes(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    result, data = run('--stages', 'S8,S9')
+    assert result.returncode == 0, result.stdout + result.stderr
+    (project / 'app/application.py').write_text('VERSION = 2\n')
+    status = subprocess.run([sys.executable, '-m', 'ai_sdlc_claudecode', 'status', '--feature-id', 'fixture'],
+                            env=env, text=True, capture_output=True, timeout=10)
+    assert status.returncode == 0, status.stderr
+    assert 'Project acceptance: incomplete' in status.stdout
+    assert 'Execution: partial' in status.stdout
+    report = subprocess.run([sys.executable, '-m', 'ai_sdlc_claudecode', 'report', '--feature-id', 'fixture'],
+                            env=env, text=True, capture_output=True, timeout=10)
+    assert report.returncode == 0, report.stderr
+    report_path = Path(env['PIPELINE_ROOT']) / 'fixture/ai-sdlc-report.md'
+    content = report_path.read_text()
+    assert '**Project acceptance**: incomplete' in content
+    assert '**Execution**: partial' in content
+    assert '1/2' in content
+    assert '/13' not in content
+    # Displays must use the run's DAG, even when no caller supplies its path.
+    display_env = {key: value for key, value in env.items() if key != 'PIPELINE_DAG_FILE'}
+    for missing_dag in (False, True):
+        if missing_dag:
+            path.unlink()
+        for script, args in [('pipeline-status.sh', ['fixture']), ('pipeline-monitor.sh', ['fixture']),
+                             ('pipeline-list.sh', []), ('pipeline-list.sh', ['--verbose']),
+                             ('pipeline-list.sh', ['--json'])]:
+            result = subprocess.run(['bash', str(ROOT / script), *args], env=display_env,
+                                    capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, script + '\n' + result.stderr
+            if '--json' in args:
+                row = json.loads(result.stdout)[0]
+                assert row['pipeline_state'] == 'partial'
+                assert row['project_acceptance']['status'] == 'incomplete'
+                assert row['stages_passed'] == (0 if missing_dag else 1) and row['stages_total'] == 2
+            else:
+                assert 'Project acceptance: incomplete' in result.stdout, script + result.stdout
+                assert 'Execution: partial' in result.stdout
+                assert ('0/2' if missing_dag else '1/2') in result.stdout
+                assert 'Remaining:' in result.stdout and 'Next: Coordinator:' in result.stdout
+
+
 def test_concurrent_supervisor_cost_writers_preserve_stage_records(contract):
     from concurrent.futures import ThreadPoolExecutor
     state, run, dag, output_dir = contract
@@ -693,3 +985,69 @@ def test_status_commands_use_verified_scope(executor_case):
         if script == 'pipeline-list.sh':
             row = json.loads(result.stdout)[0]
             assert row['stages_passed'] == row['stages_total'] == 1
+
+
+def test_rejected_concurrent_runner_cannot_overwrite_winning_run(project_acceptance_case, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from ai_sdlc_claudecode.runner import PipelineRunner
+    dag, path, env, run, project, driver = project_acceptance_case
+    path.write_text(json.dumps(dag))
+    import shlex
+    wrapper = project / 'wrapper.sh'
+    wrapper.write_text('bash ' + shlex.quote(str(ROOT / 'pipeline-executor.sh'))
+                       + ' "$@" --project-dir ' + shlex.quote(str(project)) + '\n')
+    fake = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    fake.write_text(fake.read_text().replace('stage = re.search', 'import time\ntime.sleep(1)\nstage = re.search'))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    # Both real invocations observe the same baseline before either launches.
+    original_read = PipelineState.read
+    barrier, local = threading.Barrier(2), threading.local()
+    def read_baseline(self):
+        data = original_read(self)
+        if not getattr(local, 'started', False):
+            local.started = True
+            barrier.wait(timeout=10)
+        return data
+    monkeypatch.setattr(PipelineState, 'read', read_baseline)
+    def invoke(_):
+        return PipelineRunner(wrapper, Path(env['PIPELINE_ROOT'])).run('fixture', 'local only', timeout_seconds=25)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(invoke, range(2)))
+    monkeypatch.setattr(PipelineState, 'read', original_read)
+    winner = [result for result in results if result.exit_code == 0]
+    assert len(winner) == 1, [(result.exit_code, result.stderr) for result in results]
+    loser = next(result for result in results if result.exit_code != 0)
+    assert loser.run_id is None and not loser.all_passed
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.summary()['project_acceptance']['status'] == 'passed'
+    assert state.read()['executor_exit']['exit_code'] == 0
+    before = state.read()
+    assert not state.record_executor_exit(before['run_id'], 'another-invocation', 7)
+    assert state.read() == before
+
+
+def test_runner_does_not_attribute_successor_summary_to_its_own_run(project_acceptance_case, monkeypatch):
+    import shlex
+    from ai_sdlc_claudecode.runner import PipelineRunner
+    dag, path, env, run, project, driver = project_acceptance_case
+    path.write_text(json.dumps(dag))
+    wrapper = project / 'wrapper.sh'
+    wrapper.write_text('bash ' + shlex.quote(str(ROOT / 'pipeline-executor.sh'))
+                       + ' "$@" --project-dir ' + shlex.quote(str(project)) + '\nexit 7\n')
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    original_summary = PipelineState.summary
+    successor = []
+    def summary_after_successor_starts(self):
+        # A real state transition at the precise gap between exit write and readback.
+        successor.append(self.start_run('fixture', path, ['S8', 'S9'],
+                                       invocation_id='successor', project_dir=str(project)))
+        return original_summary(self)
+    monkeypatch.setattr(PipelineState, 'summary', summary_after_successor_starts)
+    result = PipelineRunner(wrapper, Path(env['PIPELINE_ROOT'])).run('fixture', 'local only', timeout_seconds=25)
+    assert result.exit_code == 7 and not result.all_passed
+    assert result.run_id is None
+    assert result.project_acceptance['status'] == 'not_evaluated'
+    assert PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json').read()['run_id'] == successor[0]

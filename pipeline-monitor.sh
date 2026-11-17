@@ -62,8 +62,16 @@ events_file = os.environ["EVENTS_FILE"]
 
 with open(state_file) as f:
     state = json.load(f)
-with open(dag_file) as f:
-    dag = json.load(f)
+dag_file = state.get('dag_path', dag_file)
+from ai_sdlc_claudecode.state import PipelineState
+summary = PipelineState(state_file).summary()
+try:
+    with open(dag_file) as f:
+        dag = json.load(f)
+except (OSError, ValueError):
+    for line in PipelineState.format_summary(summary):
+        print(line)
+    raise SystemExit(0)
 
 events = []
 if os.path.exists(events_file):
@@ -122,10 +130,9 @@ else:
     elapsed_str = "00:00"
 
 # ── Counts ──
-from ai_sdlc_claudecode.state import PipelineState
-scope = state.get("scope", [])
+scope = summary['scope']
 total = len(scope)
-passed_ids = [sid for sid in scope if PipelineState.is_verified(stages_state.get(sid, {}), dag_file)]
+passed_ids = [sid for sid in scope if summary['stage_statuses'][sid] == 'passed']
 skipped_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") == "skipped"]
 running_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") in ("running", "gate_checking")]
 failed_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") in ("failed", "dead_letter")]
@@ -203,7 +210,7 @@ print(bx(""))
 for sm in stages_meta:
     sid = sm["id"]
     sdata = stages_state.get(sid, {})
-    st = sdata.get("status", "pending")
+    st = summary['stage_statuses'].get(sid, 'pending')
     ic = ICONS.get(st, "?")
     retry = sdata.get("retry_count", 0)
 
@@ -264,15 +271,8 @@ for sm in stages_meta:
                 print(bx(f"输入: {dep_id}-{dep}/output.json ({sz:.0f}KB) → {action}"))
 
 print(f"\u255a{'═' * (W + 2)}\u255d")
-
-# Pipeline completion summary
-end_ev = next((e for e in reversed(events) if e.get("event_type") in ("pipeline_end", "pipeline_fail")), None)
-if end_ev:
-    is_ok = "success" in end_ev.get("message", "")
-    emoji = "\u2705" if is_ok else "\u274c"
-    label = "COMPLETE" if is_ok else "FAILED"
-    print(f"\n{emoji} Pipeline {label}")
-    print(f"   Passed: {len(passed_ids)}/{total} | Failed: {len(failed_ids)} | Cost: ${usd:.2f} | Tokens: {tokens:,}")
+for line in PipelineState.format_summary(summary):
+    print(line)
 DASHEOF
 }
 

@@ -143,8 +143,16 @@ events_file = os.environ["EVENTS_FILE"]
 
 with open(state_file) as f:
     state = json.load(f)
-with open(dag_file) as f:
-    dag = json.load(f)
+dag_file = state.get('dag_path', dag_file)
+from ai_sdlc_claudecode.state import PipelineState
+summary = PipelineState(state_file).summary()
+try:
+    with open(dag_file) as f:
+        dag = json.load(f)
+except (OSError, ValueError):
+    for line in PipelineState.format_summary(summary):
+        print(line)
+    raise SystemExit(0)
 
 events = []
 if os.path.exists(events_file):
@@ -203,10 +211,9 @@ else:
     elapsed_str = "00:00"
 
 # ── Counts ──
-from ai_sdlc_claudecode.state import PipelineState
-scope = state.get("scope", [])
+scope = summary['scope']
 total = len(scope)
-passed_ids = [sid for sid in scope if PipelineState.is_verified(stages_state.get(sid, {}), dag_file)]
+passed_ids = [sid for sid in scope if summary['stage_statuses'][sid] == 'passed']
 skipped_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") == "skipped"]
 running_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") in ("running", "gate_checking")]
 failed_ids = [s["id"] for s in stages_meta if stages_state.get(s["id"], {}).get("status") in ("failed", "dead_letter")]
@@ -292,7 +299,7 @@ print(bx(""))
 for sm in stages_meta:
     sid = sm["id"]
     sdata = stages_state.get(sid, {})
-    st = sdata.get("status", "pending")
+    st = summary['stage_statuses'].get(sid, 'pending')
     ic = ICONS.get(st, "?")
     retry = sdata.get("retry_count", 0)
 
@@ -365,6 +372,8 @@ for sm in stages_meta:
 
 # Bottom border
 print(f"\u255a{'═' * (W + 2)}\u255d")
+for line in PipelineState.format_summary(summary):
+    print(line)
 DASHEOF
 }
 
@@ -595,6 +604,36 @@ prompt = prompt.replace('{{module_list}}', '(auto-detect from pom.xml)')
 prompt = prompt.replace('{{table_list}}', '(auto-detect from existing mappers)')
 prompt = prompt.replace('{{project_dir}}', os.environ.get('PROJECT_CODE_DIR', ''))
 
+# Management context supplements both file and inline prompts; it cannot grant a pass.
+prompt += '''
+
+## Delivery responsibilities
+Work within the current stage and authorized project scope. Read authoritative sources
+and inspect equivalent rules and call sites before changing behavior. State the user
+behavior, constraints, relevant source versions, and the smallest observable check.
+Coordinator: assign bounded responsibilities, track dependencies and unresolved findings,
+and route missing evidence to its owner. Reuse the existing DAG and retry loop.
+Implementer: implement and run focused self-checks; report the candidate and exact tested
+scope as submitted for verification. The supervisor decides acceptance from collected checks.
+Reviewer: start from the original contract, test counterexamples and equivalent entrypoints,
+and distinguish independent review from the author's self-check.
+Never remove a required check or omit an open finding to obtain a pass. A submitted fix
+is not verified_closed. Preserve blockers until the same candidate passes their checks.
+After the same blocker survives two attempts, narrow to a causal probe before repeating
+the full chain; record the new fact, remaining gap, next owner/action and rollback condition.
+Do not promote a stage success into product acceptance, deployment permission or a global rule.
+'''
+completion = dag.get('config', {}).get('project_completion')
+if completion:
+    prompt += '\n## Project intent and authoritative sources\n' + json.dumps(completion, ensure_ascii=False, indent=2)
+definition = dag.get('config', {}).get('project_acceptance')
+if definition:
+    prompt += '\n## Declared project acceptance contract\n' + json.dumps(definition, ensure_ascii=False, indent=2)
+    prompt += '\nThe configured post_commands generate the acceptance report. Agent prose cannot replace it.\n'
+    from ai_sdlc_claudecode.state import PipelineState
+    prompt += '\n## Current supervisor evidence\n' + '\n'.join(
+        PipelineState.format_summary(PipelineState(os.path.join(out_dir, 'state.json')).summary()))
+
 # Inject quality lessons from accumulated deployment retrospectives
 quality_lessons_path = os.path.join(os.path.dirname(dag_path), 'prompts', 'quality-lessons.md')
 if os.path.exists(quality_lessons_path):
@@ -702,7 +741,19 @@ verify_stage() {
     bash "$VALIDATE_SCRIPT" "$stage_id" "$output_json" > "$log_file" 2>&1 || code=$?
     collect_evidence "$feature_id" "$stage_id" schema "$code" "$log_file" || return 1
     [[ $code -eq 0 ]] || return 1
-    run_post_commands "$stage_name" "$feature_id" "$stage_id" || return 1
+    local acceptance_report post_exit=0 acceptance_exit=0
+    acceptance_report=$(python3 -m ai_sdlc_claudecode.state acceptance-prepare \
+        "${PIPELINE_ROOT}/${feature_id}/state.json" "$PIPELINE_RUN_ID" "$stage_id" "$PIPELINE_ATTEMPT_ID") || return 1
+    PIPELINE_ACCEPTANCE_REPORT="$acceptance_report" \
+        run_post_commands "$stage_name" "$feature_id" "$stage_id" || post_exit=$?
+    if [[ -n "$acceptance_report" ]]; then
+        python3 -m ai_sdlc_claudecode.state acceptance-collect \
+            "${PIPELINE_ROOT}/${feature_id}/state.json" "$PIPELINE_RUN_ID" "$stage_id" "$PIPELINE_ATTEMPT_ID" "$post_exit" \
+            > "${output_dir}/project-acceptance.log" 2>&1 || acceptance_exit=$?
+        collect_evidence "$feature_id" "$stage_id" project_acceptance "$acceptance_exit" "${output_dir}/project-acceptance.log" || return 1
+        [[ $acceptance_exit -eq 0 ]] || return 1
+    fi
+    [[ $post_exit -eq 0 ]] || return 1
     if [[ "$stage_id" == S3 || "$stage_id" == S3b ]]; then
         local contracts_json="${PIPELINE_ROOT}/${feature_id}/S2-architecture/contracts.json"
         code=0
@@ -1282,11 +1333,14 @@ PY_CONTRACTS
             return 3
         elif [[ $check_exit -eq 0 ]]; then
             set_stage_state "$feature_id" "$stage_id" passed "$retry_count" || return 1
-            emit_event "$feature_id" stage_pass "$stage_id" "Configured stage checks passed; business acceptance not evaluated"
+            emit_event "$feature_id" stage_pass "$stage_id" "Configured stage checks passed; project acceptance is reported separately"
             return 0
         fi
         set_stage_state "$feature_id" "$stage_id" failed "$retry_count" || return 1
         prev_error_output="Required verification failed (exit ${check_exit}); inspect ${output_dir}/*.log"
+        if [[ -s "${output_dir}/project-acceptance.log" ]]; then
+            prev_error_output+=$'\n'"$(head -c 4000 "${output_dir}/project-acceptance.log")"
+        fi
         prev_exit_code="$check_exit"
         retry_count=$((retry_count + 1))
     done

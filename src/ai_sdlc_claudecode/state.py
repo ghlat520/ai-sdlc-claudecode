@@ -13,6 +13,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import acceptance
+
 
 @dataclass(frozen=True)
 class PhaseState:
@@ -214,6 +216,8 @@ class EvolveState:
             f"**Total iterations**: {self.current_iteration}",
             f"**Consecutive stalls**: {self.consecutive_no_improve}",
             "",
+            *PipelineState.format_summary(PipelineState(self.state_file.with_name('state.json')).summary(), markdown=True),
+            "",
             "## Phase Summary",
             "",
             "| Phase | Status | Iterations | Best Stages | Errors Learned |",
@@ -222,7 +226,7 @@ class EvolveState:
         for num in sorted(self.phases):
             ps = self.phases[num]
             best = max(ps.stages_passed) if ps.stages_passed else 0
-            lines.append(f"| {num} | {ps.status} | {ps.iterations} | {best}/13 | {ps.errors_learned} |")
+            lines.append(f"| {num} | {ps.status} | {ps.iterations} | {best} | {ps.errors_learned} |")
 
         lines.extend(["", "## Improvement Trend", ""])
         for num in sorted(self.phases):
@@ -298,6 +302,7 @@ class PipelineState:
             raise ValueError("feature_id must be a simple identifier")
         dag_path = Path(dag_path).resolve()
         dag = json.loads(dag_path.read_text())
+        acceptance.policy(dag)
         ids = {s["id"] for s in dag["stages"].values()}
         if not scope or not set(scope) <= ids:
             raise ValueError("empty or unknown execution scope")
@@ -316,7 +321,9 @@ class PipelineState:
                     raise ValueError("feature already has a live execution owner")
             data.setdefault("stages", {})
             data.setdefault("cost", {})
+            data.pop('executor_exit', None)
             data.update(feature_id=feature, contract_version=2, run_id=run,
+                        invocation_id=metadata.pop('invocation_id', None),
                         dag_path=str(dag_path), dag_sha256=_sha(dag_path),
                         scope=list(scope), execution_scope=execution_scope,
                         pipeline_state="running", updated_at=_now())
@@ -336,7 +343,7 @@ class PipelineState:
                 data.setdefault("history", []).append(old)
             dag = json.loads(Path(data["dag_path"]).read_text())
             config = next(s for s in dag["stages"].values() if s["id"] == stage)
-            checks = sorted(self.expected_checks(config))
+            checks = sorted(self.expected_checks(config, dag))
             archive = output_dir / ".attempts" / attempt
             archive.mkdir(parents=True, exist_ok=False)
             # Old output is retained in its previous result archive, never reused as new work.
@@ -413,7 +420,7 @@ class PipelineState:
             return deepcopy(record)
 
     @staticmethod
-    def expected_checks(config):
+    def expected_checks(config, dag=None):
         checks = {"schema", "gate"}
         if config.get("post_commands"):
             checks.add("post_commands")
@@ -423,6 +430,9 @@ class PipelineState:
             checks.add("contracts")
         if config["id"] in ("S4", "S4b", "S4c"):
             checks.add("tdd")
+        definition = acceptance.policy(dag) if dag else None
+        if definition and definition['stage_id'] == config['id']:
+            checks.add('project_acceptance')
         return checks
 
     @staticmethod
@@ -451,8 +461,12 @@ class PipelineState:
             if any(d["sha256"] != _sha(d["path"]) for d in record.get("dependencies", [])):
                 return False
             receipts = record["verification"]["evidence"]
-            if not PipelineState.expected_checks(config) <=  {r["check"] for r in receipts}:
+            if not PipelineState.expected_checks(config, dag) <= {r["check"] for r in receipts}:
                 return False
+            definition = acceptance.policy(dag)
+            if definition and definition['stage_id'] == record['stage_id']:
+                if acceptance.evaluate(record.get('project_acceptance', {}), definition, record)['status'] != 'passed':
+                    return False
             return bool(receipts) and all(
                 r["exit_code"] == 0 and r["run_id"] == record["run_id"]
                 and r["attempt_id"] == record["attempt_id"] and r["sha256"] == _sha(r["path"])
@@ -460,8 +474,115 @@ class PipelineState:
         except (KeyError, OSError, TypeError, ValueError, StopIteration):
             return False
 
-    def outcome(self):
+    def prepare_acceptance(self, run, stage, attempt):
+        with locked_json(self.path) as data:
+            record = self._attempt(data, run, stage, attempt)
+            if record['status'] not in ('running', 'gate_checking'):
+                raise ValueError('Cannot prepare acceptance for a terminal attempt')
+            definition = acceptance.policy(json.loads(Path(data['dag_path']).read_text()))
+            if not definition or definition['stage_id'] != stage:
+                return ''
+            if data['dag_sha256'] != _sha(data['dag_path']):
+                raise ValueError('Acceptance policy changed during execution')
+            known = {}
+            for previous in data.get('history', []):
+                evidence = previous.get('project_acceptance', {})
+                if evidence.get('scope') == definition['scope']:
+                    known.update(evidence.get('known_findings', {}))
+            known.update(definition.get('blocking_findings', {}))
+            record['project_acceptance'] = acceptance.prepare(definition, record, data['project_dir'], known)
+            return record['project_acceptance']['report_path']
+
+    def collect_acceptance(self, run, stage, attempt, command_exit):
+        with locked_json(self.path) as data:
+            record = self._attempt(data, run, stage, attempt)
+            if record['status'] not in ('running', 'gate_checking'):
+                raise ValueError('Cannot collect acceptance for a terminal attempt')
+            definition = acceptance.policy(json.loads(Path(data['dag_path']).read_text()))
+            binding = record['project_acceptance']
+            acceptance.collect(binding, command_exit)
+            result = acceptance.evaluate(binding, definition, record)
+            binding['known_findings'] = result['known_findings']
+            return result
+
+    def project_acceptance(self, data=None):
+        data = self.read() if data is None else data
+        if not data.get('dag_path'):
+            return dict(status='not_evaluated', scope=None, reasons=['No project execution record'])
+        try:
+            definition = acceptance.policy(json.loads(Path(data['dag_path']).read_text()))
+            if definition is None or data.get('simulation'):
+                return dict(status='not_evaluated', scope=None, reasons=['No executed project acceptance'])
+            stage = definition['stage_id']
+            if stage not in data.get('scope', []):
+                return dict(status='incomplete', scope=definition['scope'], reasons=['Acceptance stage is outside requested scope'])
+            record = data.get('stages', {}).get(stage, {})
+            result = acceptance.evaluate(record.get('project_acceptance', {}), definition, record)
+            if result['status'] == 'passed' and self.outcome(data) != 'complete':
+                result.update(status='incomplete', reasons=['Requested execution scope is not verified complete'])
+            return result
+        except (KeyError, OSError, ValueError, TypeError) as exc:
+            return dict(status='incomplete', scope=None, reasons=[str(exc)])
+
+    def summary(self):
         data = self.read()
+        scope = data.get('scope', [])
+        statuses = {}
+        for stage in dict.fromkeys([*scope, *data.get('stages', {})]):
+            record = data.get('stages', {}).get(stage, {})
+            status = record.get('status', 'pending')
+            if status == 'passed' and not self.is_verified(record, data.get('dag_path', '')):
+                status = 'unverified'
+            statuses[stage] = status
+        return dict(feature_id=data.get('feature_id'), run_id=data.get('run_id'),
+                    scope=scope, execution_scope=data.get('execution_scope', scope),
+                    execution_outcome=self.outcome(data) if data.get('dag_path') else 'unverified',
+                    stage_statuses=statuses, stages_passed=sum(statuses[s] == 'passed' for s in scope),
+                    stages_total=len(scope), project_acceptance=self.project_acceptance(data))
+
+    def record_executor_exit(self, run, invocation, code):
+        """Persist the supervising process result without overwriting another run."""
+        with locked_json(self.path) as data:
+            if (not invocation or data.get('run_id') != run
+                    or data.get('invocation_id') != invocation):
+                return False
+            data['executor_exit'] = dict(run_id=run, invocation_id=invocation,
+                                         exit_code=code, observed_at=_now())
+            return True
+
+    @staticmethod
+    def format_summary(summary, markdown=False):
+        project = summary['project_acceptance']
+        values = [('Execution', summary['execution_outcome']),
+                  ('Verified stages', f"{summary['stages_passed']}/{summary['stages_total']} (configured scope)"),
+                  ('Project acceptance', project['status']),
+                  ('Acceptance scope', project.get('scope') or 'not declared')]
+        if project.get('candidate_sha256'):
+            values.append(('Candidate', project['candidate_sha256']))
+        if project.get('reasons'):
+            values.append(('Remaining', '; '.join(project['reasons'])))
+        else:
+            values.append(('Remaining', 'None within the declared acceptance contract'))
+        if project['status'] == 'failed':
+            values.append(('Next', 'Implementer: repair the reported failures and resubmit for verification'))
+        elif project['status'] == 'incomplete':
+            values.append(('Next', 'Coordinator: resolve the missing or stale evidence in the declared scope'))
+        elif project['status'] == 'not_evaluated':
+            values.append(('Next', 'Coordinator: declare and execute project acceptance when required by the goal'))
+        else:
+            values.append(('Next', 'Product owner: review the accepted scope and any separately authorized release decision'))
+        return [f"{'**' if markdown else ''}{key}{'**' if markdown else ''}: {value}" for key, value in values]
+
+    def outcome(self, data=None):
+        data = self.read() if data is None else data
+        process = data.get('executor_exit', {})
+        if process.get('run_id') == data.get('run_id') and process.get('exit_code', 0) != 0:
+            code = process['exit_code']
+            if code == 3:
+                return 'human_waiting'
+            if code == 4:
+                return 'paused' if data.get('pipeline_state') == 'paused' else 'partial'
+            return 'failed'
         stages = [data.get("stages", {}).get(s, {}) for s in data.get("scope", [])]
         statuses = {s.get("status", "pending") for s in stages}
         if "human_waiting" in statuses:
@@ -504,6 +625,7 @@ def _pipeline_cli():
         print(state.start_run(feature, dag_path, [dag["stages"][n]["id"] for n in names],
                               execution_scope=[dag["stages"][n]["id"] for n in execution_names],
                               simulation=simulation == "true", project_dir=project, owner_pid=int(owner),
+                              invocation_id=os.environ.get('PIPELINE_INVOCATION_ID'),
                               feature_description=description,
                               config={"cost_limit_usd":float(cost), "max_retries":int(retries)}))
     elif command == "replay":
@@ -520,6 +642,14 @@ def _pipeline_cli():
     elif command == "evidence":
         run, stage, attempt, check, code, source = args
         state.add_evidence(run, stage, attempt, check, int(code), source)
+    elif command == 'acceptance-prepare':
+        print(state.prepare_acceptance(*args))
+    elif command == 'acceptance-collect':
+        result = state.collect_acceptance(*args[:3], int(args[3]))
+        print(json.dumps(result))
+        sys.exit(0 if result['status'] == 'passed' else 1)
+    elif command == 'summary':
+        print(json.dumps(state.summary()))
     elif command == "stage":
         run, stage, attempt, status, retry, fixes = args
         if status in ("skipped", "imported"):

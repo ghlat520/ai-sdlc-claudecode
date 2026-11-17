@@ -79,10 +79,18 @@ print()
 
 # Stage order
 from ai_sdlc_claudecode.state import PipelineState
-dag_path = os.environ['PIPELINE_DAG_FILE']
-dag = json.load(open(dag_path))
+summary = PipelineState('${state_file}').summary()
+dag_path = state.get('dag_path', os.environ['PIPELINE_DAG_FILE'])
+try:
+    with open(dag_path) as f:
+        dag = json.load(f)
+except (OSError, ValueError):
+    for line in PipelineState.format_summary(summary):
+        print('  ' + line)
+    raise SystemExit(0)
 STAGE_ORDER = [(dag['stages'][n]['id'], n) for n in PipelineState.ordered(dag)]
-print('  Outcome:', state.get('pipeline_state', 'unverified'))
+for line in PipelineState.format_summary(summary):
+    print('  ' + line)
 print('  Run:', state.get('run_id', 'legacy/unverified'))
 
 stages = state.get('stages', {})
@@ -91,9 +99,7 @@ print('  ─────────────  ──────────
 
 for sid, sname in STAGE_ORDER:
     sdata = stages.get(sid, {})
-    status = sdata.get('status', 'pending')
-    if status == 'passed' and not PipelineState.is_verified(sdata, dag_path):
-        status = 'unverified'
+    status = summary['stage_statuses'].get(sid, 'pending')
     retries = sdata.get('retry_count', 0)
     updated = sdata.get('updated_at', '-')
     if updated != '-':
@@ -111,8 +117,8 @@ for sid, sname in STAGE_ORDER:
     print(f'  {sid} {sname:12s}  {status_str:14s}  {retry_str:>7s}  {updated}')
 
 # Count summary
-total = len(state.get('scope', []))
-passed = sum(PipelineState.is_verified(stages.get(sid, {}), dag_path) for sid in state.get('scope', []))
+total = summary['stages_total']
+passed = summary['stages_passed']
 failed = sum(1 for sid, _ in STAGE_ORDER if stages.get(sid, {}).get('status') in ('failed', 'dead_letter'))
 running = sum(1 for sid, _ in STAGE_ORDER if stages.get(sid, {}).get('status') in ('running', 'gate_checking'))
 waiting = sum(1 for sid, _ in STAGE_ORDER if stages.get(sid, {}).get('status') == 'human_waiting')

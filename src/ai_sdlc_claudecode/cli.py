@@ -25,7 +25,7 @@ from ai_sdlc_claudecode.config import (
 )
 from ai_sdlc_claudecode.engine import ErrorEngine
 from ai_sdlc_claudecode.runner import PipelineRunner
-from ai_sdlc_claudecode.state import EvolveState
+from ai_sdlc_claudecode.state import EvolveState, PipelineState
 
 
 def _log(msg: str, color: str = NC) -> None:
@@ -153,7 +153,8 @@ class EvolvingAgent:
                 break
 
             if result.all_passed:
-                _log(f"Phase {phase} COMPLETE!", GREEN + BOLD)
+                project_status = (result.project_acceptance or {}).get('status', 'not_evaluated')
+                _log(f"Phase {phase} configured checks complete; project acceptance: {project_status}", GREEN + BOLD)
                 self.state = self.state.complete_phase(phase)
                 self.state.checkpoint()
                 break
@@ -237,14 +238,17 @@ def _cmd_run(args: argparse.Namespace) -> None:
 def _cmd_status(args: argparse.Namespace) -> None:
     pipeline_root = resolve_pipeline_root()
     state_file = pipeline_root / args.feature_id / "ai-sdlc-state.json"
+    pipeline = PipelineState(state_file.with_name('state.json'))
 
-    if not state_file.exists():
+    if not state_file.exists() and not pipeline.path.exists():
         print("No state found. Run `ai-sdlc run` first.")
         return
 
-    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
 
     print(f"\n{BOLD}{CYAN}AI-SDLC Agent Status{NC}")
+    for line in PipelineState.format_summary(pipeline.summary()):
+        print('  ' + line)
     print(f"  Started:    {data.get('start_time', 'N/A')}")
     print(f"  Phase:      {data.get('current_phase', '?')}")
     print(f"  Iteration:  {data.get('current_iteration', 0)}")
@@ -276,13 +280,18 @@ def _cmd_report(args: argparse.Namespace) -> None:
     pipeline_root = resolve_pipeline_root()
     state_file = pipeline_root / args.feature_id / "ai-sdlc-state.json"
     report_path = pipeline_root / args.feature_id / "ai-sdlc-report.md"
+    pipeline = PipelineState(state_file.with_name('state.json'))
 
-    if not state_file.exists():
+    if not state_file.exists() and not pipeline.path.exists():
         print("No state found. Run `ai-sdlc run` first.")
         return
 
-    state = EvolveState.create(state_file)
-    state.generate_report(report_path)
+    if state_file.exists():
+        state = EvolveState.create(state_file)
+        state.generate_report(report_path)
+    else:
+        report_path.write_text('\n'.join(['# AI-SDLC Delivery Report', '',
+                                         *PipelineState.format_summary(pipeline.summary(), markdown=True), '']))
     print(f"Report generated: {report_path}")
 
 

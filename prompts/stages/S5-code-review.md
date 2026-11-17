@@ -2,6 +2,14 @@
 
 Review all code changes for this feature.
 
+Start from the approved project contract and current candidate. Search every equivalent
+rule and call site implicated by a fix, including normal behavior and necessary rejection
+cases. The checks below apply where required by that contract; do not invent endpoints or
+features solely to satisfy a generic checklist. Keep open and fix_submitted findings visible
+until their named checks verify closure. Report source, package, runtime and business evidence
+separately. An author self-check is not an independent review, and a review score cannot
+override a failed required check or establish project acceptance.
+
 ## Changed Files
 {{S3_output.files_changed}}
 {{S3b_output.files_changed}}
@@ -57,4 +65,5 @@ When reporting issues, classify each as:
 - **D-Integration**: Runtime error (AOP, SQL constraint, bean wiring)
 
 ## Output
-Write to: {{output_path}}/review.json
+Return the review JSON with findings, evidence, scope and remaining gaps. The supervisor
+stores the artifact; its acceptance calculation owns the project verdict.

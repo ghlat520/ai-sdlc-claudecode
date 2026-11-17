@@ -7,6 +7,7 @@ which contains the pipeline executor and supporting scripts.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 # Package root: src/ai_sdlc_claudecode/
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -64,4 +65,6 @@ def resolve_project_root() -> Path:
 
 def resolve_pipeline_root() -> Path:
     """Resolve docs/pipeline/ output directory."""
+    if os.environ.get('PIPELINE_ROOT'):
+        return Path(os.environ['PIPELINE_ROOT']).resolve()
     return resolve_project_root() / "docs" / "pipeline"

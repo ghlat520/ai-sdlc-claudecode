@@ -918,7 +918,7 @@
     "release": {
       "id": "S10",
       "name": "Release & Rollout",
-      "description": "Final release checklist, rollback plan, and deployment strategy",
+      "description": "Release decision brief and rollback plan only; project acceptance requires an explicit project_acceptance contract, and deployment requires separate authorization",
       "agents": [
         {
           "type": "DevOps Automator",

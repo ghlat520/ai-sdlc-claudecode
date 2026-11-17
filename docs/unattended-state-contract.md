@@ -40,6 +40,14 @@ Retain state.json and events.jsonl. Stage records include:
 
 Evidence receipts retain command/validator names, exit codes, timestamps and digests. Output logs remain local. A stage PASS proves only its configured checks; business_acceptance remains not_evaluated.
 
+An optional `config.project_acceptance` policy now adds a separate scoped verdict. The
+designated stage runs the project's existing acceptance adapter through `post_commands`.
+Its attempt record binds actual candidate inputs, policy, named cases, known blockers
+and collected report. `PipelineState.summary()` recalculates both execution and project
+acceptance for all reporting paths. No policy means `not_evaluated`; old records are not
+retroactively certified. See [the integration contract](ai-management.md) for the format,
+source exclusions, roles, retry semantics and remaining runtime/human boundaries.
+
 Pipeline outcomes distinguish complete, partial, simulated, human_waiting, paused and failed. Only verified requested stages yield complete. A simulated run is explicitly labelled and contributes no production pass or learning sample.
 
 ## 5. Flow

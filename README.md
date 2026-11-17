@@ -27,6 +27,11 @@ Human gates checkpoint and return exit 3; editable `APPROVED` files are not acce
 
 See [the state contract and five-stage mapping](docs/unattended-state-contract.md) for the evidence boundary, invariants, verification matrix and remaining integration work.
 
+Optional [AI management and project acceptance](docs/ai-management.md) binds a project's
+named checks and blocking findings to its actual candidate inputs. Execution completion
+and project acceptance are reported separately through one live calculation. Existing
+DAGs without this contract keep running with project acceptance `not_evaluated`.
+
 ### Model routing and existing project inputs
 
 Project DAGs can route models to Codex while retaining the existing Claude path for unmapped models:

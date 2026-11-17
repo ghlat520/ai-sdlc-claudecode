@@ -1,6 +1,11 @@
 # S10: Release & Rollout
 
-Prepare the final release for this feature.
+Prepare a release decision brief for this feature. This stage prepares material; it does
+not deploy or authorize a release. Cite the supervisor's current project acceptance status,
+declared scope and candidate. If no contract is configured, report not_evaluated. List
+missing, stale or failed evidence and the next owner/action; never infer product acceptance
+from stage counts, self-reported completion or review scores. A local fix cannot close the
+whole delivery while a required case or known blocking finding remains unresolved.
 
 ## Deployment Plan
 {{S6_output}}
@@ -22,4 +27,5 @@ Prepare the final release for this feature.
 - Stakeholder notifications
 
 ## Output
-Write to: {{output_path}}/release.json
+Return the release JSON, keeping execution completion, project acceptance and human release
+decisions separate. Notifications are drafts. The supervisor stores the artifact.
