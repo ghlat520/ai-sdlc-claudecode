@@ -910,7 +910,7 @@ REVIEW_EOF
                         emit_event "$feature_id" token_usage "$stage_id" "Refinement usage in ${rp_receipt}; USD cost unknown" || true
                     else
                         local rp_tokens=$(( (${#full_review_prompt} + ${#review_output}) / 4 ))
-                        update_cost "$feature_id" "$rp_tokens" "$rp_model" || true
+                        PIPELINE_COST_ID="$rp_receipt" update_cost "$feature_id" "$rp_tokens" "$rp_model" || true
                     fi
                 else
                     echo -e "    ${RED}Review pass ${rp_role}: invalid revision${NC}"
@@ -1218,7 +1218,7 @@ PY_METRICS
 
         # Cost tracking: prefer real usage from claude JSON, fallback to char/4 estimate
         if [[ -n "${parsed_cost:-}" ]]; then
-            update_cost_real "$feature_id" "$parsed_cost" "$parsed_in" "$parsed_out" "$parsed_cr" "$parsed_cc" "$agent_model" || true
+            PIPELINE_COST_ID="$model_receipt" update_cost_real "$feature_id" "$parsed_cost" "$parsed_in" "$parsed_out" "$parsed_cr" "$parsed_cc" "$agent_model" || true
             local total_t=$((${parsed_in:-0} + ${parsed_out:-0} + ${parsed_cr:-0} + ${parsed_cc:-0}))
             emit_event "$feature_id" "cost_update" "$stage_id" "Real: \$${parsed_cost} (${total_t}t, cache_read=${parsed_cr:-0})" "{\"cost_usd\": ${parsed_cost}, \"input\": ${parsed_in:-0}, \"output\": ${parsed_out:-0}, \"cache_read\": ${parsed_cr:-0}, \"cache_creation\": ${parsed_cc:-0}, \"duration\": ${duration}, \"source\": \"claude_json\"}" || true
         elif [[ "${parsed_provider:-}" == codex ]]; then
@@ -1226,7 +1226,7 @@ PY_METRICS
                 "{\"cost_usd\": null, \"input\": ${parsed_in:-0}, \"output\": ${parsed_out:-0}, \"cache_read\": ${parsed_cr:-0}, \"duration\": ${duration}, \"source\": \"codex_json\"}" || true
         else
             local est_tokens=$(( (${#prompt} + ${#claude_output}) / 4 ))
-            update_cost "$feature_id" "$est_tokens" "$agent_model" || true
+            PIPELINE_COST_ID="${model_receipt:-simulation}" update_cost "$feature_id" "$est_tokens" "$agent_model" || true
             emit_event "$feature_id" "cost_update" "$stage_id" "Est: ~${est_tokens}t" "{\"tokens\": ${est_tokens}, \"duration\": ${duration}, \"source\": \"estimated\"}" || true
         fi
 

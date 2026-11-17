@@ -7,13 +7,14 @@ Checkpoints are atomic writes to disk.
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import acceptance
+from . import acceptance, quality
 
 
 @dataclass(frozen=True)
@@ -310,6 +311,7 @@ class PipelineState:
         if not execution_scope or not set(execution_scope) <= set(scope):
             raise ValueError("execution scope must stay within the goal scope")
         run = uuid.uuid4().hex
+        quality_context = quality.tracking_context(dag, dict(metadata, scope=list(scope)))
         with locked_json(self.path) as data:
             owner = data.get("owner_pid")
             if owner:
@@ -337,6 +339,9 @@ class PipelineState:
                         scope=list(scope), execution_scope=execution_scope,
                         pipeline_state="running", updated_at=_now())
             data.update(metadata)
+            data.setdefault('quality_task_id', acceptance.digest(dict(feature_id=feature,
+                            project_dir=str(Path(data.get('project_dir', self.path.parent)).resolve()))))
+            data['quality_context'] = quality_context
             data["invoked_by"] = {"os_uid": os.getuid(), "process_id": metadata.get("owner_pid"),
                                   "mechanism": "local_cli", "identity_assurance": "same_user_process"}
         return run
@@ -349,6 +354,7 @@ class PipelineState:
                 raise ValueError("stale run")
             old = data["stages"].get(stage)
             if old:
+                old['superseded_at_epoch'] = time.time()
                 data.setdefault("history", []).append(old)
             dag = json.loads(Path(data["dag_path"]).read_text())
             config = next(s for s in dag["stages"].values() if s["id"] == stage)
@@ -366,6 +372,7 @@ class PipelineState:
             data["stages"][stage] = dict(
                 contract_version=2, run_id=run, attempt_id=attempt, stage_id=stage,
                 status="running", retry_count=retry, updated_at=_now(),
+                started_at_epoch=time.time(), quality_context=data['quality_context'],
                 dag_sha256=data["dag_sha256"], output_dir=str(output_dir),
                 archive=str(archive), required_checks=checks,
                 verification={"status": "pending", "scope": "configured_stage_checks",
@@ -429,6 +436,8 @@ class PipelineState:
                     self.freeze_function_map(data, definition)
             elif status != "gate_checking":
                 record["verification"]["status"] = "unverified"
+            if status in ('passed', 'failed', 'dead_letter', 'human_waiting', 'simulated') and 'quality_snapshot' not in record:
+                record['quality_snapshot'] = quality.capture_attempt(record, time.time())
             return deepcopy(record)
 
     @staticmethod
@@ -534,6 +543,7 @@ class PipelineState:
             acceptance.collect(binding, command_exit)
             result = acceptance.evaluate(binding, definition, record)
             binding['known_findings'] = result['known_findings']
+            binding['result_at_collection'] = result
             return result
 
     def project_acceptance(self, data=None):
@@ -690,6 +700,9 @@ def _pipeline_cli():
                 old = data["stages"].get(stage, {})
                 if status == "skipped" and old.get("status") == "imported":
                     return
+                if old and old.get('status') not in ('skipped', 'imported', 'pending'):
+                    old['superseded_at_epoch'] = time.time()
+                    data.setdefault('history', []).append(old)
                 data["stages"][stage] = dict(contract_version=2, run_id=run, attempt_id=None,
                                              status=status, verification={"status": "unverified"},
                                              authorization={"decision": "not_evaluated"},
@@ -758,12 +771,30 @@ def _pipeline_cli():
         with locked_json(path) as data:
             if os.environ.get("PIPELINE_RUN_ID") != data.get("run_id"):
                 raise ValueError("stale cost writer")
+            amount = float(usd) if kind == "actual" else tin / 1e6 * {"opus":45, "sonnet":9, "haiku":2.4}.get(model, 9)
+            if kind not in ('actual', 'estimated') or not math.isfinite(amount) or amount < 0:
+                raise ValueError('Invalid cost update')
+            attempt_id = os.environ.get('PIPELINE_ATTEMPT_ID')
+            cost_id = os.environ.get('PIPELINE_COST_ID')
+            record = next((r for r in data['stages'].values() if r.get('attempt_id') == attempt_id), None) if attempt_id else None
+            if attempt_id and (record is None or record['run_id'] != data['run_id']):
+                raise ValueError('stale attempt cost writer')
+            if record is not None and cost_id:
+                entries = record.setdefault('cost_entries', {})
+                entry = dict(kind=kind, model=model, usd=amount, input_tokens=tin, output_tokens=tout,
+                             cache_read_tokens=cr, cache_creation_tokens=cc, source=cost_id)
+                if cost_id in entries:
+                    if entries[cost_id] != entry:
+                        raise ValueError('Conflicting repeated cost entry')
+                    return
+                if 'quality_snapshot' in record:
+                    raise ValueError('Cannot add costs to a finalized attempt')
+                entries[cost_id] = entry
             c = data.setdefault("cost", {})
             for key, value in (("total_tokens", tin+tout+cr+cc), ("input_tokens", tin),
                                ("output_tokens", tout), ("cache_read_input_tokens", cr),
                                ("cache_creation_input_tokens", cc)):
                 c[key] = c.get(key, 0) + value
-            amount = float(usd) if kind == "actual" else tin / 1e6 * {"opus":45, "sonnet":9, "haiku":2.4}.get(model, 9)
             c["estimated_usd"] = round(c.get("estimated_usd", 0) + amount, 6)
             if kind == "actual":
                 c["actual_usd"] = round(c.get("actual_usd", 0) + amount, 6)

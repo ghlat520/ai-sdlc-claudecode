@@ -816,6 +816,204 @@ def test_function_map_scope_rename_cannot_remove_blocker(function_map_case):
     assert 'R1' in after['stages']['S9']['project_acceptance']['known_findings']
 
 
+def test_quality_keeps_first_failure_and_all_attempts(function_map_case):
+    dag, path, env, run, project, driver, source = function_map_case
+    dag['config']['quality_tracking'] = {'sample_kind': 'framework_fixture', 'technology': ['python'],
+        'risk': 'low', 'task_size': 'small', 'observation_window': 'fixture-v1', 'tool_version': 'test-v1'}
+    app = project / 'app/application.py'
+    valid = app.read_text()
+    app.write_text(valid.replace('if key not in items: items.append(key)', 'items.append(key)'))
+    failed, before = run('--stages', 'S1,S9')
+    assert failed.returncode == 1
+    app.write_text(valid)
+    passed, after = run('--stages', 'S1,S9', '--resume')
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    output = project / 'quality-report.json'
+    state = Path(env['PIPELINE_ROOT']) / 'fixture/state.json'
+    command = [sys.executable, '-m', 'ai_sdlc_claudecode.quality', str(state), str(state), '--output', str(output)]
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text())
+    task = report['tasks'][0]
+    assert len(report['tasks']) == 1
+    assert task['attempt_count'] == 3
+    assert task['first_candidate_status'] == 'failed'
+    assert task['current_acceptance'] == 'passed'
+    assert task['repair_attempts'] == 1
+    assert task['cost']['actual_total_usd'] is None
+    assert task['cost']['estimated_usd'] > 0
+    assert report['cohorts'][0]['metrics']['first_independent_pass_rate']['status'] == 'unavailable'
+    original = output.read_bytes()
+    subprocess.run(command, env=env, check=True, capture_output=True)
+    assert output.read_bytes() == original
+    assert all(report['cohorts'][0]['metrics'][name]['status'] == 'unavailable' for name in (
+        'bad_candidate_leak_rate', 'legitimate_candidate_block_rate', 'defect_recurrence'))
+    candidates = [a for a in task['attempts'] if a['candidate_sha256']]
+    evidence = project / 'independent-fixture-evidence.txt'
+    evidence.write_text('Fixture oracle: repeated create must retain one item. This is framework test metadata.')
+    common = {'task_id': task['task_id'], 'reviewer': 'fixture-oracle',
+              'independence_basis': 'Frozen expected values in the framework test; not a real product review',
+              'evidence': {'path': evidence.name, 'sha256': __import__('hashlib').sha256(evidence.read_bytes()).hexdigest()}}
+    observations = []
+    for index, candidate in enumerate(candidates):
+        bound = {**common, **{key: candidate[key] for key in ('attempt_id', 'candidate_sha256', 'policy_sha256')}}
+        observations.extend([
+            {**bound, 'kind': 'oracle', 'classification': 'known_bad' if index == 0 else 'known_good'},
+            {**bound, 'kind': 'independent_review', 'verdict': 'failed' if index == 0 else 'passed'},
+        ])
+    observations.append({**bound, 'kind': 'defect_followup', 'rule_id': 'duplicate-create', 'rule_version': '1',
+                         'applicable': True, 'observed': True, 'recurred': True, 'defect_count': 2})
+    observations.append({**bound, 'kind': 'human_intervention', 'count': 1})
+    annotations = project / 'observations.json'
+    annotations.write_text(json.dumps({'observations': observations + observations}))
+    command += ['--observations', str(annotations)]
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    metrics = json.loads(output.read_text())['cohorts'][0]['metrics']
+    assert metrics['bad_candidate_leak_rate']['value'] == 0
+    assert metrics['bad_candidate_leak_rate']['denominator'] == 1
+    assert metrics['legitimate_candidate_block_rate']['value'] == 0
+    assert metrics['first_independent_pass_rate']['value'] == 0
+    assert metrics['first_independent_pass_rate']['denominator'] == 1
+    assert metrics['defect_recurrence']['by_rule']['duplicate-create@1']['value'] == 1
+    accepted = metrics['rework_and_cost']['accepted_tasks'][0]
+    assert accepted['repair_attempts'] == 1
+    assert accepted['cost']['estimated_usd'] == task['cost']['estimated_usd']
+    assert accepted['human_interventions'] == 1
+    evidence.write_text('changed after review')
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'evidence missing or changed' in result.stderr
+
+
+def test_quality_scope_or_budget_changes_are_not_comparable(function_map_case):
+    dag, path, env, run, project, driver, source = function_map_case
+    first, _ = run('--stages', 'S1,S9')
+    assert first.returncode == 0
+    dag['config']['cost_limit_usd'] = 60
+    second, _ = run('--stages', 'S1,S9', '--resume')
+    assert second.returncode == 0, second.stdout + second.stderr
+    from ai_sdlc_claudecode.quality import build_report
+    report = build_report([Path(env['PIPELINE_ROOT']) / 'fixture/state.json'])
+    assert report['tasks'][0]['comparable'] is False
+    assert report['cohorts'][0]['comparable'] is False
+    assert len(report['tasks'][0]['contexts']) == 2
+
+
+def test_quality_measured_cost_is_distinct_and_replay_is_idempotent(executor_case):
+    dag, path, env, run = executor_case
+    fake = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    content = fake.read_text()
+    start = content.index("    print(json.dumps({'stage_id': stage")
+    fake.write_text(content[:start] + '''    document = {'stage_id': stage, 'status': 'complete', 'summary': 'fixture'}
+    print(json.dumps({'type': 'result', 'result': json.dumps(document), 'model': 'fixture-model-v1',
+                      'total_cost_usd': 0.125, 'usage': {'input_tokens': 100, 'output_tokens': 20}}))
+''')
+    result, data = run('--stages', 'S8')
+    assert result.returncode == 0, result.stdout + result.stderr
+    from ai_sdlc_claudecode.quality import build_report
+    state = Path(env['PIPELINE_ROOT']) / 'fixture/state.json'
+    task = build_report([state])['tasks'][0]
+    assert task['cost']['actual_total_usd'] == 0.125
+    assert task['cost']['estimated_usd'] is None
+    record = data['stages']['S8']
+    entry = next(iter(record['cost_entries']))
+    command = [sys.executable, '-m', 'ai_sdlc_claudecode.state', 'cost', str(state),
+               'actual', 'haiku', '0.125', '100', '20', '0', '0']
+    replay = subprocess.run(command, env={**env, 'PIPELINE_RUN_ID': data['run_id'],
+        'PIPELINE_ATTEMPT_ID': record['attempt_id'], 'PIPELINE_COST_ID': entry}, capture_output=True, text=True)
+    assert replay.returncode == 0, replay.stderr
+    assert json.loads(state.read_text())['cost']['actual_usd'] == 0.125
+    assert build_report([state])['tasks'][0]['cost']['actual_total_usd'] == 0.125
+
+
+def test_quality_waiting_is_not_active_execution(executor_case):
+    dag, path, env, run = executor_case
+    dag['stages']['first']['gate'] = {'type': 'human-required'}
+    result, data = run('--stages', 'S8')
+    assert result.returncode == 3
+    from ai_sdlc_claudecode.quality import build_report
+    task = build_report([Path(env['PIPELINE_ROOT']) / 'fixture/state.json'])['tasks'][0]
+    assert task['attempts'][0]['status'] == 'human_waiting'
+    assert task['active_attempt_seconds'] >= 0
+    assert task['authorization_wait_seconds'] is None
+    assert task['current_acceptance'] == 'not_evaluated'
+
+
+@pytest.mark.parametrize('has_attempt_id', [False, True])
+def test_quality_legacy_failure_cannot_become_first_pass(project_acceptance_case, has_attempt_id):
+    dag, path, env, run, project, driver = project_acceptance_case
+    dag['config']['quality_tracking'] = {'sample_kind': 'framework_fixture', 'technology': ['python'],
+        'risk': 'low', 'task_size': 'small', 'observation_window': 'fixture-v1', 'tool_version': 'test-v1'}
+    first, data = run('--stages', 'S8,S9')
+    assert first.returncode == 0
+    legacy = {'stage_id': 'S9', 'status': 'failed'}
+    if has_attempt_id:
+        legacy['attempt_id'] = 'legacy-attempt'
+    data.setdefault('history', []).insert(0, legacy)
+    state = Path(env['PIPELINE_ROOT']) / 'fixture/state.json'
+    state.write_text(json.dumps(data))
+    from ai_sdlc_claudecode.quality import build_report
+    report = build_report([state])
+    task = report['tasks'][0]
+    assert task['attempt_count'] == 3
+    assert task['incomplete_attempts'] == 1
+    assert task['first_candidate_status'] == 'unavailable'
+    assert task['first_candidate_attempt_id'] is None
+    assert task['repair_attempts'] == (1 if has_attempt_id else None)
+    assert task['comparable'] is False
+    assert report['cohorts'][0]['metrics']['first_independent_pass_rate']['status'] == 'unavailable'
+
+
+def test_quality_skip_cannot_erase_first_failure(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    valid = driver.read_text()
+    driver.write_text(valid.replace("'create': 'passed'", "'create': 'failed'"))
+    first, before = run('--stages', 'S8,S9')
+    assert first.returncode == 1
+    original_attempt = before['stages']['S9']['attempt_id']
+    skipped, _ = run('--stages', 'S8,S9', '--resume', '--skip-stage', 'S9')
+    assert skipped.returncode == 4
+    driver.write_text(valid)
+    passed, _ = run('--stages', 'S8,S9', '--resume')
+    assert passed.returncode == 0
+    from ai_sdlc_claudecode.quality import build_report
+    task = build_report([Path(env['PIPELINE_ROOT']) / 'fixture/state.json'])['tasks'][0]
+    assert task['first_candidate_attempt_id'] == original_attempt
+    assert task['first_candidate_status'] == 'failed'
+    assert task['attempt_count'] == 3
+    assert task['repair_attempts'] == 1
+
+
+def test_quality_independent_acceptance_cannot_cross_contract(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    dag['config']['project_acceptance']['required_checks'] = {'business': ['create']}
+    first, _ = run('--stages', 'S8,S9')
+    assert first.returncode == 0
+    from ai_sdlc_claudecode.quality import build_report
+    state = Path(env['PIPELINE_ROOT']) / 'fixture/state.json'
+    task = build_report([state])['tasks'][0]
+    candidate = next(a for a in task['attempts'] if a['candidate_sha256'])
+    evidence = project / 'review.txt'
+    evidence.write_text('Independent fixture verdict for the create-only contract')
+    observations = project / 'observations.json'
+    observations.write_text(json.dumps({'observations': [{
+        'kind': 'independent_review', 'verdict': 'passed', 'task_id': task['task_id'],
+        **{key: candidate[key] for key in ('attempt_id', 'candidate_sha256', 'policy_sha256')},
+        'reviewer': 'fixture-reviewer', 'independence_basis': 'Framework fixture with frozen expectations',
+        'evidence': {'path': evidence.name, 'sha256': __import__('hashlib').sha256(evidence.read_bytes()).hexdigest()},
+    }]}))
+    assert len(build_report([state], observations)['cohorts'][0]['metrics']['rework_and_cost']['accepted_tasks']) == 1
+    dag['config']['project_acceptance']['required_checks']['business'].append('replay')
+    second, _ = run('--stages', 'S8,S9', '--resume')
+    assert second.returncode == 0
+    report = build_report([state], observations)
+    assert report['tasks'][0]['current_candidate_sha256'] == candidate['candidate_sha256']
+    assert report['tasks'][0]['current_policy_sha256'] != candidate['policy_sha256']
+    assert report['cohorts'][0]['metrics']['rework_and_cost']['accepted_tasks'] == []
+    assert len(report['cohorts'][0]['metrics']['rework_and_cost']['incomplete_tasks']) == 1
+
+
 def test_project_acceptance_binds_actual_checks_to_current_candidate(project_acceptance_case):
     dag, path, env, run, project, driver = project_acceptance_case
     result, data = run('--stages', 'S8,S9')
