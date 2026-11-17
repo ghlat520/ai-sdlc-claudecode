@@ -181,6 +181,26 @@ def test_codex_failures_never_become_success(agent_case, mode):
     assert record["total_cost_usd"] is None
 
 
+def test_completed_turn_with_cli_shutdown_timeout_still_fails_closed(agent_case):
+    """A final model result must not conceal a CLI that missed its exit deadline."""
+    run, executable, _, receipt, _ = agent_case
+    executable.write_text(
+        "#!/bin/sh\n/bin/cat >/dev/null\n"
+        "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"cleanup-fixture\"}' "
+        "'{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"completed result\"}}' "
+        "'{\"type\":\"turn.completed\"}'\n/bin/sleep 30\n"
+    )
+    executable.chmod(0o755)
+    # Allow the fixture to emit its final event before exercising stuck cleanup.
+    result = run("gpt-6.1-sol", "--timeout", "2")
+    record = json.loads(receipt.read_text())
+    assert result.returncode == 124
+    assert record["completed"] is True
+    assert record["status"] == "failed"
+    assert json.loads(result.stdout)["is_error"] is True
+    assert 'completed result' in Path(record["raw_output_path"]).read_text()
+
+
 @pytest.mark.parametrize("ending,exit_code,expected_success", [
     ("completed", 0, True),
     ("turn_failed", 0, False),
