@@ -12,13 +12,14 @@
 # Exit codes:
 #   0 = PASS (coverage >= threshold)
 #   1 = FAIL (coverage < threshold)
-#   2 = WARN (could not determine coverage, non-blocking)
+#   2 = WARN (could not determine coverage)
+#   Coverage command failures retain their non-zero exit code.
 # =============================================================================
 set -euo pipefail
 
 # --- Path setup ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAG_FILE="${SCRIPT_DIR}/pipeline-dag.json"
+DAG_FILE="${PIPELINE_DAG_FILE:-${SCRIPT_DIR}/pipeline-dag.json}"
 
 # --- Constants ---
 PREFIX="[TDD-GATE]"
@@ -42,26 +43,24 @@ if [[ ! -f "$DAG_FILE" ]]; then
 fi
 
 # --- Look up coverage command from DAG config ---
-lookup_coverage_command() {
+lookup_coverage_config() {
     local stack="$1"
-    local cmd
-    cmd=$(python3 -c "
+    local field="${2:-coverage}"
+    python3 - "$DAG_FILE" "$stack" "$field" <<'PY_COVERAGE'
 import json, sys
-with open('${DAG_FILE}') as f:
+with open(sys.argv[1]) as f:
     dag = json.load(f)
 commands = dag.get('config', {}).get('tech_stack_commands', {})
-stack_cfg = commands.get('${stack}')
+stack_cfg = commands.get(sys.argv[2])
 if not stack_cfg:
     print('ERROR:unknown_stack', end='')
     sys.exit(0)
-cov = stack_cfg.get('coverage', '')
-if not cov:
+value = stack_cfg.get(sys.argv[3], '')
+if sys.argv[3] == 'coverage' and not value:
     print('ERROR:no_coverage_cmd', end='')
     sys.exit(0)
-print(cov, end='')
-" 2>/dev/null)
-
-    echo "$cmd"
+print(value, end='')
+PY_COVERAGE
 }
 
 # --- Parse coverage from Java/Maven (jacoco) ---
@@ -226,7 +225,7 @@ print(json.dumps({
 echo "${PREFIX} Tech stack: ${TECH_STACK}"
 
 # Look up coverage command
-COVERAGE_CMD=$(lookup_coverage_command "$TECH_STACK")
+COVERAGE_CMD=$(lookup_coverage_config "$TECH_STACK")
 
 if [[ "$COVERAGE_CMD" == "ERROR:unknown_stack" ]]; then
     echo "${PREFIX} ERROR: Unknown tech stack '${TECH_STACK}'"
@@ -239,6 +238,12 @@ if [[ "$COVERAGE_CMD" == "ERROR:no_coverage_cmd" ]]; then
     exit 2
 fi
 
+COVERAGE_WORKDIR=$(lookup_coverage_config "$TECH_STACK" coverage_workdir)
+cd "${PROJECT_CODE_DIR:-$PWD}"
+if [[ -n "$COVERAGE_WORKDIR" ]]; then
+    cd "$COVERAGE_WORKDIR"
+fi
+echo "${PREFIX} Working directory: $PWD"
 echo "${PREFIX} Running coverage: ${COVERAGE_CMD}"
 
 # Run the coverage command and capture output
@@ -247,9 +252,11 @@ COV_EXIT=0
 COV_OUTPUT=$(eval "$COVERAGE_CMD" 2>&1) || COV_EXIT=$?
 
 if [[ $COV_EXIT -ne 0 ]]; then
-    echo "${PREFIX} WARN: Coverage command exited with code ${COV_EXIT}"
+    echo "${PREFIX} ERROR: Coverage command exited with code ${COV_EXIT}"
     echo "${PREFIX} Output (last 20 lines):"
     echo "$COV_OUTPUT" | tail -20
+    emit_json_result "0" "$THRESHOLD" "fail" "$TECH_STACK"
+    exit "$COV_EXIT"
 fi
 
 # Parse coverage based on tech stack

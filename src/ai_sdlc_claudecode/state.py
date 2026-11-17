@@ -301,6 +301,9 @@ class PipelineState:
         ids = {s["id"] for s in dag["stages"].values()}
         if not scope or not set(scope) <= ids:
             raise ValueError("empty or unknown execution scope")
+        execution_scope = list(metadata.pop("execution_scope", scope))
+        if not execution_scope or not set(execution_scope) <= set(scope):
+            raise ValueError("execution scope must stay within the goal scope")
         run = uuid.uuid4().hex
         with locked_json(self.path) as data:
             owner = data.get("owner_pid")
@@ -315,7 +318,8 @@ class PipelineState:
             data.setdefault("cost", {})
             data.update(feature_id=feature, contract_version=2, run_id=run,
                         dag_path=str(dag_path), dag_sha256=_sha(dag_path),
-                        scope=list(scope), pipeline_state="running", updated_at=_now())
+                        scope=list(scope), execution_scope=execution_scope,
+                        pipeline_state="running", updated_at=_now())
             data.update(metadata)
             data["invoked_by"] = {"os_uid": os.getuid(), "process_id": metadata.get("owner_pid"),
                                   "mechanism": "local_cli", "identity_assurance": "same_user_process"}
@@ -341,6 +345,8 @@ class PipelineState:
                 (archive / "previous-output.json").write_bytes(previous_output.read_bytes())
             for name in ("output.json", "evidence.json", f"ai-review-{stage}.json"):
                 (output_dir / name).unlink(missing_ok=True)
+            if stage == "S2":
+                (output_dir / "contracts.json").unlink(missing_ok=True)
             data["stages"][stage] = dict(
                 contract_version=2, run_id=run, attempt_id=attempt, stage_id=stage,
                 status="running", retry_count=retry, updated_at=_now(),
@@ -413,7 +419,7 @@ class PipelineState:
             checks.add("post_commands")
         if config.get("review_passes"):
             checks.add("refinement")
-        if config["id"] in ("S3", "S3b"):
+        if config["id"] in ("S2", "S3", "S3b"):
             checks.add("contracts")
         if config["id"] in ("S4", "S4b", "S4c"):
             checks.add("tdd")
@@ -432,6 +438,10 @@ class PipelineState:
             result = record["result"]
             if result["sha256"] != _sha(result["path"]):
                 return False
+            if record["stage_id"] == "S2":
+                output = json.loads(Path(result["path"]).read_text())
+                if output["contracts_sha256"] != _sha(Path(result["path"]).with_name("contracts.json")):
+                    return False
             dag = json.loads(Path(dag_path).read_text())
             config = next(s for s in dag["stages"].values() if s["id"] == record["stage_id"])
             if record["authorization"]["type"] != config["gate"]["type"]:
@@ -475,17 +485,24 @@ def _pipeline_cli():
     if command == "start":
         feature, dag_path, selected, start_from, simulation, project, owner, description, cost, retries = args
         dag = json.loads(Path(dag_path).read_text())
-        names = state.ordered(dag)
-        if start_from:
-            names = names[next(i for i, n in enumerate(names)
-                               if start_from in (n, dag["stages"][n]["id"])):]
+        ordered = state.ordered(dag)
+        names = ordered
         if selected:
             selectors = set(selected.split(","))
             known = {v for n in names for v in (n, dag["stages"][n]["id"])}
             if not selectors <= known:
                 raise ValueError("unknown selected stages")
             names = [n for n in names if selectors & {n, dag["stages"][n]["id"]}]
+        execution_names = names
+        if start_from:
+            offset = next(i for i, n in enumerate(ordered)
+                          if start_from in (n, dag["stages"][n]["id"]))
+            remaining = set(ordered[offset:])
+            execution_names = [n for n in names if n in remaining]
+            if not selected:
+                names = execution_names
         print(state.start_run(feature, dag_path, [dag["stages"][n]["id"] for n in names],
+                              execution_scope=[dag["stages"][n]["id"] for n in execution_names],
                               simulation=simulation == "true", project_dir=project, owner_pid=int(owner),
                               feature_description=description,
                               config={"cost_limit_usd":float(cost), "max_retries":int(retries)}))
@@ -558,7 +575,10 @@ def _pipeline_cli():
                 print("unverified prerequisite: " + name, file=sys.stderr)
                 sys.exit(1)
     elif command == "selected":
-        sys.exit(0 if args[0] in state.read().get("scope", []) else 1)
+        data = state.read()
+        scope = data.get("scope", [])
+        execution_scope = data.get("execution_scope", scope)
+        sys.exit(0 if args[0] in scope and args[0] in execution_scope else 1)
     elif command == "pipeline":
         with locked_json(path) as data:
             if os.environ.get("PIPELINE_RUN_ID") != data.get("run_id"):

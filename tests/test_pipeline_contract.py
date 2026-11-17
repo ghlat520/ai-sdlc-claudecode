@@ -167,8 +167,11 @@ else:
     return dag, dag_path, env, run
 
 
-def test_code_stage_can_write_source_and_returns_metadata(executor_case):
+@pytest.mark.parametrize("template_has_description", [False, True])
+def test_code_stage_can_write_source_and_returns_metadata(executor_case, template_has_description):
     dag, path, env, run = executor_case
+    if template_has_description:
+        dag["stages"]["first"]["agents"][0]["prompt_template"] += "\n{{feature_description}}"
     dag['stages']['first']['writes_code'] = True
     fake_cli = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
     fake_cli.write_text(fake_cli.read_text().replace(
@@ -181,6 +184,7 @@ def test_code_stage_can_write_source_and_returns_metadata(executor_case):
     assert 'Write implementation and test source files' in prompt
     assert 'Do NOT attempt to write files.' not in prompt
     assert 'metadata JSON' in prompt
+    assert prompt.count('local only') == 1
 
 
 def test_imported_architecture_materializes_configured_contracts(executor_case, tmp_path):
@@ -206,6 +210,162 @@ def test_imported_architecture_materializes_configured_contracts(executor_case, 
     assert 'contracts.json' in output['artifacts']
     assert output['contracts_sha256']
     assert data['stages']['S2']['status'] == 'imported'
+
+
+@pytest.fixture
+def generated_architecture(executor_case, tmp_path):
+    dag, path, env, run = executor_case
+    dag['stages'] = {'architecture': {
+        **dag['stages']['first'], 'id': 'S2',
+        'output_schema': str(ROOT / 'schemas/architecture-output.json'),
+        'agents': [{'type': 'fixture', 'model': 'haiku', 'prompt_template': 'FAKE_STAGE:S2'}],
+    }, 'second': {**dag['stages']['second'], 'dependencies': ['architecture']}}
+    dag['execution_order'] = [{'stage': name, 'mode': 'sequential'} for name in dag['stages']]
+    document = {
+        'stage_id': 'S2', 'feature_id': 'fixture', 'timestamp': '2026-11-11T00:00:00Z',
+        'status': 'complete', 'summary': 'Generated architecture',
+        'architecture': {'affected_modules': [{'module_name': 'backend', 'change_type': 'new',
+                                              'description': 'Application backend'}],
+                         'api_contracts': [], 'data_model': {'tables': []},
+                         'sequence_flows': [{'name': 'health', 'steps': []}]},
+        'contracts': {'services': [{'name': 'backend', 'responsibility': 'Application backend',
+                                    'language': 'java', 'port': 8080}],
+                      'api_endpoints': [], 'cross_service_messages': [], 'encryption_pairs': [],
+                      'shared_models': [], 'external_refs': {'ai_models': [], 'npm_packages_forbidden': []}},
+    }
+    source = tmp_path / 'architecture.json'
+    source.write_text(json.dumps(document))
+    env['FAKE_ARCHITECTURE'] = str(source)
+    fake = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    fake.write_text(fake.read_text().replace(
+        "if 'FAKE_STAGE:' not in prompt:",
+        "if '## Primary Agent Output (to review and revise)' in prompt:\n"
+        "    print(open(os.environ['FAKE_REFINED_ARCHITECTURE']).read())\n    sys.exit(0)\n"
+        "if 'FAKE_STAGE:' not in prompt:"
+    ).replace(
+        "if mode == 'empty':",
+        "if stage == 'S2':\n"
+        "    open(os.environ['FAKE_ARCHITECTURE'] + '.prompt', 'w').write(prompt)\n"
+        "    print(open(os.environ['FAKE_ARCHITECTURE']).read())\n    sys.exit(0)\nif mode == 'empty':"))
+    return dag, path, env, run, document, source
+
+
+@pytest.mark.parametrize('refined', [False, True])
+def test_generated_architecture_hands_off_validated_bound_contracts(generated_architecture, refined):
+    """The normal S2 path must produce the contract consumed by later stages."""
+    import hashlib
+
+    dag, path, env, run, document, source = generated_architecture
+    if refined:
+        dag['stages']['architecture']['review_passes'] = [{'role': 'contracts', 'model': 'haiku'}]
+        document['contracts']['services'][0]['port'] = 8090
+        revision = source.with_name('refined-architecture.json')
+        revision.write_text(json.dumps(document))
+        env['FAKE_REFINED_ARCHITECTURE'] = str(revision)
+
+    result, data = run('--stages', 'S2,S9')
+    assert result.returncode == 0, result.stdout + result.stderr
+    output_dir = Path(env['PIPELINE_ROOT']) / 'fixture' / 'S2-architecture'
+    contracts_path = output_dir / 'contracts.json'
+    assert contracts_path.exists(), 'Generated S2 passed without its downstream contract artifact'
+    contracts = json.loads(contracts_path.read_text())
+    assert contracts['contracts'] == document['contracts']
+    output = json.loads((output_dir / 'output.json').read_text())
+    assert output['contracts_sha256'] == hashlib.sha256(contracts_path.read_bytes()).hexdigest()
+    assert 'contracts.json' in output['artifacts']
+    assert PipelineState.is_verified(data['stages']['S2'], path)
+    receipts = data['stages']['S2']['verification']['evidence']
+    assert {r['check'] for r in receipts} >= {'contracts', 'schema', 'post_commands', 'gate'}
+    assert all(r['artifact_sha256'] == hashlib.sha256((output_dir / 'output.json').read_bytes()).hexdigest()
+               for r in receipts)
+    if refined:
+        assert 'refinement' in {r['check'] for r in receipts}
+    prompt = Path(str(source) + '.prompt').read_text()
+    assert 'S2 Cross-Service Contracts Output' in prompt
+    assert data['stages']['S9']['status'] == 'passed'
+    contracts_path.write_text('{}')
+    assert not PipelineState.is_verified(data['stages']['S2'], path)
+
+
+@pytest.mark.parametrize('case', ['missing', 'invalid', 'stale', 'refined_missing'])
+def test_generated_architecture_rejects_unusable_contracts(generated_architecture, case):
+    dag, path, env, run, document, source = generated_architecture
+    # Imported contracts are only an input to the explicitly imported-plan path.
+    dag['config']['imported_contracts'] = document['contracts']
+    output_dir = Path(env['PIPELINE_ROOT']) / 'fixture' / 'S2-architecture'
+    if case == 'stale':
+        output_dir.mkdir(parents=True)
+        (output_dir / 'contracts.json').write_text(json.dumps(document))
+    if case == 'invalid':
+        document['contracts'] = {'services': []}
+    else:
+        del document['contracts']
+    if case == 'refined_missing':
+        dag['stages']['architecture']['review_passes'] = [{'role': 'contracts', 'model': 'haiku'}]
+        source = source.with_name('refined-architecture.json')
+        env['FAKE_REFINED_ARCHITECTURE'] = str(source)
+    source.write_text(json.dumps(document))
+
+    result, data = run('--stages', 'S2,S9')
+    assert result.returncode != 0, result.stdout + result.stderr
+    record = data['stages']['S2']
+    assert record['status'] == 'dead_letter'
+    assert not PipelineState.is_verified(record, path)
+    assert any(r['check'] == 'contracts' and r['exit_code'] != 0
+               for r in record['verification']['evidence'])
+    assert Path(env['FAKE_CALLS']).read_text().splitlines() == ['S2']
+    assert 'S9' not in data['stages']
+    assert not (output_dir / 'contracts.json').exists()
+
+
+def test_generated_architecture_contracts_are_enforced_downstream(generated_architecture, tmp_path):
+    dag, path, env, run, document, source = generated_architecture
+    document['contracts']['external_refs']['npm_packages_forbidden'] = ['forbidden-fixture-package']
+    source.write_text(json.dumps(document))
+    dag['stages']['second'].update(id='S3', agents=[{
+        'type': 'fixture', 'model': 'haiku', 'prompt_template': 'FAKE_STAGE:S3',
+    }])
+    backend = tmp_path / 'backend'
+    backend.mkdir()
+    (backend / 'package.json').write_text(json.dumps({'dependencies': {'forbidden-fixture-package': '1.0'}}))
+    fake = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    fake.write_text(fake.read_text().replace(
+        "'status': 'complete', 'summary': 'fixture'",
+        "'status': 'complete', 'summary': 'fixture', 'implementation': {'compile_result': {'success': True}}"))
+
+    result, data = run('--stages', 'S2,S3')
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert PipelineState.is_verified(data['stages']['S2'], path)
+    assert data['stages']['S3']['status'] == 'dead_letter'
+    violations = json.loads((Path(env['PIPELINE_ROOT']) / 'fixture/S3-second/contract_violations.json').read_text())
+    assert any(v['check'] == 'forbidden_npm_package' for v in violations['violations'])
+
+
+def test_executor_coverage_check_uses_project_dag_and_workdir(executor_case, tmp_path):
+    dag, path, env, run = executor_case
+    dag['stages']['first'].update(id='S4b', agents=[{
+        'type': 'fixture', 'model': 'haiku', 'prompt_template': 'FAKE_STAGE:S4b',
+    }])
+    dag['config'].update(tech_stack='java-maven', tech_stack_commands={'java-maven': {
+        'coverage_workdir': 'backend',
+        'coverage': "test -f pom.xml && mkdir -p target/site/jacoco && "
+                    "printf 'INSTRUCTION_MISSED,INSTRUCTION_COVERED\\n10,90\\n' > target/site/jacoco/jacoco.csv",
+    }})
+    backend = tmp_path / 'backend'
+    backend.mkdir()
+    (backend / 'pom.xml').write_text('<project/>')
+    fake = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    fake.write_text(fake.read_text().replace(
+        "'status': 'complete', 'summary': 'fixture'",
+        "'status': 'complete', 'summary': 'fixture', 'testing': {'test_results': {'failed': 0}}"))
+
+    result, data = run('--stages', 'S4b')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert PipelineState.is_verified(data['stages']['S4b'], path)
+    log = (Path(env['PIPELINE_ROOT']) / 'fixture/S4b-first/tdd.log').read_text()
+    assert f'Working directory: {backend}' in log
+    assert 'Coverage: 90.0%' in log
+    assert not (tmp_path / 'target').exists()
 
 
 @pytest.mark.parametrize('group_mode', ['sequential', 'parallel'])
@@ -371,6 +531,58 @@ def test_live_feature_owner_rejects_concurrent_start(contract):
     state.start_run('feature', dag, ['S1'], owner_pid=os.getpid())
     with pytest.raises(ValueError, match='live execution owner'):
         state.start_run('feature', dag, ['S1'], owner_pid=os.getpid())
+
+
+def test_explicit_goal_scope_survives_start_from_subset(executor_case):
+    dag, path, env, run = executor_case
+    result, original = run('--stages', 'S8,S9')
+    assert result.returncode == 0, result.stdout + result.stderr
+    prefix = original['stages']['S8']
+    previous_attempt = original['stages']['S9']['attempt_id']
+    result, data = run('--stages', 'S8,S9', '--start-from', 'S9')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert data['scope'] == ['S8', 'S9'], 'The authoritative goal must not shrink to the rerun subset'
+    assert data['execution_scope'] == ['S9']
+    assert data['stages']['S8'] == prefix, 'Verified prefix evidence must remain unchanged'
+    assert data['stages']['S9']['attempt_id'] != previous_attempt
+    assert Path(env['FAKE_CALLS']).read_text().splitlines() == ['S8', 'S9', 'S9']
+    result, data = run('--resume')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert data['execution_scope'] == ['S8', 'S9']
+    assert Path(env['FAKE_CALLS']).read_text().splitlines() == ['S8', 'S9', 'S9']
+
+
+def test_missing_prefix_keeps_full_goal_partial_after_subset_passes(executor_case):
+    dag, path, env, run = executor_case
+    result, data = run('--stages', 'S8,S9', '--start-from', 'S9')
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert data['scope'] == ['S8', 'S9']
+    assert data['execution_scope'] == ['S9']
+    assert data['pipeline_state'] == 'partial'
+    assert PipelineState.is_verified(data['stages']['S9'], path)
+    assert not PipelineState.is_verified(data['stages'].get('S8', {}), path)
+    assert Path(env['FAKE_CALLS']).read_text().splitlines() == ['S9']
+
+
+def test_execution_scope_cannot_escape_goal_scope(contract):
+    state, run, dag, output_dir = contract
+    before = state.path.read_bytes()
+    with pytest.raises(ValueError, match='execution scope'):
+        state.start_run('feature', dag, ['S1'], execution_scope=['OTHER'])
+    assert state.path.read_bytes() == before
+
+
+def test_resume_from_suffix_preserves_unfinished_goal(executor_case):
+    dag, path, env, run = executor_case
+    result, data = run('--stages', 'S8,S9', '--start-from', 'S9')
+    assert result.returncode == 4, result.stdout + result.stderr
+    result, data = run('--resume', '--start-from', 'S9')
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert data['scope'] == ['S8', 'S9']
+    assert data['execution_scope'] == ['S9']
+    assert data['pipeline_state'] == 'partial'
+    assert 'S8' not in data['stages']
+    assert Path(env['FAKE_CALLS']).read_text().splitlines() == ['S9']
 
 
 def test_concurrent_supervisor_cost_writers_preserve_stage_records(contract):

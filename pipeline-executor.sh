@@ -627,6 +627,13 @@ if os.path.exists(methods_map_path):
 
 prompt += '\n\nCRITICAL: Your FINAL output MUST contain a valid JSON object conforming to this schema:\n'
 prompt += json.dumps(schema, indent=2)
+if stage_id == 'S2':
+    with open(os.path.join(schemas_base, 'schemas/contracts-output.json')) as f:
+        contracts_schema = json.load(f)
+    prompt += '\n\nInclude the top-level contracts payload in that SAME final JSON. '
+    prompt += 'It must also satisfy this contracts schema. The supervisor will validate and '
+    prompt += 'materialize contracts.json from your final JSON after refinement; do not write that file.\n'
+    prompt += json.dumps(contracts_schema, indent=2)
 if stage.get('writes_code', stage_id in ('S3', 'S3b')):
     prompt += '\n\nWrite implementation and test source files in the project directory within the assigned scope. '
     prompt += 'Return the stage metadata JSON in your final response; the supervisor writes output.json. '
@@ -645,6 +652,9 @@ if shared_ctx_path and os.path.exists(shared_ctx_path):
             prompt += '\n\n## Other Agent Progress\n' + memory_summary + '\n'
     except Exception:
         pass
+
+if '{{feature_description}}' not in prompt_template:
+    prompt += '\n\n## Current user request\n' + feat_desc + '\n'
 
 print(prompt)
 PYEOF
@@ -703,7 +713,8 @@ verify_stage() {
     fi
     if [[ "$stage_id" == S4 || "$stage_id" == S4b || "$stage_id" == S4c ]]; then
         code=0
-        bash "${SCRIPT_DIR}/lib/tdd-gate.sh" "$feature_id" "${PIPELINE_TECH_STACK:-node-typescript}" 80 \
+        PROJECT_CODE_DIR="${PROJECT_CODE_DIR:-$PROJECT_ROOT}" PIPELINE_DAG_FILE="$DAG_FILE" \
+            bash "${SCRIPT_DIR}/lib/tdd-gate.sh" "$feature_id" "${PIPELINE_TECH_STACK:-node-typescript}" 80 \
             > "${output_dir}/tdd.log" 2>&1 || code=$?
         collect_evidence "$feature_id" "$stage_id" tdd "$code" "${output_dir}/tdd.log" || return 1
         [[ $code -eq 0 ]] || return 1
@@ -1210,7 +1221,8 @@ except Exception:
         # Try to extract JSON output from Claude's response
         # Check if output file was created, or try to extract from response
         local output_json="${output_dir}/output.json"
-        if [[ ! -f "$output_json" ]]; then
+        if [[ "$stage_id" == S2 || ! -f "$output_json" ]]; then
+            [[ "$stage_id" != S2 ]] || rm -f "$output_json"
             echo "$claude_output" | python3 -m ai_sdlc_claudecode extract-json "$output_json" 2>/dev/null || {
                 echo -e "  ${YELLOW}Warning: Could not extract structured output${NC}"
                 # Save raw output for debugging
@@ -1226,6 +1238,29 @@ except Exception:
         # Refinement belongs to generation; only verify_stage accepts the final artifact.
         local refinement_exit=0
         run_review_passes "$stage_name" "$feature_id" "$output_dir" "$stage_id" > "${output_dir}/refinement.log" 2>&1 || refinement_exit=$?
+        local contracts_exit=0
+        if [[ "$stage_id" == S2 && $refinement_exit -eq 0 ]]; then
+            # Finalize both artifacts before collecting any output-bound receipt.
+            python3 - "$output_json" "${SCRIPT_DIR}/schemas/contracts-output.json" > "${output_dir}/contracts.log" 2>&1 <<'PY_CONTRACTS' || contracts_exit=$?
+import hashlib, json, sys
+from pathlib import Path
+from jsonschema import Draft202012Validator
+
+output_path, schema_path = map(Path, sys.argv[1:])
+output = json.loads(output_path.read_text())
+document = {key: output[key] for key in ('stage_id', 'feature_id', 'timestamp', 'contracts')}
+Draft202012Validator(json.loads(schema_path.read_text())).validate(document)
+contract_path = output_path.with_name('contracts.json')
+contract_path.write_text(json.dumps(document, indent=2, ensure_ascii=False))
+artifacts = output.setdefault('artifacts', [])
+if 'contracts.json' not in artifacts:
+    artifacts.append('contracts.json')
+output['contracts_sha256'] = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+output_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
+print('Final S2 contracts validated and materialized')
+PY_CONTRACTS
+            collect_evidence "$feature_id" "$stage_id" contracts "$contracts_exit" "${output_dir}/contracts.log" || return 1
+        fi
         if [[ $(dag_get "$stage_name" review_pass_count) -gt 0 ]]; then
             collect_evidence "$feature_id" "$stage_id" refinement "$refinement_exit" "${output_dir}/refinement.log" || return 1
         fi
@@ -1236,8 +1271,10 @@ except Exception:
             retry_count=$((retry_count + 1))
             continue
         fi
-        local check_exit=0
-        verify_stage "$stage_name" "$feature_id" "$stage_id" "$output_dir" "$gate_type" || check_exit=$?
+        local check_exit="$contracts_exit"
+        if [[ $check_exit -eq 0 ]]; then
+            verify_stage "$stage_name" "$feature_id" "$stage_id" "$output_dir" "$gate_type" || check_exit=$?
+        fi
         if [[ $check_exit -eq 3 && "$gate_type" == human-required ]]; then
             set_stage_state "$feature_id" "$stage_id" human_waiting "$retry_count" || return 1
             set_pipeline_state "$feature_id" human_waiting "Approval required: ${stage_id}" || return 1
@@ -1381,7 +1418,7 @@ main() {
     fi
 
     # Resume retains the originally selected scope; each invocation still has a fresh run ID.
-    if $auto_resume && [[ -z "$specific_stages" && -z "$start_from" && -f "${PIPELINE_ROOT}/${feature_id}/state.json" ]]; then
+    if $auto_resume && [[ -z "$specific_stages" && -f "${PIPELINE_ROOT}/${feature_id}/state.json" ]]; then
         specific_stages=$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1])).get("scope", [])))' "${PIPELINE_ROOT}/${feature_id}/state.json")
     fi
 
