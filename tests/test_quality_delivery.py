@@ -341,3 +341,135 @@ def test_failure_concurrency_and_retry_verify_sqlite(pilot_project):
     assert set(report['checks']) == {'unauthorized','invalid','create_replay','conflict','concurrent','response_lost_retry','timeout_retry','sequence','persistence'}
     assert all(status == 'passed' for status in report['checks'].values())
     assert len(report['stored_rows']) == 9
+
+
+@pytest.fixture
+def browser_project(pilot_project):
+    project = pilot_project
+    front = project / 'frontend'; front.mkdir()
+    (project / 'node_modules').symlink_to(ROOT / 'node_modules', target_is_directory=True)
+    (front / 'index.html').write_text('''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><title>Quality reference</title><main><h1>Reference notebook</h1>
+<button id="login">Sign in</button><button id="save" disabled>Save notebook</button>
+<p role="status" id="status">Signed out</p><p id="count">0 stored</p></main><script src="/client.js"></script></html>''')
+    (front / 'client.ts').write_text('''let signedIn = false;
+const statusNode = document.getElementById('status')!;
+const save = document.getElementById('save') as HTMLButtonElement;
+const key = sessionStorage.getItem('request') || crypto.randomUUID(); sessionStorage.setItem('request',key);
+async function refresh() {
+  const response = await fetch('/items'); if (!response.ok) return;
+  const value = await response.json(); document.getElementById('count')!.textContent = value.items.length + ' stored';
+}
+document.getElementById('login')!.onclick = async () => {
+  const response = await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  if (response.ok) { signedIn = true; save.disabled = false; statusNode.textContent = 'Signed in'; await refresh(); }
+};
+save.onclick = async () => {
+  if (!signedIn) return; save.disabled = true; statusNode.textContent = 'Saving';
+  try {
+    const response = await fetch('/items',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({request_id:key,label:'Notebook',quantity:1})});
+    if (!response.ok) throw new Error('save failed');
+    statusNode.textContent = 'Saved'; await refresh();
+  } catch { statusNode.textContent = 'Save failed; retry'; }
+  finally { save.disabled = false; }
+};
+''')
+    (project / 'browser.cjs').write_text('''const {chromium} = require('playwright-core');
+const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+const assert = require('node:assert/strict');
+(async () => {
+ const root = process.env.BROWSER_EVIDENCE; fs.mkdirSync(root,{recursive:true});
+ const target = process.env.BROWSER_TARGET;
+ const viewport = JSON.parse(process.env.BROWSER_VIEWPORT);
+ const browser = await chromium.launch({channel:'chrome',headless:true});
+ const context = await browser.newContext({viewport,isMobile:target === 'h5-browser-emulation',hasTouch:target === 'h5-browser-emulation'});
+ await context.tracing.start({screenshots:true,snapshots:true,sources:true});
+ const page = await context.newPage(), requests = [], steps = [], errors = [];
+ page.on('request',r => requests.push({method:r.method(),url:r.url()}));
+ page.on('pageerror',e => errors.push(e.message));
+ const step = action => steps.push({action,status:'passed'});
+ try {
+  await page.goto(process.env.BROWSER_URL); await page.getByRole('heading',{name:'Reference notebook'}).waitFor(); step('open app');
+  await page.getByRole('button',{name:'Sign in',exact:true}).click();
+  await page.getByRole('status').filter({hasText:'Signed in'}).waitFor(); step('sign in with server session');
+  let failed = false;
+  await page.route('**/items',route => { if(route.request().method()==='POST' && !failed) {failed=true; return route.abort();} return route.continue(); });
+  await page.getByRole('button',{name:'Save notebook',exact:true}).click();
+  await page.getByRole('status').filter({hasText:'Save failed; retry'}).waitFor(); step('observe network failure and retry feedback');
+  const started = performance.now();
+  await page.getByRole('button',{name:'Save notebook',exact:true}).click();
+  await page.getByRole('status').filter({hasText:'Saved'}).waitFor();
+  await page.locator('#count').filter({hasText:'1 stored'}).waitFor(); step('retry same request and observe durable result');
+  const create_elapsed_ms = performance.now()-started;
+  const response = await context.request.get(process.env.BROWSER_URL+'/items'); assert.equal(response.status(),200);
+  const data = await response.json(); assert.equal(data.items.length,1); assert.equal(data.items[0].label,'Notebook'); step('read back API state');
+  assert.deepEqual(errors,[]);
+  const files = {trace:path.join(root,'trace.zip'),screenshot:path.join(root,'page.png'),requests:path.join(root,'requests.json'),data:path.join(root,'data.json')};
+  await page.screenshot({path:files.screenshot,fullPage:true});
+  fs.writeFileSync(files.requests,JSON.stringify(requests)); fs.writeFileSync(files.data,JSON.stringify(data));
+  await context.tracing.stop({path:files.trace});
+  const evidence = Object.fromEntries(Object.entries(files).map(([key,file])=>[key,{path:file,sha256:crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')} ]));
+  const observed = {run_id:process.env.PIPELINE_RUN_ID,attempt_id:process.env.PIPELINE_ATTEMPT_ID,
+    candidate_sha256:process.env.PIPELINE_CANDIDATE_SHA256,target,
+    identity:{browser:'chromium',version:browser.version(),viewport,is_mobile:target==='h5-browser-emulation'},steps,evidence,metrics:{create_elapsed_ms}};
+  fs.writeFileSync(path.join(root,'journey.json'),JSON.stringify(observed));
+ } finally {await browser.close();}
+})().catch(error=>{console.error(error.stack);process.exitCode=1;});
+''')
+    (project / 'browser_checks.py').write_text('''import hashlib, json, os, sqlite3, subprocess, tempfile, threading
+from pathlib import Path
+from backend.server import Server
+report_path = Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']); checks = {}; journeys = {}
+for name,target,viewport in [('pc_web','pc-web',{'width':1280,'height':800}),('h5','h5-browser-emulation',{'width':390,'height':844})]:
+    with tempfile.TemporaryDirectory() as temp:
+        database = Path(temp)/'items.sqlite'; server = Server(database)
+        thread = threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+        evidence = report_path.parent/name
+        try:
+            result = subprocess.run(['node','browser.cjs'],env={**os.environ,'BROWSER_URL':'http://127.0.0.1:'+str(server.server_port),
+                'BROWSER_TARGET':target,'BROWSER_VIEWPORT':json.dumps(viewport),'BROWSER_EVIDENCE':str(evidence)},timeout=30)
+            if result.returncode: raise SystemExit(result.returncode)
+            observed = json.loads((evidence/'journey.json').read_text())
+            with sqlite3.connect(database) as db: rows = db.execute('SELECT label,quantity FROM items').fetchall()
+            if rows != [('Notebook',1)]: raise SystemExit('Browser state and SQLite differ')
+            data = evidence/'data.json'; value=json.loads(data.read_text()); value['sqlite_rows']=rows; data.write_text(json.dumps(value))
+            observed['evidence']['data']['sha256'] = hashlib.sha256(data.read_bytes()).hexdigest()
+            checks[name] = {'login_retry_persistence':'passed'}; journeys[name] = observed
+        finally: server.shutdown(); server.server_close(); thread.join()
+report_path.write_text(json.dumps({'run_id':os.environ['PIPELINE_RUN_ID'],'attempt_id':os.environ['PIPELINE_ATTEMPT_ID'],
+    'checks':checks,'findings':{},'journeys':journeys}))
+''')
+    compiled = subprocess.run(['node', str(ROOT/'node_modules/typescript/bin/tsc'), 'client.ts','--outDir','dist','--lib','es2020,dom','--strict','--skipLibCheck'],
+        cwd=front, capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    return project
+
+
+def test_real_pc_and_h5_journeys_bind_artifacts(browser_project):
+    from ai_sdlc_claudecode.acceptance import digest, fingerprint
+    from ai_sdlc_claudecode.verification import validate_journey
+    project = browser_project; archive = project/'.artifacts/journey-attempt'; archive.mkdir(parents=True)
+    report = archive/'acceptance.json'
+    candidate = digest(fingerprint(project,['backend/server.py','frontend','browser.cjs','browser_checks.py']))
+    env = {**os.environ,'PIPELINE_RUN_ID':'browser-run','PIPELINE_ATTEMPT_ID':'browser-attempt',
+           'PIPELINE_CANDIDATE_SHA256':candidate,'PIPELINE_ACCEPTANCE_REPORT':str(report)}
+    result = subprocess.run([sys.executable,'browser_checks.py'],cwd=project,env=env,capture_output=True,text=True,timeout=70)
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = json.loads(report.read_text())
+    binding = dict(run_id='browser-run',attempt_id='browser-attempt',candidate_sha256=candidate,report_path=str(report))
+    for name,target in [('pc_web','pc-web'),('h5','h5-browser-emulation')]:
+        spec = {'target':target,'identity':{'browser':'chromium','is_mobile':name=='h5'},'min_steps':5}
+        assert validate_journey(observed['journeys'][name], spec, binding)
+    assert observed['journeys']['pc_web']['identity']['viewport']['width'] == 1280
+    assert observed['journeys']['h5']['identity']['viewport']['width'] == 390
+    from copy import deepcopy
+    for change in ('skip', 'zero', 'wrong_target', 'wrong_candidate', 'stale_artifact'):
+        altered = deepcopy(observed['journeys']['pc_web'])
+        if change == 'skip': altered['steps'][0]['status'] = 'skipped'
+        elif change == 'zero': altered['steps'] = []
+        elif change == 'wrong_target': altered['target'] = 'native-ios'
+        elif change == 'wrong_candidate': altered['candidate_sha256'] = 'old'
+        else: altered['evidence']['data']['sha256'] = 'old'
+        with pytest.raises((ValueError, OSError)):
+            validate_journey(altered, {'target':'pc-web','identity':{'browser':'chromium'},'min_steps':5}, binding)

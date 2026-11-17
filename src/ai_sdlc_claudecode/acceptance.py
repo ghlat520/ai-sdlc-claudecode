@@ -38,7 +38,7 @@ def policy(dag):
     value = dag.get('config', {}).get('project_acceptance')
     if value is None:
         return None
-    allowed = {'scope', 'stage_id', 'candidate_inputs', 'required_checks', 'blocking_findings', 'function_map'}
+    allowed = {'scope', 'stage_id', 'candidate_inputs', 'required_checks', 'blocking_findings', 'function_map', 'journeys'}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError('Invalid project_acceptance policy fields')
     for key in ('scope', 'stage_id'):
@@ -68,6 +68,18 @@ def policy(dag):
             raise ValueError('function_map must reference the S1 requirements artifact')
         if not any(s['id'] == 'S1' for s in dag['stages'].values()) or value['stage_id'] == 'S1':
             raise ValueError('Function map requires S1 before a separate acceptance stage')
+    journeys = value.get('journeys', {})
+    if not isinstance(journeys, dict) or not set(journeys) <= set(checks):
+        raise ValueError('Journeys must reference required named checks')
+    for name, journey in journeys.items():
+        if (not isinstance(journey, dict) or set(journey) - {'target', 'identity', 'min_steps', 'max_metrics'}
+                or not isinstance(journey.get('target'), str) or not journey['target']
+                or not isinstance(journey.get('identity'), dict) or not journey['identity']
+                or type(journey.get('min_steps')) is not int or journey['min_steps'] < 1):
+            raise ValueError(f'Journey {name} needs a target identity and positive step count')
+        metrics = journey.get('max_metrics', {})
+        if not isinstance(metrics, dict) or any(type(v) not in (int, float) or not __import__('math').isfinite(v) or v < 0 for v in metrics.values()):
+            raise ValueError('Invalid journey performance budget')
     return value
 
 
@@ -235,6 +247,12 @@ def evaluate(binding, definition, record):
             if any(status in ('failed', 'error') for status in cases.values()):
                 failed = True
                 reasons.append(f'Failed cases: {name}')
+        journeys = report.get('journeys', {})
+        if not isinstance(journeys, dict):
+            raise ValueError('Invalid terminal journey results')
+        for name, spec in definition.get('journeys', {}).items():
+            from .verification import validate_journey
+            validate_journey(journeys.get(name), spec, binding)
         if definition.get('function_map'):
             result['behaviors'] = [dict(id=b['id'], requirement_id=b['requirement_id'],
                 acceptance_id=b['acceptance_id'], target=b['target'], expected=b['expected'],

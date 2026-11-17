@@ -723,10 +723,14 @@ verify_stage() {
     bash "$VALIDATE_SCRIPT" "$stage_id" "$output_json" > "$log_file" 2>&1 || code=$?
     collect_evidence "$feature_id" "$stage_id" schema "$code" "$log_file" || return 1
     [[ $code -eq 0 ]] || return 1
-    local acceptance_report post_exit=0 acceptance_exit=0
+    local acceptance_report acceptance_candidate="" post_exit=0 acceptance_exit=0
     acceptance_report=$(python3 -m ai_sdlc_claudecode.state acceptance-prepare \
         "${PIPELINE_ROOT}/${feature_id}/state.json" "$PIPELINE_RUN_ID" "$stage_id" "$PIPELINE_ATTEMPT_ID") || return 1
-    PIPELINE_ACCEPTANCE_REPORT="$acceptance_report" \
+    if [[ -n "$acceptance_report" ]]; then
+        acceptance_candidate=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["stages"][sys.argv[2]]["project_acceptance"]["candidate_sha256"])' \
+            "${PIPELINE_ROOT}/${feature_id}/state.json" "$stage_id") || return 1
+    fi
+    PIPELINE_ACCEPTANCE_REPORT="$acceptance_report" PIPELINE_CANDIDATE_SHA256="$acceptance_candidate" \
         run_post_commands "$stage_name" "$feature_id" "$stage_id" || post_exit=$?
     if [[ -n "$acceptance_report" ]]; then
         python3 -m ai_sdlc_claudecode.state acceptance-collect \

@@ -7,6 +7,7 @@ not process isolation or an authorization service.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,6 +19,44 @@ from .acceptance import _names, fingerprint
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[2]
+
+
+def validate_journey(observed, expected, binding):
+    if not isinstance(observed, dict):
+        raise ValueError('Missing required terminal journey')
+    if any(observed.get(key) != binding.get(key) for key in ('run_id', 'attempt_id', 'candidate_sha256')):
+        raise ValueError('Journey evidence belongs to a different execution/candidate')
+    if observed.get('target') != expected['target']:
+        raise ValueError('Journey evidence is from another terminal target')
+    if not isinstance(observed.get('identity'), dict) or any(observed['identity'].get(k) != v for k, v in expected['identity'].items()):
+        raise ValueError('Journey runtime/device identity does not match the declared target')
+    steps = observed.get('steps')
+    if (not isinstance(steps, list) or len(steps) < expected['min_steps']
+            or any(not isinstance(step, dict) or not isinstance(step.get('action'), str) or not step['action'].strip()
+                   or step.get('status') != 'passed' for step in steps)):
+        raise ValueError('Required journey has missing, failed or skipped steps')
+    archive = Path(binding['report_path']).parent.resolve(strict=True)
+    evidence = observed.get('evidence')
+    if not isinstance(evidence, dict):
+        raise ValueError('Missing terminal journey artifact map')
+    for kind in ('trace', 'screenshot', 'requests', 'data'):
+        artifact = evidence.get(kind, {})
+        if not isinstance(artifact, dict):
+            raise ValueError(f'Invalid journey artifact: {kind}')
+        path = Path(artifact.get('path', ''))
+        if path.is_symlink():
+            raise ValueError('Journey artifacts must not be symlinks')
+        path = path.resolve(strict=True)
+        path.relative_to(archive)
+        if not path.is_file() or not path.stat().st_size or hashlib.sha256(path.read_bytes()).hexdigest() != artifact.get('sha256'):
+            raise ValueError(f'Missing or changed journey artifact: {kind}')
+    for name, maximum in expected.get('max_metrics', {}).items():
+        if not isinstance(observed.get('metrics'), dict):
+            raise ValueError('Missing measured journey metrics')
+        value = observed.get('metrics', {}).get(name)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or value > maximum:
+            raise ValueError(f'Journey metric {name} is missing or exceeds {maximum}')
+    return observed
 
 
 def run_bounded(command_text, directory, timeout, env=None, stream=None):
