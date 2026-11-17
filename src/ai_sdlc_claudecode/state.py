@@ -415,6 +415,10 @@ class PipelineState:
             modules = Path(record['archive']) / 'module-checks.json'
             if check == 'post_commands' and modules.exists():
                 record['module_checks'] = json.loads(modules.read_text())
+            if check == 'contracts' and stage in ('S3', 'S3b'):
+                report = json.loads(source.read_text())
+                if report.get('source_binding'):
+                    record['contract_source'] = report['source_binding']
 
     def finish_attempt(self, run, stage, attempt, status, output=None, fix_ids=()):
         with locked_json(self.path) as data:
@@ -487,6 +491,10 @@ class PipelineState:
                 return False
             if config.get('module_checks') and not verification.modules_current(record.get('module_checks', {})):
                 return False
+            if record.get('contract_source'):
+                source = record['contract_source']
+                if acceptance.fingerprint(source['project_dir'], source['paths']) != source['manifest']:
+                    return False
             receipts = record["verification"]["evidence"]
             if not PipelineState.expected_checks(config, dag) <= {r["check"] for r in receipts}:
                 return False

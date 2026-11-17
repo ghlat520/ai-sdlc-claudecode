@@ -12,6 +12,125 @@
       "type": "object",
       "required": ["services", "api_endpoints", "cross_service_messages", "encryption_pairs", "shared_models", "external_refs"],
       "properties": {
+        "quality_rules": {
+          "description": "Opt-in executable rules; each ID has a scoped source, failure message and actual input paths.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind",
+              "source",
+              "message",
+              "paths"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "kind": {
+                "enum": [
+                  "imports",
+                  "wire"
+                ]
+              },
+              "source": {
+                "type": "string",
+                "minLength": 1
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1
+              },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "language": {
+                "enum": [
+                  "python",
+                  "typescript"
+                ]
+              },
+              "forbidden": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "command": {
+                "type": "string",
+                "minLength": 1
+              },
+              "endpoint": {
+                "type": "object",
+                "required": [
+                  "service",
+                  "method",
+                  "path"
+                ],
+                "properties": {
+                  "service": {
+                    "type": "string"
+                  },
+                  "method": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "imports"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "language",
+                    "forbidden",
+                    "exclude"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "wire"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "command",
+                    "endpoint"
+                  ]
+                }
+              }
+            ]
+          }
+        },
         "services": {
           "description": "Authoritative list of services/modules. Prevents duplicate-service bugs (ai-media-platform C2).",
           "type": "array",

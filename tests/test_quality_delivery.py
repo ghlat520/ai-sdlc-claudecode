@@ -10,6 +10,97 @@ from ai_sdlc_claudecode.state import PipelineState
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('code,blocked', [
+    ('import {secret} from "../backend/secret"; export const label = secret;', True),
+    ('import {items} from "demo/catalog"; export const label = items;', True),
+    ('// import {items} from "demo/catalog";\nexport const label = "../backend/secret";', False),
+    ('export const load = () => import("../backend/secret");', True),
+])
+def test_s2_dependency_rules_use_import_syntax(tmp_path, code, blocked):
+    (tmp_path / 'frontend').mkdir()
+    (tmp_path / 'frontend/node_modules').symlink_to(ROOT / 'node_modules', target_is_directory=True)
+    (tmp_path / 'frontend/value.ts').write_text(code)
+    contract = tmp_path / 'contracts.json'
+    contract.write_text(json.dumps({'services': [], 'quality_rules': [{
+        'id': 'ARCH-PROD-01', 'kind': 'imports', 'language': 'typescript', 'paths': ['frontend'],
+        'exclude': [], 'forbidden': ['../backend/*', 'demo/*'], 'source': 'approved architecture',
+        'message': 'Renderer uses API and cannot import backend or demo providers',
+    }]}))
+    result = subprocess.run([sys.executable, '-m', 'ai_sdlc_claudecode.contract_validator', str(contract), str(tmp_path)],
+                            capture_output=True, text=True, env={**os.environ, 'PYTHONPATH': str(ROOT / 'src')})
+    assert result.returncode == (1 if blocked else 0), result.stdout + result.stderr
+    if blocked: assert 'ARCH-PROD-01' in result.stdout
+
+
+@pytest.mark.parametrize('code,blocked', [('import app.demo.provider',True),('from .demo import provider',True),('from . import demo',True),
+    ("import importlib; value=importlib.import_module('.demo.provider',package='app')",True),
+    ("from importlib import import_module as load; value=load('.demo.provider',package='app')",True),('from . import safe',False)])
+def test_relative_imports_cannot_bypass_package_boundary(tmp_path,code,blocked):
+    from ai_sdlc_claudecode.contract_validator import validate
+    (tmp_path/'app').mkdir(); (tmp_path/'app/main.py').write_text(code)
+    source=tmp_path/'contracts.json';source.write_text(json.dumps({'services':[], 'quality_rules':[
+        {'id':'PROD-PACKAGE','kind':'imports','language':'python','paths':['app'],'exclude':[],
+         'forbidden':['app.demo','app.demo.*'],'source':'package boundary','message':'production excludes demo providers'}]}))
+    assert bool(validate(source,tmp_path).blocking()) is blocked
+
+
+@pytest.mark.parametrize('language,filename,code', [('python','dynamic.py','import importlib\nimportlib.import_module(module_name)'),
+    ('typescript','dynamic.ts','export const load = name => import(name);')])
+def test_excluded_test_files_are_excluded_before_parsing(tmp_path,language,filename,code):
+    from ai_sdlc_claudecode.contract_validator import validate
+    (tmp_path/'app/tests').mkdir(parents=True);(tmp_path/'app/tests'/filename).write_text(code)
+    (tmp_path/'app/node_modules').symlink_to(ROOT/'node_modules',target_is_directory=True)
+    (tmp_path/'app'/('main.py' if language=='python' else 'main.ts')).write_text('value = 42' if language=='python' else 'export const value = 42;')
+    source=tmp_path/'contracts.json';source.write_text(json.dumps({'services':[],'quality_rules':[
+        {'id':'PROD-EXCLUDE','kind':'imports','language':language,'paths':['app'],'exclude':['app/tests/*'],
+         'forbidden':['demo.*','demo/*'],'source':'explicit test exclusion','message':'production uses actual providers'}]}))
+    assert not validate(source,tmp_path).blocking()
+
+
+@pytest.mark.parametrize('wire,blocked', [
+    ({'id': 3, 'label': 'valid alias mapping'}, False),
+    ({'item_id': 3, 'label': 'drift'}, True),
+    ({'id': True, 'label': 'boolean is not integer'}, True),
+])
+def test_wire_rules_check_actual_serialization(tmp_path, wire, blocked):
+    # The adapter executes a real JSON serializer; HTTP probes use this same wire shape below.
+    (tmp_path / 'serialize.py').write_text('import json\ninternal_name = ' + repr(wire) + '\nprint(json.dumps({"method":"POST","path":"/items","status":201,"request":{"label":"input"},"response":internal_name}))')
+    contract = {'services': [], 'api_endpoints': [{'service': 'backend', 'method': 'POST', 'path': '/items',
+        'request_fields': [{'name': 'label', 'type': 'string'}],
+        'response_fields': [{'name': 'id', 'type': 'integer'}, {'name': 'label', 'type': 'string'}]}],
+        'quality_rules': [{'id': 'API-01', 'kind': 'wire', 'source': 'FR-1 / AC-1',
+            'message': 'Published JSON fields must match S2', 'paths': ['serialize.py'],
+            'endpoint': {'service': 'backend', 'method': 'POST', 'path': '/items'}, 'command': 'python3 serialize.py'}]}
+    source = tmp_path / 'contracts.json'; source.write_text(json.dumps(contract))
+    result = subprocess.run([sys.executable, '-m', 'ai_sdlc_claudecode.contract_validator', str(source), str(tmp_path)],
+        capture_output=True, text=True, env={**os.environ, 'PYTHONPATH': str(ROOT / 'src')})
+    assert result.returncode == (1 if blocked else 0), result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert report['rules'][0]['id'] == 'API-01'
+    assert report['source_binding']['manifest']
+
+
+def test_production_import_rule_respects_explicit_test_scope(executor_case, tmp_path):
+    dag, path, env, run = executor_case
+    (tmp_path / 'app').mkdir(); (tmp_path / 'app/tests').mkdir()
+    (tmp_path / 'app/main.py').write_text('import json as wire\n')
+    (tmp_path / 'app/tests/test_main.py').write_text('import demo.provider\n')
+    rule = {'id': 'PROD-01', 'kind': 'imports', 'language': 'python', 'paths': ['app'],
+        'exclude': ['app/tests/*'], 'forbidden': ['demo.*'], 'source': 'approved production boundary',
+        'message': 'Production must not import demonstration providers'}
+    contract = tmp_path / 'contracts.json'; contract.write_text(json.dumps({'services': [], 'quality_rules': [rule]}))
+    dag['config']['modules'] = {'application': {'path': 'app', 'tech_stack': 'python', 'inputs': ['main.py', 'tests'],
+        'artifacts': [], 'commands': {'rules': 'python3 -m ai_sdlc_claudecode.contract_validator ../contracts.json ..'}}}
+    dag['stages']['first']['module_checks'] = {'application': ['rules']}
+    dag['stages']['first']['gate'] = {'type': 'ai-review'}
+    result, data = run('--stages', 'S8')
+    assert result.returncode == 0, result.stdout + result.stderr
+    (tmp_path / 'app/main.py').write_text('import demo.provider\n')
+    result, data = run('--stages', 'S8', '--resume')
+    assert result.returncode == 1
+    assert 'PROD-01' in Path(data['stages']['S8']['output_dir'], 'post-commands.log').read_text()
+
+
 @pytest.fixture
 def module_case(executor_case, tmp_path):
     dag, path, env, run = executor_case

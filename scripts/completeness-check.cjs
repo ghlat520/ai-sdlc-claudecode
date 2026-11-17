@@ -7,12 +7,15 @@ const ignored = new Set(['node_modules', '.git', '.nuxt', 'target', 'dist', 'bui
   '.artifacts', '.venv', '__pycache__', 'coverage']);
 const scriptExtensions = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts', '.vue']);
 
-function scan(root) {
+function scan(root, importsOnly = false, excludedFiles = []) {
   const files = [];
+  const excluded = new Set(excludedFiles.map(file => path.resolve(file)));
+  const imports = [];
   function walk(dir) {
     for (const entry of fs.readdirSync(dir, {withFileTypes: true})) {
       if (ignored.has(entry.name)) continue;
       const file = path.join(dir, entry.name);
+      if (excluded.has(path.resolve(file))) continue;
       if (entry.isSymbolicLink()) throw new Error(`Unsupported source symlink: ${file}`);
       if (entry.isDirectory()) walk(file);
       else if (scriptExtensions.has(path.extname(file)) || /\.(java|sql)$/.test(file)) {
@@ -43,6 +46,17 @@ function scan(root) {
       });
     }
     for (const block of blocks) {
+      let compilerOptions = {};
+      if (importsOnly) {
+        const configPath = ts.findConfigFile(path.dirname(file), ts.sys.fileExists);
+        if (configPath) {
+          const config = ts.readConfigFile(configPath, ts.sys.readFile);
+          if (config.error) throw new Error(`Invalid TypeScript configuration: ${configPath}`);
+          const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath));
+          if (parsed.errors.some(error => error.code !== 18003)) throw new Error(`Invalid TypeScript options: ${configPath}`);
+          compilerOptions = parsed.options;
+        }
+      }
       const kind = {tsx: ts.ScriptKind.TSX, jsx: ts.ScriptKind.JSX, ts: ts.ScriptKind.TS,
         mts: ts.ScriptKind.TS, cts: ts.ScriptKind.TS}[block.lang] || ts.ScriptKind.JS;
       const source = ts.createSourceFile(file, block.content, ts.ScriptTarget.Latest, true, kind);
@@ -50,6 +64,21 @@ function scan(root) {
         throw new Error(`Parse error in ${file}: ${source.parseDiagnostics.map(d => ts.flattenDiagnosticMessageText(d.messageText, ' ')).join('; ')}`);
       }
       function visit(node) {
+        const literals = [];
+        if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) literals.push(node.moduleSpecifier);
+        if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) literals.push(node.moduleReference.expression);
+        if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+            || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) {
+          if (node.arguments.length !== 1 || !ts.isStringLiteralLike(node.arguments[0])) {
+            if (importsOnly) throw new Error(`Unresolved dynamic import in ${file}`);
+          } else literals.push(node.arguments[0]);
+        }
+        for (const literal of literals) {
+          const resolution = importsOnly && ts.resolveModuleName(literal.text, file, compilerOptions, ts.sys).resolvedModule;
+          imports.push({file: path.relative(root, file), module: literal.text,
+            resolved: resolution ? resolution.resolvedFileName : literal.text.startsWith('.') ? path.resolve(path.dirname(file), literal.text) : null,
+            line: source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1 + block.offset});
+        }
         if (ts.isFunctionLike(node) && node.body && ts.isBlock(node.body)
             && node.body.statements.every(statement => ts.isEmptyStatement(statement))) {
           // Parameter properties are executable constructor initialization.
@@ -60,7 +89,7 @@ function scan(root) {
           const inner = block.content.slice(node.body.getStart(source) + 1, node.body.end - 1).trim();
           const exception = callback && /^\/\* completeness-allow-empty: [^\r\n]+ \*\/$/.test(inner)
             && !inner.slice(2, -2).includes('*/');
-          if (!initialized && !exception) {
+          if (!initialized && !exception && !importsOnly) {
             const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1 + block.offset;
             fail(`B-Stub ${path.relative(root, file)}:${line}: empty function body`);
           }
@@ -69,6 +98,10 @@ function scan(root) {
       }
       visit(source);
     }
+  }
+  if (importsOnly) {
+    console.log(JSON.stringify({files: scripts.map(({file}) => path.relative(root, file)), imports}));
+    return 0;
   }
   console.log(`[CHECK] Function bodies: ${scripts.length ? scripts.length + ' source files parsed' : 'not applicable (no JS/TS/Vue sources)'}`);
   // Retained legacy heuristics; AST coverage above does not make these semantic checks.
@@ -102,5 +135,6 @@ function scan(root) {
   return violations ? 1 : 0;
 }
 
-try { process.exitCode = scan(path.resolve(process.argv[2])); }
+try { process.exitCode = scan(path.resolve(process.argv[process.argv[2] === '--imports' ? 3 : 2]),
+  process.argv[2] === '--imports', process.argv[4] ? JSON.parse(process.argv[4]) : []); }
 catch (error) { console.error(`[ERROR] ${error.message}`); process.exitCode = 2; }
