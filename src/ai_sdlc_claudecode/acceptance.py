@@ -38,7 +38,7 @@ def policy(dag):
     value = dag.get('config', {}).get('project_acceptance')
     if value is None:
         return None
-    allowed = {'scope', 'stage_id', 'candidate_inputs', 'required_checks', 'blocking_findings'}
+    allowed = {'scope', 'stage_id', 'candidate_inputs', 'required_checks', 'blocking_findings', 'function_map'}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError('Invalid project_acceptance policy fields')
     for key in ('scope', 'stage_id'):
@@ -63,7 +63,58 @@ def policy(dag):
     stage = next((s for s in dag['stages'].values() if s['id'] == value['stage_id']), None)
     if stage is None or not stage.get('post_commands'):
         raise ValueError('Project acceptance requires a known stage with post_commands')
+    if 'function_map' in value:
+        if value['function_map'] != {'source_stage_id': 'S1'}:
+            raise ValueError('function_map must reference the S1 requirements artifact')
+        if not any(s['id'] == 'S1' for s in dag['stages'].values()) or value['stage_id'] == 'S1':
+            raise ValueError('Function map requires S1 before a separate acceptance stage')
     return value
+
+
+def function_contract(output, definition, commands):
+    """Validate S1 behavior obligations against the existing named-case contract."""
+    value = output.get('function_map')
+    if (not isinstance(value, dict) or set(value) != {'version', 'behaviors'}
+            or not isinstance(value['version'], str) or not value['version'].strip()
+            or not isinstance(value['behaviors'], list) or not value['behaviors']):
+        raise ValueError('S1 function_map requires a version and nonempty behaviors')
+    prd = output.get('prd', {})
+    requirements = prd.get('functional_requirements', [])
+    criteria = prd.get('acceptance_criteria', [])
+    for entries, label in ((requirements, 'requirements'), (criteria, 'acceptance criteria')):
+        if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+            raise ValueError(f'Invalid {label}')
+        _names([entry.get('id') for entry in entries], label)
+    requirement_ids = {entry['id'] for entry in requirements}
+    criteria_ids = {entry['id'] for entry in criteria}
+    fields = {'id', 'requirement_id', 'acceptance_id', 'role', 'preconditions', 'state_before',
+              'event', 'state_after', 'data_changes', 'failure_retry', 'feedback', 'target',
+              'check_id', 'case_id', 'command', 'expected', 'evidence'}
+    seen, pairs, covered_requirements, covered_criteria = set(), set(), set(), set()
+    for behavior in value['behaviors']:
+        if (not isinstance(behavior, dict) or set(behavior) != fields
+                or any(not isinstance(v, str) or not v.strip() for v in behavior.values())):
+            raise ValueError('Each function-map behavior must declare all executable behavior fields')
+        pair = (behavior['check_id'], behavior['case_id'])
+        if behavior['id'] in seen or pair in pairs:
+            raise ValueError('Duplicate function-map behavior or check/case')
+        seen.add(behavior['id'])
+        pairs.add(pair)
+        if behavior['requirement_id'] not in requirement_ids or behavior['acceptance_id'] not in criteria_ids:
+            raise ValueError('Function-map behavior references an unknown FR/AC')
+        covered_requirements.add(behavior['requirement_id'])
+        covered_criteria.add(behavior['acceptance_id'])
+        if behavior['command'] not in commands or behavior['evidence'] != 'supervisor_report':
+            raise ValueError('Function-map command/evidence must bind the actual acceptance stage')
+    expected = {(check, case) for check, cases in definition['required_checks'].items() for case in cases}
+    if pairs != expected:
+        raise ValueError('Function map and required checks must declare exactly the same cases')
+    must = {entry['id'] for entry in requirements if entry.get('priority') == 'must'}
+    if not must <= covered_requirements or covered_criteria != criteria_ids:
+        raise ValueError('Function map is missing required FR/AC behavior')
+    return dict(function_map=value, requirements=requirements, acceptance_criteria=criteria,
+                required_checks=definition['required_checks'], acceptance_policy=definition,
+                acceptance_commands=list(commands))
 
 
 def fingerprint(project, inputs):
@@ -96,14 +147,19 @@ def fingerprint(project, inputs):
     return manifest
 
 
-def prepare(definition, record, project, known_findings):
+def prepare(definition, record, project, known_findings, function_map=None):
     manifest = fingerprint(project, definition['candidate_inputs'])
+    if function_map:
+        for behavior in function_map['contract']['function_map']['behaviors']:
+            target = behavior['target']
+            if not any(name == target or name.startswith(target.rstrip('/') + '/') for name in manifest):
+                raise ValueError(f'Function-map target is outside candidate inputs: {target}')
     return dict(scope=definition['scope'], policy_sha256=digest(definition),
                 run_id=record['run_id'], attempt_id=record['attempt_id'],
                 project_dir=str(Path(project).resolve()), candidate_manifest=manifest,
                 candidate_sha256=digest(manifest), known_findings=dict(known_findings),
                 report_path=str(Path(record['archive']) / 'project-acceptance.json'),
-                collected=False)
+                collected=False, function_map=function_map)
 
 
 def collect(binding, command_exit):
@@ -118,7 +174,7 @@ def evaluate(binding, definition, record):
     result = dict(status='incomplete', scope=definition['scope'], reasons=[],
                   run_id=binding.get('run_id'), attempt_id=binding.get('attempt_id'),
                   report_path=binding.get('report_path'),
-                  candidate_sha256=binding.get('candidate_sha256'), passed_cases=0,
+                  candidate_sha256=binding.get('candidate_sha256'), policy_sha256=binding.get('policy_sha256'), passed_cases=0,
                   required_cases=sum(map(len, definition['required_checks'].values())),
                   known_findings=dict(binding.get('known_findings', {})))
     reasons = result['reasons']
@@ -127,6 +183,16 @@ def evaluate(binding, definition, record):
                 or binding.get('run_id') != record.get('run_id')
                 or binding.get('attempt_id') != record.get('attempt_id')):
             raise ValueError('Missing or stale acceptance attempt/policy')
+        if definition.get('function_map'):
+            frozen = binding['function_map']
+            if not frozen or digest(frozen['contract']) != frozen['sha256']:
+                raise ValueError('Missing or altered frozen function map')
+            if frozen['contract']['required_checks'] != definition['required_checks']:
+                raise ValueError('Required function-map cases changed')
+            source = frozen['source']
+            if hashlib.sha256(Path(source['path']).read_bytes()).hexdigest() != source['sha256']:
+                raise ValueError('S1 function-map artifact changed; old evidence is invalid')
+            result['function_map_sha256'] = frozen['sha256']
         failed = binding['command_exit'] != 0
         if failed:
             result['status'] = 'failed'
@@ -169,6 +235,12 @@ def evaluate(binding, definition, record):
             if any(status in ('failed', 'error') for status in cases.values()):
                 failed = True
                 reasons.append(f'Failed cases: {name}')
+        if definition.get('function_map'):
+            result['behaviors'] = [dict(id=b['id'], requirement_id=b['requirement_id'],
+                acceptance_id=b['acceptance_id'], target=b['target'], expected=b['expected'],
+                evidence_path=binding['report_path'], check_id=b['check_id'], case_id=b['case_id'],
+                status=checks.get(b['check_id'], {}).get(b['case_id'], 'missing'))
+                for b in binding['function_map']['contract']['function_map']['behaviors']]
         passed_checks = set()
         for name, required in definition['required_checks'].items():
             cases = checks.get(name)

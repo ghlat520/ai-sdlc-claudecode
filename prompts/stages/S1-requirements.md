@@ -15,6 +15,20 @@
 ## Context Files
 {{context_files}}
 
+## Executable behavior map (when configured)
+
+If `config.project_acceptance.function_map` selects S1, emit `function_map` in the
+S1 artifact using `schemas/requirements-output.json`. Reuse the PRD's FR/AC IDs.
+Cover every must-have FR and every AC with role, preconditions, before/after state,
+event, data change, failure/retry behavior and visible/API feedback. Bind each
+behavior to a candidate target, named check/case, the exact configured acceptance
+command, expected observation and `evidence: "supervisor_report"`.
+
+The map and `required_checks` must contain the same case set. The supervisor freezes
+these obligations after S1 verification. A retry cannot delete a case or weaken its
+expected result. Report a scope change separately instead of rewriting the frozen
+contract. Do not generate a passing result yourself; the acceptance command executes it.
+
 ---
 
 ## Phase 1: Domain Classification & Adaptive Routing

@@ -76,6 +76,38 @@
         }
       }
     },
+    "function_map": {
+      "type": "object", "required": ["version", "behaviors"], "additionalProperties": false,
+      "properties": {
+        "version": {"type": "string", "minLength": 1},
+        "behaviors": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["id", "requirement_id", "acceptance_id", "role", "preconditions", "state_before", "event", "state_after", "data_changes", "failure_retry", "feedback", "target", "check_id", "case_id", "command", "expected", "evidence"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "requirement_id": {"type": "string", "minLength": 1},
+              "acceptance_id": {"type": "string", "minLength": 1},
+              "role": {"type": "string", "minLength": 1},
+              "preconditions": {"type": "string", "minLength": 1},
+              "state_before": {"type": "string", "minLength": 1},
+              "event": {"type": "string", "minLength": 1},
+              "state_after": {"type": "string", "minLength": 1},
+              "data_changes": {"type": "string", "minLength": 1},
+              "failure_retry": {"type": "string", "minLength": 1},
+              "feedback": {"type": "string", "minLength": 1},
+              "target": {"type": "string", "minLength": 1},
+              "check_id": {"type": "string", "minLength": 1},
+              "case_id": {"type": "string", "minLength": 1},
+              "command": {"type": "string", "minLength": 1},
+              "expected": {"type": "string", "minLength": 1},
+              "evidence": {"const": "supervisor_report"}
+            }
+          }
+        }
+      }
+    },
     "metadata": {
       "type": "object",
       "properties": {

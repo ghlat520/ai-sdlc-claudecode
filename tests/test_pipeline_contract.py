@@ -671,6 +671,151 @@ Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']).write_text(json.dumps(report))
     return dag, path, env, run, tmp_path, driver
 
 
+@pytest.fixture
+def function_map_case(project_acceptance_case):
+    dag, path, env, run, project, driver = project_acceptance_case
+    dag['stages']['first']['id'] = 'S1'
+    dag['stages']['first']['output_schema'] = str(ROOT / 'schemas/requirements-output.json')
+    dag['stages']['first']['agents'][0]['prompt_template'] = 'FAKE_STAGE:S1'
+    dag['stages']['second']['dependencies'] = ['first']
+    dag['config']['project_acceptance']['function_map'] = {'source_stage_id': 'S1'}
+    behaviors = []
+    for case, ac, event, expected in [('create', 'AC-1', 'POST /items', '201 and one stored item'),
+                                     ('replay', 'AC-2', 'Repeat POST /items', '200 and still one stored item')]:
+        behaviors.append(dict(id=f'B-{case}', requirement_id='FR-1', acceptance_id=ac,
+            role='API caller', preconditions='Empty isolated store; request key A',
+            state_before='No item' if case == 'create' else 'One item', event=event,
+            state_after='One item', data_changes='Exactly one item with key A',
+            failure_retry='Retry with same request key', feedback='HTTP status and JSON list',
+            target='app/application.py', check_id='business', case_id=case,
+            command='python3 acceptance_driver.py', expected=expected, evidence='supervisor_report'))
+    requirements = {'stage_id': 'S1', 'feature_id': 'fixture', 'timestamp': '2026-11-17T00:00:00Z',
+                    'status': 'complete', 'summary': 'API item contract',
+                    'prd': {'title': 'Idempotent API', 'summary': 'An API caller creates one item and can retry the same key without duplicating that item.',
+                            'functional_requirements': [{'id': 'FR-1', 'priority': 'must', 'description': 'Create idempotently'}],
+                            'non_functional_requirements': [{'id': 'NFR-1', 'category': 'reliability', 'description': 'Repeat safe', 'metric': 'one item'}],
+                            'user_stories': [{'id': 'US-1', 'as_a': 'caller', 'i_want': 'retry', 'so_that': 'one item'}],
+                            'acceptance_criteria': [{'id': 'AC-1', 'given': 'empty', 'when': 'create', 'then': 'one item'},
+                                                    {'id': 'AC-2', 'given': 'one item', 'when': 'retry', 'then': 'same item'}]},
+                    'function_map': {'version': '1', 'behaviors': behaviors}}
+    source = project / 'requirements-input.json'
+    source.write_text(json.dumps(requirements))
+    fake = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    fake.write_text(fake.read_text().replace(
+        "with open(os.environ['FAKE_CALLS'], 'a') as log:",
+        f"if stage == 'S1':\n    print(open({str(source)!r}).read()); sys.exit(0)\nwith open(os.environ['FAKE_CALLS'], 'a') as log:"))
+    (project / 'app/application.py').write_text('''import json
+from http.server import BaseHTTPRequestHandler
+items = []
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_POST(self):
+        key = json.loads(self.rfile.read(int(self.headers['Content-Length'])))['key']
+        status = 200 if key in items else 201
+        if key not in items: items.append(key)
+        self.send_response(status); self.end_headers()
+        self.wfile.write(json.dumps(items).encode())
+''')
+    driver.write_text('''import json, os, threading
+from pathlib import Path
+from http.server import ThreadingHTTPServer
+from urllib.request import Request, urlopen
+from app.application import Handler
+server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+checks = {}
+try:
+    for case, expected in [('create', 201), ('replay', 200)]:
+        request = Request('http://127.0.0.1:%s/items' % server.server_port,
+                          data=b'{"key":"A"}', headers={'Content-Type':'application/json'})
+        with urlopen(request, timeout=3) as response:
+            checks[case] = 'passed' if response.status == expected and json.load(response) == ['A'] else 'failed'
+finally:
+    server.shutdown(); server.server_close(); thread.join()
+report = {'run_id': os.environ['PIPELINE_RUN_ID'], 'attempt_id': os.environ['PIPELINE_ATTEMPT_ID'],
+          'checks': {'business': checks}, 'findings': {}}
+Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']).write_text(json.dumps(report))
+''')
+    return dag, path, env, run, project, driver, source
+
+
+def test_function_map_traces_s1_to_executed_api(function_map_case):
+    dag, path, env, run, project, driver, source = function_map_case
+    result, data = run('--stages', 'S1,S9')
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json').project_acceptance()
+    assert report['status'] == 'passed'
+    assert report['function_map_sha256'] == data['function_map_contract']['sha256']
+    assert [(row['acceptance_id'], row['status']) for row in report['behaviors']] == [
+        ('AC-1', 'passed'), ('AC-2', 'passed')]
+
+
+@pytest.mark.parametrize('change', ['missing_behavior', 'missing_feedback', 'unknown_ac', 'wrong_command'])
+def test_function_map_rejects_unbound_requirements(function_map_case, change):
+    dag, path, env, run, project, driver, source = function_map_case
+    value = json.loads(source.read_text())
+    behaviors = value['function_map']['behaviors']
+    if change == 'missing_behavior': behaviors.pop()
+    elif change == 'missing_feedback': del behaviors[0]['feedback']
+    elif change == 'unknown_ac': behaviors[0]['acceptance_id'] = 'AC-99'
+    else: behaviors[0]['command'] = 'true'
+    source.write_text(json.dumps(value))
+    result, data = run('--stages', 'S1,S9')
+    assert result.returncode == 1
+    assert data['stages'].get('S9', {}).get('status') != 'passed'
+
+
+@pytest.mark.parametrize('mode,expected', [('failed', 'failed'), ('missing', 'incomplete'), ('skipped', 'incomplete')])
+def test_function_map_api_failure_missing_or_skipped_cannot_pass(function_map_case, mode, expected):
+    dag, path, env, run, project, driver, source = function_map_case
+    if mode == 'failed':
+        app = project / 'app/application.py'
+        app.write_text(app.read_text().replace('if key not in items: items.append(key)', 'items.append(key)'))
+    else:
+        expression = "del checks['replay']" if mode == 'missing' else "checks['replay'] = 'skipped'"
+        driver.write_text(driver.read_text().replace('report = {', expression + '\nreport = {'))
+    result, data = run('--stages', 'S1,S9')
+    assert result.returncode == 1
+    report = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json').project_acceptance()
+    assert report['status'] == expected
+    assert report['behaviors'][1]['status'] == mode
+
+
+def test_function_map_drift_invalidates_evidence_and_cannot_erase_obligations(function_map_case):
+    dag, path, env, run, project, driver, source = function_map_case
+    result, data = run('--stages', 'S1,S9')
+    assert result.returncode == 0, result.stdout + result.stderr
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    artifact = Path(data['stages']['S1']['result']['path'])
+    altered = json.loads(artifact.read_text())
+    altered['function_map']['behaviors'][0]['expected'] = 'anything'
+    artifact.write_text(json.dumps(altered))
+    assert state.project_acceptance()['status'] == 'incomplete'
+    source.write_text(json.dumps(altered))
+    result, after = run('--stages', 'S1,S9', '--resume')
+    assert result.returncode == 1
+    assert after['function_map_contract']['sha256'] == data['function_map_contract']['sha256']
+    dag['config']['project_acceptance']['required_checks']['business'].remove('replay')
+    result, _ = run('--stages', 'S1,S9', '--resume')
+    assert result.returncode == 1
+    assert 'Cannot change frozen' in result.stdout + result.stderr
+
+
+def test_function_map_scope_rename_cannot_remove_blocker(function_map_case):
+    dag, path, env, run, project, driver, source = function_map_case
+    dag['config']['project_acceptance']['blocking_findings'] = {'R1': ['business']}
+    first, before = run('--stages', 'S1,S9')
+    assert first.returncode == 1
+    assert 'R1' in before['stages']['S9']['project_acceptance']['known_findings']
+    dag['config']['project_acceptance']['scope'] = 'renamed-scope'
+    dag['config']['project_acceptance']['blocking_findings'] = {}
+    second, after = run('--stages', 'S1,S9', '--resume')
+    assert second.returncode == 1
+    assert 'Cannot change frozen acceptance contract or scope' in second.stdout + second.stderr
+    assert after['function_map_contract']['sha256'] == before['function_map_contract']['sha256']
+    assert 'R1' in after['stages']['S9']['project_acceptance']['known_findings']
+
+
 def test_project_acceptance_binds_actual_checks_to_current_candidate(project_acceptance_case):
     dag, path, env, run, project, driver = project_acceptance_case
     result, data = run('--stages', 'S8,S9')

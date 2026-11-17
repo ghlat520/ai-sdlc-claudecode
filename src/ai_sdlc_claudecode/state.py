@@ -321,6 +321,15 @@ class PipelineState:
                     raise ValueError("feature already has a live execution owner")
             data.setdefault("stages", {})
             data.setdefault("cost", {})
+            if data.get('function_map_contract'):
+                definition = acceptance.policy(dag)
+                if not definition or not definition.get('function_map'):
+                    raise ValueError('Cannot remove a frozen function-map obligation from this task')
+                if definition['required_checks'] != data['function_map_contract']['contract']['required_checks']:
+                    raise ValueError('Cannot change frozen function-map required checks in this task')
+                frozen_policy = data['function_map_contract']['contract'].get('acceptance_policy')
+                if not frozen_policy or acceptance.digest(definition) != acceptance.digest(frozen_policy):
+                    raise ValueError('Cannot change frozen acceptance contract or scope in this task')
             data.pop('executor_exit', None)
             data.update(feature_id=feature, contract_version=2, run_id=run,
                         invocation_id=metadata.pop('invocation_id', None),
@@ -415,6 +424,9 @@ class PipelineState:
                 record["verification"]["status"] = "verified"
                 if not self.is_verified(record, data["dag_path"]):
                     raise ValueError("missing, failed or stale verification evidence")
+                definition = acceptance.policy(json.loads(Path(data['dag_path']).read_text()))
+                if stage == 'S1' and definition and definition.get('function_map'):
+                    self.freeze_function_map(data, definition)
             elif status != "gate_checking":
                 record["verification"]["status"] = "unverified"
             return deepcopy(record)
@@ -474,6 +486,24 @@ class PipelineState:
         except (KeyError, OSError, TypeError, ValueError, StopIteration):
             return False
 
+    def freeze_function_map(self, data, definition):
+        source = data['stages'].get('S1', {})
+        if not self.is_verified(source, data['dag_path']):
+            raise ValueError('Function map requires a verified S1 requirements artifact')
+        artifact = source['result']
+        output = json.loads(Path(artifact['path']).read_text())
+        dag = json.loads(Path(data['dag_path']).read_text())
+        config = next(s for s in dag['stages'].values() if s['id'] == definition['stage_id'])
+        contract = acceptance.function_contract(output, definition, config['post_commands'])
+        frozen = dict(contract=contract, sha256=acceptance.digest(contract),
+                      source=dict(path=artifact['path'], sha256=artifact['sha256'],
+                                  run_id=source['run_id'], attempt_id=source['attempt_id']))
+        previous = data.get('function_map_contract')
+        if previous and previous['sha256'] != frozen['sha256']:
+            raise ValueError('Frozen function map changed; retain the original task obligations')
+        data['function_map_contract'] = frozen
+        return frozen
+
     def prepare_acceptance(self, run, stage, attempt):
         with locked_json(self.path) as data:
             record = self._attempt(data, run, stage, attempt)
@@ -490,7 +520,8 @@ class PipelineState:
                 if evidence.get('scope') == definition['scope']:
                     known.update(evidence.get('known_findings', {}))
             known.update(definition.get('blocking_findings', {}))
-            record['project_acceptance'] = acceptance.prepare(definition, record, data['project_dir'], known)
+            function_map = self.freeze_function_map(data, definition) if definition.get('function_map') else None
+            record['project_acceptance'] = acceptance.prepare(definition, record, data['project_dir'], known, function_map)
             return record['project_acceptance']['report_path']
 
     def collect_acceptance(self, run, stage, attempt, command_exit):
