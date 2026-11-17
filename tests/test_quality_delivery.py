@@ -10,6 +10,15 @@ from ai_sdlc_claudecode.state import PipelineState
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_legacy_text_heuristics_do_not_block_valid_javascript(tmp_path):
+    (tmp_path/'node_modules').symlink_to(ROOT/'node_modules',target_is_directory=True)
+    (tmp_path/'load.js').write_text('export const load = () => Promise.resolve({label: "value"});')
+    result=subprocess.run(['bash',str(ROOT/'scripts/completeness-check.sh'),str(tmp_path)],capture_output=True,text=True)
+    assert result.returncode==0,result.stdout+result.stderr
+
+
+
+
 @pytest.mark.parametrize('code,blocked', [
     ('import {secret} from "../backend/secret"; export const label = secret;', True),
     ('import {items} from "demo/catalog"; export const label = items;', True),
