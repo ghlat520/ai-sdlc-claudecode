@@ -89,12 +89,7 @@ for name, s in dag['stages'].items():
         assignment(f'DAG_{safe_name}_rp{i}_model', f'{rpass.get("model", "sonnet")}')
         assignment(f'DAG_{safe_name}_rp{i}_prompt', f'{rpass.get("prompt_file", "")}')
 
-# Export tech_stack_commands as TECH_CMD_<key> variables
-ts = cfg.get('tech_stack', 'node-typescript')
-cmds = cfg.get('tech_stack_commands', {}).get(ts, {})
-for key, val in cmds.items():
-    assignment(f'TECH_CMD_{key}', f'{val}')
-
+# Check commands are resolved at execution time after CLI and module selection.
 # Export evidence_required config
 assignment(f'EVIDENCE_REQUIRED', f'{str(cfg.get("evidence_required", False)).lower()}')
 PYEOF
@@ -422,6 +417,8 @@ schemas_base = os.environ['SCHEMAS_BASE']
 with open(dag_path) as f:
     dag = json.load(f)
 
+from ai_sdlc_claudecode.verification import validate_modules
+validate_modules(dag)
 stages = dag['stages']
 stage_ids = set(stages.keys())
 errors = []
@@ -601,7 +598,7 @@ else:
         prompt = prompt.replace('{{' + key + '}}', value)
 
 prompt = prompt.replace('{{context_files}}', '(see project codebase)')
-prompt = prompt.replace('{{module_list}}', '(auto-detect from pom.xml)')
+prompt = prompt.replace('{{module_list}}', '(read declared module manifests and approved architecture)')
 prompt = prompt.replace('{{table_list}}', '(auto-detect from existing mappers)')
 prompt = prompt.replace('{{project_dir}}', os.environ.get('PROJECT_CODE_DIR', ''))
 
@@ -624,6 +621,11 @@ After the same blocker survives two attempts, narrow to a causal probe before re
 the full chain; record the new fact, remaining gap, next owner/action and rollback condition.
 Do not promote a stage success into product acceptance, deployment permission or a global rule.
 '''
+prompt += '\n## Module execution targets\n' + json.dumps(dict(
+    modules=dag.get('config', {}).get('modules', {}),
+    module_checks=stage.get('module_checks', {}),
+    selected_default_stack=os.environ.get('PIPELINE_TECH_STACK', dag.get('config', {}).get('tech_stack')),
+    profile=dag.get('config', {}).get('project_profile')), ensure_ascii=False, indent=2)
 completion = dag.get('config', {}).get('project_completion')
 if completion:
     prompt += '\n## Project intent and authoritative sources\n' + json.dumps(completion, ensure_ascii=False, indent=2)
@@ -701,38 +703,17 @@ PYEOF
 }
 
 # --- Run post-commands (Layer 1: objective hard gate) ---
-# Resolves {{compile}}, {{test}}, {{lint}} templates from TECH_CMD_* variables
+# Resolves project/module commands after the selected CLI stack is known.
 # Returns 0 if all pass (or no commands), 1 if any fail
 run_post_commands() {
     local stage_name="$1" feature_id="$2" stage_id="$3"
-    local templates tmpl resolved key var cmd_exit cmd_dir
-    templates=$(dag_get "$stage_name" post_commands) || return 1
-    local log_file="${output_dir}/post-commands.log"
-    : > "$log_file"
-    local all_pass=0
-    while IFS= read -r tmpl; do
-        [[ -n "$tmpl" ]] || continue
-        resolved="$tmpl"
-        if [[ "$tmpl" =~ ^\{\{([a-z_]+)\}\}$ ]]; then
-            key="${BASH_REMATCH[1]}"
-            var="TECH_CMD_${key}"
-            resolved="${!var:-}"
-            if [[ -z "$resolved" ]]; then
-                printf 'Missing configured command: %s\n' "$tmpl" >> "$log_file"
-                all_pass=1
-                continue
-            fi
-        fi
-        printf 'Command: %s\n' "$resolved" >> "$log_file"
-        cmd_exit=0
-        cmd_dir="${PROJECT_CODE_DIR:-$PROJECT_ROOT}"
-        (cd "$cmd_dir" && eval "$resolved") >> "$log_file" 2>&1 || cmd_exit=$?
-        printf 'Exit: %s\n' "$cmd_exit" >> "$log_file"
-        [[ $cmd_exit -eq 0 ]] || all_pass=1
-    done < <(python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])))' "$templates")
-    collect_evidence "$feature_id" "$stage_id" post_commands "$all_pass" "$log_file" || return 1
+    local log_file="${output_dir}/post-commands.log" code=0
+    python3 -m ai_sdlc_claudecode.verification --dag "$DAG_FILE" --stage "$stage_name" \
+        --project "${PROJECT_CODE_DIR:-$PROJECT_ROOT}" --log "$log_file" \
+        --report "${output_dir}/.attempts/${PIPELINE_ATTEMPT_ID}/module-checks.json" || code=$?
+    collect_evidence "$feature_id" "$stage_id" post_commands "$code" "$log_file" || return 1
     POST_CMD_ERROR_OUTPUT=$(tail -40 "$log_file")
-    return "$all_pass"
+    return "$code"
 }
 
 # Required checks collect their own exits; agent self-reports are not acceptance receipts.
@@ -765,9 +746,13 @@ verify_stage() {
     fi
     if [[ "$stage_id" == S4 || "$stage_id" == S4b || "$stage_id" == S4c ]]; then
         code=0
-        PROJECT_CODE_DIR="${PROJECT_CODE_DIR:-$PROJECT_ROOT}" PIPELINE_DAG_FILE="$DAG_FILE" \
-            bash "${SCRIPT_DIR}/lib/tdd-gate.sh" "$feature_id" "${PIPELINE_TECH_STACK:-node-typescript}" 80 \
-            > "${output_dir}/tdd.log" 2>&1 || code=$?
+        if [[ -f "${output_dir}/.attempts/${PIPELINE_ATTEMPT_ID}/module-checks.json" ]]; then
+            printf 'Module coverage checks executed by post_commands; see module-checks.json.\n' > "${output_dir}/tdd.log"
+        else
+            PROJECT_CODE_DIR="${PROJECT_CODE_DIR:-$PROJECT_ROOT}" PIPELINE_DAG_FILE="$DAG_FILE" \
+                bash "${SCRIPT_DIR}/lib/tdd-gate.sh" "$feature_id" "${PIPELINE_TECH_STACK:-node-typescript}" 80 \
+                > "${output_dir}/tdd.log" 2>&1 || code=$?
+        fi
         collect_evidence "$feature_id" "$stage_id" tdd "$code" "${output_dir}/tdd.log" || return 1
         [[ $code -eq 0 ]] || return 1
     fi

@@ -225,7 +225,7 @@ print(json.dumps({
 echo "${PREFIX} Tech stack: ${TECH_STACK}"
 
 # Look up coverage command
-COVERAGE_CMD=$(lookup_coverage_config "$TECH_STACK")
+COVERAGE_CMD=${PIPELINE_COVERAGE_COMMAND:-$(lookup_coverage_config "$TECH_STACK")}
 
 if [[ "$COVERAGE_CMD" == "ERROR:unknown_stack" ]]; then
     echo "${PREFIX} ERROR: Unknown tech stack '${TECH_STACK}'"
@@ -238,13 +238,31 @@ if [[ "$COVERAGE_CMD" == "ERROR:no_coverage_cmd" ]]; then
     exit 2
 fi
 
-COVERAGE_WORKDIR=$(lookup_coverage_config "$TECH_STACK" coverage_workdir)
+COVERAGE_WORKDIR=${PIPELINE_COVERAGE_WORKDIR-$(lookup_coverage_config "$TECH_STACK" coverage_workdir)}
 cd "${PROJECT_CODE_DIR:-$PWD}"
 if [[ -n "$COVERAGE_WORKDIR" ]]; then
     cd "$COVERAGE_WORKDIR"
 fi
 echo "${PREFIX} Working directory: $PWD"
 echo "${PREFIX} Running coverage: ${COVERAGE_CMD}"
+
+# A successful no-op must not reuse an older report as a new measurement.
+coverage_report_identity() {
+    python3 - "$TECH_STACK" <<'PY_FRESH'
+import hashlib, json, pathlib, sys
+names = {'java-maven':['target/site/jacoco/jacoco.csv','target/site/jacoco/jacoco.xml'],
+         'node-typescript':['coverage/coverage-summary.json'], 'golang':['coverage.out']}.get(sys.argv[1], [])
+result = {}
+for name in names:
+    p = pathlib.Path(name)
+    if p.is_file():
+        s = p.stat()
+        result[name] = [s.st_mtime_ns, s.st_ctime_ns, hashlib.sha256(p.read_bytes()).hexdigest()]
+        break  # Match the parser's CSV/XML priority; touching an unused report is insufficient.
+print(json.dumps(result, sort_keys=True))
+PY_FRESH
+}
+REPORT_BEFORE=$(coverage_report_identity)
 
 # Run the coverage command and capture output
 COV_OUTPUT=""
@@ -257,6 +275,11 @@ if [[ $COV_EXIT -ne 0 ]]; then
     echo "$COV_OUTPUT" | tail -20
     emit_json_result "0" "$THRESHOLD" "fail" "$TECH_STACK"
     exit "$COV_EXIT"
+fi
+
+if [[ "$TECH_STACK" != python && "$(coverage_report_identity)" == "$REPORT_BEFORE" ]]; then
+    echo "${PREFIX} ERROR: Coverage report was not refreshed by the command"
+    exit 2
 fi
 
 # Parse coverage based on tech stack
@@ -280,7 +303,7 @@ esac
 if [[ -z "$COVERAGE" ]]; then
     echo "${PREFIX} Coverage: UNKNOWN"
     echo "${PREFIX} Threshold: ${THRESHOLD}%"
-    echo "${PREFIX} Result: WARN (could not determine coverage, non-blocking)"
+    echo "${PREFIX} Result: UNVERIFIED (could not determine required coverage)"
     emit_json_result "0" "$THRESHOLD" "warn" "$TECH_STACK"
     exit 2
 fi

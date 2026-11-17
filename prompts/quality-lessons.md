@@ -1,3 +1,10 @@
+# Applicability
+
+Apply a lesson only when its trigger matches the approved requirements and selected
+module. Java/Spring, administrative CRUD, seed-data and export examples are the
+`java-admin-demo` project profile, not cross-language defaults. Preserve legitimate
+field conversions and use actual wire-contract checks rather than variable spelling.
+
 # Quality Lessons — Accumulated from Deployment Retrospectives
 
 > These lessons are injected into S3, S3b, and S5 prompts via `{{quality_lessons}}`.
@@ -17,16 +24,16 @@
 ## Lesson 2: Empty function bodies pass compilation but break delivery
 **Source**: SRM Platform (2026-03-26), 4 bugs (27% of total)
 **Problem**: `const openDetail = (row) => { // open detail drawer }` compiles and passes lint but does nothing at runtime.
-**Rule**: Every UI button/action MUST have a non-empty implementation. If the backend endpoint doesn't exist yet, DO NOT render the button. Scan for `=> { }` and `=> { //` patterns.
+**Rule**: Every UI button/action MUST have a non-empty implementation. If the backend endpoint doesn't exist yet, DO NOT render the button. Use the project's syntax-aware empty-body check and explicit callback exemptions.
 **Examples**:
 - 4 detail/view buttons with empty handlers → clicking did nothing
 - 3 export buttons calling non-existent backend endpoints → 500 errors
 - Dashboard showing hardcoded `Promise.resolve({ data: null })` → all zeros
 
-## Lesson 3: Seed data must cover every page and every status
+## Lesson 3: For an explicitly approved demo profile, seed data covers its declared scenarios
 **Source**: SRM Platform (2026-03-26), 3 bugs (20% of total)
 **Problem**: Pages loaded correctly but displayed empty because H2 had no matching data.
-**Rule**: SQL init scripts MUST insert ≥5 rows per table, with at least 1 row per status value. Status-filtered pages (audit review, blacklist, pending approval) are especially prone to this.
+**Rule (java-admin-demo only)**: If the approved demo requires seeded states, cover those named states with coherent fixtures. The earlier project used five rows per table; unrelated production schemas do not inherit that count.
 **Examples**:
 - Audit log page blank — no log entries in seed data
 - Supplier review page blank — no `under_review` status suppliers
@@ -41,10 +48,10 @@
 - Auto-generated supplier_code was NULL → NOT NULL column failed
 - Maven multi-module ran with stale classes → ClassNotFoundException
 
-## Lesson 5: CSV export is a universal requirement
+## Lesson 5: CSV export follows the approved product requirements
 **Source**: SRM Platform (2026-03-26)
 **Problem**: Every list page needs an export button, but none were generated.
-**Rule**: For every list page, generate both backend CSV export endpoint (HttpServletResponse + PrintWriter + UTF-8 BOM) and frontend download button. No external library needed.
+**Rule**: Only when the approved requirements include CSV export, implement the endpoint and download behavior using that module's framework. HttpServletResponse/PrintWriter apply to Java Servlet modules only. Do not add export to unrelated lists.
 
 ## Lesson 6: Dashboard data must be real
 **Source**: SRM Platform (2026-03-26)

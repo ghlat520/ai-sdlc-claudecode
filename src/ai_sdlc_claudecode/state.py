@@ -14,7 +14,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import acceptance, quality
+from . import acceptance, quality, verification
 
 
 @dataclass(frozen=True)
@@ -304,6 +304,7 @@ class PipelineState:
         dag_path = Path(dag_path).resolve()
         dag = json.loads(dag_path.read_text())
         acceptance.policy(dag)
+        verification.validate_modules(dag)
         ids = {s["id"] for s in dag["stages"].values()}
         if not scope or not set(scope) <= ids:
             raise ValueError("empty or unknown execution scope")
@@ -411,6 +412,9 @@ class PipelineState:
                                  sha256=_sha(snapshot), timestamp=_now(), run_id=run,
                                  attempt_id=attempt,
                                  artifact_sha256=_sha(output) if output.exists() else None))
+            modules = Path(record['archive']) / 'module-checks.json'
+            if check == 'post_commands' and modules.exists():
+                record['module_checks'] = json.loads(modules.read_text())
 
     def finish_attempt(self, run, stage, attempt, status, output=None, fix_ids=()):
         with locked_json(self.path) as data:
@@ -443,7 +447,7 @@ class PipelineState:
     @staticmethod
     def expected_checks(config, dag=None):
         checks = {"schema", "gate"}
-        if config.get("post_commands"):
+        if config.get("post_commands") or config.get('module_checks'):
             checks.add("post_commands")
         if config.get("review_passes"):
             checks.add("refinement")
@@ -480,6 +484,8 @@ class PipelineState:
             if record["authorization"]["sha256"] != _sha(dag_path):
                 return False
             if any(d["sha256"] != _sha(d["path"]) for d in record.get("dependencies", [])):
+                return False
+            if config.get('module_checks') and not verification.modules_current(record.get('module_checks', {})):
                 return False
             receipts = record["verification"]["evidence"]
             if not PipelineState.expected_checks(config, dag) <= {r["check"] for r in receipts}:

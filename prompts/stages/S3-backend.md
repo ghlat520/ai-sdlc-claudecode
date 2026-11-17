@@ -1,56 +1,32 @@
 # S3: Backend Development
 
-Implement the backend code for this feature.
+Implement the approved backend behavior in `{{project_dir}}` using the declared
+module paths and toolchain. Stage metadata belongs in `{{output_path}}`.
 
-## Project Directory (WRITE CODE HERE)
-{{project_dir}}
-
-**CRITICAL**: All generated code files MUST be written to `{{project_dir}}/`, NOT to the pipeline docs directory. The pipeline docs directory (`{{output_path}}`) is only for stage metadata (output.json).
-
-## Architecture
+## Architecture and contracts
 {{S2_output}}
 
-## PRD
+## Approved requirements and function map
 {{S1_output}}
 
-## Quality Lessons (from past deployments)
+## Applicable quality lessons
 {{quality_lessons}}
 
 ## Rules
-- Follow existing code patterns
-- Immutable objects only
-- Handle all errors explicitly
-- Max 800 lines per file
-
-## Completeness Rules (CRITICAL — these prevent delivery failures)
-
-### 1. Every CRUD must be FULLY implemented
-- List with pagination + keyword search + status filter
-- Create with validation
-- Update with validation
-- Delete (soft delete if applicable)
-- **Detail/getById endpoint** — NEVER omit this
-- **Export endpoint (CSV)** — Every list page MUST have an export API using HttpServletResponse + PrintWriter + UTF-8 BOM
-
-### 2. Seed Data (MANDATORY for demo-ready delivery)
-- Every table referenced by a list page MUST have ≥5 seed data rows in SQL init scripts
-- Status-filtered pages MUST have data in EACH status (e.g., pending, approved, rejected)
-- Relational data must be consistent (foreign keys must reference existing records)
-
-### 3. Dashboard/Statistics endpoints
-- If the PRD includes a dashboard, implement REAL aggregation queries (COUNT, SUM, GROUP BY)
-- NEVER use hardcoded demo data — always query from the database
-- Include: summary stats, trend data (last 6 months), top-N rankings, pending action counts
-
-### 4. AOP/Interceptor safety
-- Audit log aspects MUST handle nullable fields (entity_id can be null for some operations)
-- Auto-fill interceptors MUST not throw on missing fields
-- Test that the application can START and serve at least one GET request
-
-### 5. API Contract clarity
-- Every Controller method MUST have explicit `@RequestParam` or `@RequestBody` annotations
-- Response wrapper MUST be consistent: `{ code, message, data }` for single objects, `{ code, message, data: { records, total } }` for paginated lists
-- Field names in Entity MUST match what the frontend will consume — use `@JsonProperty` if needed
+- Read the owning call chain, existing implementations and declared module checks.
+- Implement the approved operations, validation, authorization and observable state changes.
+- Preserve API wire semantics, including explicit lawful field conversions. Internal names
+  do not have to match external names; actual serialized requests/responses must match S2.
+- Exercise failure, retry, concurrency and persistence where required by the function map.
+- Run the module's actual build, static checks and tests; report command failures directly.
+- Keep useful comments for business constraints, concurrency and protocols.
+- Implement exports, dashboard queries, pagination or demo data only when the approved
+  requirements call for them. Use language-specific conventions of the selected framework.
+- Java/Spring annotations and response writers apply only to an explicitly selected Java/Spring
+  module. They are not requirements for Python, Node, Go or other backends.
+- Do not substitute mock data in production paths. Tests and approved demo profiles may use
+  isolated fixtures with explicit scope. Production contracts remain independently tested.
 
 ## Output
-Write to: {{output_path}}/implementation.json
+Write implementation files to the declared module paths and metadata to
+`{{output_path}}/implementation.json` using the configured schema.
