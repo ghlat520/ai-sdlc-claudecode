@@ -289,9 +289,161 @@ tools, invalid input, parse failure or an unsupported source layout. A direct em
 argument may use exactly `/* completeness-allow-empty: specific reason */` inside its body.
 Exported empty implementations cannot use that exemption. Constructor parameter properties
 count as initialization. Zero JS/TS/Vue sources is explicitly not applicable to this rule.
-The retained TODO, API-path, seed and mock-data scans are legacy text heuristics; they do
-not prove cross-language correctness. Module-specific checks remain the T4/T5 work.
+The retained TODO, API-path, seed and mock-data scans are advisory text heuristics.
+Declared S2 rules and actual wire probes supply the hard contract checks; legitimate
+Promise operations and test fixtures are not rejected merely by those marker strings.
 
 The regression seam is the actual shell entrypoint and supervisor, plus an isolated HTTP
 create/replay API through S1 and final acceptance. The model is deterministic in these
 fixtures; their success demonstrates framework behavior, not autonomous product delivery.
+
+## Module checks, executable rules and terminal/mutation evidence (T4–T9)
+
+`config.modules` selects real execution targets. A stage's `module_checks` maps module
+IDs to a nonempty list of named commands. Example fragments:
+
+```json
+{
+  "config": {
+    "modules": {
+      "api": {
+        "path": "backend",
+        "tech_stack": "python",
+        "inputs": ["src", "pyproject.toml"],
+        "root_inputs": ["uv.lock"],
+        "artifacts": [],
+        "commands": {
+          "compile": "python3 -m compileall -q src",
+          "lint": "ruff check src",
+          "test": "python3 -m pytest",
+          "coverage": "python3 -m pytest --cov=src --cov-report=term"
+        },
+        "coverage_threshold": 80
+      }
+    }
+  },
+  "stages": {
+    "backend": {"module_checks": {"api": ["compile", "lint"]}},
+    "unit": {"module_checks": {"api": ["test", "coverage"]}}
+  }
+}
+```
+
+These are additions to the existing complete DAG, not a new DAG schema. Module paths
+and `root_inputs` are relative to the project; `inputs` and `artifacts` are relative to
+the module. Shared locks and configuration belong in `root_inputs`. A module command
+wins over `config.tech_stack_commands[module.tech_stack]`. A CLI `--tech-stack` selects
+the default for unscoped `{{compile}}`/`{{lint}}`/`{{test}}` commands at execution time;
+it does not overwrite an explicitly declared module stack. Module S4/S4b/S4c checks
+must include coverage, using the same cwd and stack. Projects may use their existing
+build/test/coverage tools through these command adapters.
+
+The collector records cwd, command, exit and duration, source/shared-input hashes and
+full artifact hashes. Generated caches and declared outputs do not count as source
+changes. Missing inputs/outputs, unsupported paths, unknown modules, empty commands,
+missing tools and failed commands block. Source, lock or artifact drift invalidates a
+previous pass. Coverage commands cannot reuse an unchanged old file report. This is
+local execution evidence; commands are trusted project configuration with the same
+filesystem authority as the supervisor.
+
+S2 may declare `contracts.quality_rules` (see `schemas/contracts-output.json`). Each
+rule has an ID, authoritative source, failure message and explicit input paths:
+
+```json
+{
+  "id": "ARCH-RENDERER-01", "kind": "imports", "language": "typescript",
+  "paths": ["frontend/src"], "exclude": ["frontend/src/tests/*"],
+  "forbidden": ["backend/*", "demo/*"],
+  "source": "approved architecture, renderer process boundary",
+  "message": "Production renderer uses the supported API"
+}
+```
+
+TypeScript/JavaScript/Vue script imports use the target's TypeScript parser. Relative
+paths and statically resolvable TS path aliases are compared with their resolved path
+as well as the literal import. Python uses AST imports, package-relative imports and
+statically resolvable `importlib.import_module` calls, including ordinary import aliases.
+For a Python `src/` layout declare `import_root: "src"`. Explicit test/demo exclusions
+apply before parsing. Unresolved dynamic calls in the supported import forms, parse
+errors, missing parsers and zero selected files remain unverified. This checks the
+supported static forms; arbitrary user-defined loaders, runtime monkey-patching and
+native dependencies need the project's own analyzer/build/runtime checks. Java rule
+adapters can continue using tools such as the project's existing dependency checks;
+this iteration does not claim a Java AST dependency analyzer.
+
+A `wire` rule references one S2 API endpoint with `{service, method, path}` and executes
+its `command` from the project root. That adapter must perform the actual serializer or
+HTTP request and emit `{method, path, status, request, response}`. The collector verifies
+the endpoint, successful status, required fields and primitive JSON types. Legitimate
+internal aliases are allowed. Semantic values, authorization, date formats and business
+invariants remain the adapter's actual assertions. A command failure or invalid probe
+output blocks. Selected rule source bytes are bound to the stage and rechecked on resume.
+The full-chain regression uses a real local HTTP probe, not a stored JSON response.
+
+Required terminal checks opt in through `project_acceptance.journeys`, keyed by existing
+required check IDs. Example: `"pc_web": {"target": "pc-web", "identity": {"browser":
+"chromium", "is_mobile": false}, "min_steps": 5, "max_metrics": {"create_elapsed_ms":
+2000}}`. Declare only budgets the project actually requires and can measure. The report's
+`journeys.pc_web` records that exact target and identity, run/attempt/candidate, actual
+`steps` with `action` and `status`, optional measured `metrics`, and `evidence` entries
+for `trace`, `screenshot`, `requests` and `data`. Each artifact is `{path, sha256}` beneath
+the current acceptance attempt archive. The supervisor supplies `PIPELINE_CANDIDATE_SHA256`
+with `PIPELINE_ACCEPTANCE_REPORT`; tools must retain these identities.
+
+Missing/zero/skipped steps, mismatched terminal/candidate/run, stale artifacts and missing
+or excessive declared metrics cannot pass. Trace bytes alone do not prove an adapter's
+business assertions or a device's identity: independently inspect the driver and raw
+results. PC Chromium and H5 Chromium viewport/touch emulation are verified reference
+paths here. Real WebViews, native mobile packages and Electron/native desktop targets
+remain project-specific integrations until actually exercised; one target cannot certify
+another.
+
+A stage may add bounded `mutation_checks`:
+
+```json
+{
+  "inputs": ["src", "tests", "run_assertions.py"], "mutable_inputs": ["src"],
+  "test_inputs": ["tests", "run_assertions.py"],
+  "command": "python3 run_assertions.py", "validate_command": "python3 -m compileall -q src",
+  "result_env": "MUTATION_RESULT", "result_file": "result.json",
+  "cases": ["reject_zero"], "timeout_seconds": 30,
+  "mutants": [{
+    "id": "ZERO-BOUNDARY", "critical": true, "classification": "non_equivalent",
+    "reason": "Zero quantity would become a valid request",
+    "changes": [{"path": "src/value.py", "old": "quantity <= 0", "new": "quantity < 0"}]
+  }]
+}
+```
+
+The assertion adapter is included in both copied inputs and frozen test inputs. It writes `{"checks": {"reject_zero": "passed"}}` to
+the path in `MUTATION_RESULT` and uses exit 0 for success or 1 for a real assertion failure.
+The original candidate must pass before mutation. Copies retain original test hashes;
+only explicitly mutable production paths can change. Path aliases cannot weaken that
+boundary. The source candidate and its tests remain unchanged. One to sixteen selected
+mutants run with a timeout of at most 120 seconds each; timed-out process groups are
+terminated. This bounded adapter can wrap existing PIT/other tooling, but no PIT
+integration is claimed without a real project run.
+
+Results distinguish `killed`, `survived`, `invalid_mutation`, `execution_error`, `timeout`
+and independently declared `equivalent_declared`. A valid build plus actual failed target
+assertions with exit 1 is required for `killed`; arbitrary nonzero exits are not kills.
+All confirmed non-equivalent critical mutants must be killed. Compile errors, tool crashes,
+missing/skipped cases, changed expectations and timeouts cannot satisfy that requirement.
+The stage stores the mutation report as a required receipt and rechecks the original
+source binding on resume.
+
+`tests/test_quality_delivery.py` provides the reproducible reference project and chain.
+It generates isolated Java, TypeScript and Python modules; uses actual JDK compilation,
+jar packaging, TypeScript compilation, HTTP/SQLite checks, deterministic operation sequences,
+critical production mutations, and real Chrome traces. Stage model output is a local
+fixture so no project content or credentials are sent to a model. Run just the full-chain
+slice with `python3 -m pytest tests/test_quality_delivery.py -k same_candidate_full -q`.
+Tests require local JDK tools, Python pytest/coverage, Node, the parser packages described
+above, `playwright-core` and an installed Chrome channel. Missing prerequisites fail
+visibly; they are not silently skipped or installed during a run.
+
+The T9 fixture receipt reports its fixed good/bad candidate matrix, required behavior
+coverage, drift/replay checks and five-metric data availability. It demonstrates the
+framework's declared paths. A real product/model outcome study additionally needs an
+approved project, frozen independent expectations, a stable observation window and model/
+tool budgets; no fixture result supplies defect reduction or savings percentages for it.
