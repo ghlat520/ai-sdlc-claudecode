@@ -796,7 +796,7 @@ print(json.dumps(result, indent=2))
     echo -e "  ${YELLOW}Checking model (${model}) connectivity...${NC}"
     local precheck_exit=0
     local precheck_output=""
-    precheck_output=$(invoke_review_model "$model" 'Reply with exactly: OK' "$output_json" gate-probe 30 2>&1) || precheck_exit=$?
+    precheck_output=$(invoke_review_model "$model" 'Reply with exactly: OK' "$output_json" gate-probe 90 2>&1) || precheck_exit=$?
 
     if [[ $precheck_exit -ne 0 || "$precheck_output" != OK ]]; then
         echo -e "  ${RED}Model '${model}' is not reachable (exit: ${precheck_exit})${NC}"
