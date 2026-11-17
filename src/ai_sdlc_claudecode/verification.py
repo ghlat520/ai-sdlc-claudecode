@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -19,6 +20,139 @@ from .acceptance import _names, fingerprint
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[2]
+
+
+def run_bounded(command_text, directory, timeout, env=None, stream=None):
+    process = subprocess.Popen(command_text, cwd=directory, shell=True, executable='/bin/bash',
+        env=env, stdout=stream if stream is not None else subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try: os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError: pass  # It exited between timeout and group termination.
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command_text, process.returncode, output)
+
+
+def validate_mutations(config):
+    if (not isinstance(config, dict) or set(config) - {'inputs', 'mutable_inputs', 'test_inputs', 'command', 'validate_command', 'result_file', 'result_env', 'cases', 'mutants', 'timeout_seconds'}):
+        raise ValueError('Invalid mutation configuration')
+    _names(config.get('inputs'), 'mutation.inputs'); _names(config.get('cases'), 'mutation.cases')
+    _names(config.get('mutable_inputs'), 'mutation.mutable_inputs'); _names(config.get('test_inputs'), 'mutation.test_inputs')
+    for name in [*config['inputs'], *config['mutable_inputs'], *config['test_inputs']]:
+        relative(name)
+    relative(config.get('result_file'))
+    for name in ('command', 'validate_command', 'result_env'):
+        if not isinstance(config.get(name), str) or not config[name].strip():
+            raise ValueError(f'Mutation testing requires {name}')
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]*', config['result_env']) or config['result_env'] in ('HOME', 'PATH', 'PYTHONPATH', 'CODEX_HOME'):
+        raise ValueError('Invalid mutation result environment variable')
+    if type(config.get('timeout_seconds')) not in (int, float) or not 0 < config['timeout_seconds'] <= 120:
+        raise ValueError('Mutation timeout must be positive and at most 120 seconds')
+    mutants = config.get('mutants')
+    if not isinstance(mutants, list) or not 1 <= len(mutants) <= 16:
+        raise ValueError('Declare one to sixteen bounded mutants')
+    _names([m.get('id') for m in mutants], 'mutation IDs')
+    for mutant in mutants:
+        if type(mutant.get('critical')) is not bool or not isinstance(mutant.get('reason'), str) or not mutant['reason'].strip():
+            raise ValueError('Mutation requires critical flag and independently reviewable non-equivalence reason')
+        if mutant.get('classification', 'non_equivalent') not in ('non_equivalent', 'equivalent'):
+            raise ValueError('Unknown mutation equivalence classification')
+        if mutant.get('classification') == 'equivalent' and mutant['critical']:
+            raise ValueError('Critical mutants must be confirmed non-equivalent')
+        changes = mutant.get('changes')
+        if not isinstance(changes, list) or not changes:
+            raise ValueError('Mutation requires changes')
+        for change in changes:
+            relative(change.get('path'))
+            path = Path(change['path']).as_posix()
+            matches = lambda selected: any(path == Path(name).as_posix() or path.startswith(Path(name).as_posix().rstrip('/') + '/') for name in selected)
+            if not matches(config['mutable_inputs']) or matches(config['test_inputs']):
+                raise ValueError('Mutations may change only declared production inputs; tests/expectations are frozen')
+            if any(not isinstance(change.get(k), str) or not change[k] for k in ('old', 'new')):
+                raise ValueError('Mutation replacements must be nonempty strings')
+
+
+def run_mutations(config, project, archive):
+    """A nonzero command is a kill only when valid target assertions actually fail."""
+    validate_mutations(config)
+    archive = Path(archive).resolve(); root = Path(project).resolve(strict=True)
+    before = fingerprint(root, config['inputs'])
+    frozen = fingerprint(root, config['test_inputs'])
+    original = dict(project_dir=str(root), paths=config['inputs'], manifest=before)
+    for name in config['inputs']:
+        source = inside(root, name)
+        if source.is_dir() and source in archive.resolve().parents:
+            raise ValueError('Mutation archive must be outside its selected input directories')
+
+    def execute_copy(name, changes):
+        directory = archive / name
+        directory.mkdir(parents=True, exist_ok=False)
+        for input_name in config['inputs']:
+            source = inside(root, input_name); destination = directory / input_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, destination, ignore=shutil.ignore_patterns('node_modules', '.git', '.artifacts', '__pycache__', '*.pyc'))
+            else: shutil.copy2(source, destination)
+        for change in changes:
+            destination = inside(directory, change['path']); text = destination.read_text()
+            if text.count(change['old']) != 1:
+                return dict(status='invalid_mutation', reason='Replacement does not match exactly once')
+            destination.write_text(text.replace(change['old'], change['new'], 1))
+        result_file = directory / config['result_file']
+        if fingerprint(directory, config['test_inputs']) != frozen:
+            return dict(status='invalid_mutation', reason='Frozen tests/expectations changed')
+        result_file.unlink(missing_ok=True)
+        env = dict(os.environ, **{config['result_env']: str(result_file)})
+        for phase, value in [('validation', config['validate_command']), ('assertions', config['command'])]:
+            log = archive / (name + '-' + phase + '.log')
+            try:
+                with log.open('w') as stream:
+                    command_result = run_bounded(value, directory, config['timeout_seconds'], env, stream)
+            except subprocess.TimeoutExpired:
+                return dict(status='timeout', phase=phase, log=str(log))
+            code = command_result.returncode
+            if fingerprint(directory, config['test_inputs']) != frozen:
+                return dict(status='execution_error', reason='Frozen tests/expectations changed', log=str(log))
+            if phase == 'validation':
+                if code: return dict(status='invalid_mutation', log=str(log), exit_code=code)
+                continue
+            try:
+                from .acceptance import _unique_object
+                observed = json.loads(result_file.read_text(), object_pairs_hook=_unique_object)['checks']
+                if (not isinstance(observed, dict) or not set(config['cases']) <= set(observed)
+                        or any(s not in ('passed', 'failed') for s in observed.values())):
+                    raise ValueError('Missing, skipped or erroneous mutation assertions')
+                failed = any(observed[name] == 'failed' for name in config['cases'])
+                if code not in (0, 1):
+                    raise ValueError('Only an assertion-failure exit (1) can kill a mutation')
+                if (code == 0) == failed:
+                    raise ValueError('Assertion status and command exit disagree')
+                return dict(status='killed' if failed else 'survived', checks=observed,
+                            exit_code=code, result_path=str(result_file), log=str(log))
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                return dict(status='execution_error', reason=str(exc), exit_code=code, log=str(log))
+
+    baseline = execute_copy('baseline', [])
+    result = dict(run_id=os.environ.get('PIPELINE_RUN_ID'), attempt_id=os.environ.get('PIPELINE_ATTEMPT_ID'),
+                  source_binding=original, baseline=baseline, mutants=[], status='failed')
+    if baseline['status'] == 'survived':
+        for index, mutant in enumerate(config['mutants']):
+            if mutant.get('classification') == 'equivalent':
+                observed = dict(status='equivalent_declared', reason=mutant['reason'])
+            else:
+                observed = execute_copy(f'mutant-{index}', mutant['changes'])
+            result['mutants'].append(dict(id=mutant['id'], critical=mutant['critical'], **observed))
+        result['status'] = 'passed' if all(
+            m['status'] == 'killed' if m['critical'] else m['status'] in ('killed', 'survived', 'equivalent_declared')
+            for m in result['mutants']) else 'failed'
+    else:
+        result['reason'] = 'Original candidate did not pass its assertions; mutation evidence unavailable'
+    if fingerprint(root, config['inputs']) != before:
+        result.update(status='failed', reason='Original candidate changed during mutation testing')
+    return result
 
 
 def validate_journey(observed, expected, binding):
@@ -59,20 +193,6 @@ def validate_journey(observed, expected, binding):
     return observed
 
 
-def run_bounded(command_text, directory, timeout, env=None, stream=None):
-    process = subprocess.Popen(command_text, cwd=directory, shell=True, executable='/bin/bash',
-        env=env, stdout=stream if stream is not None else subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, start_new_session=True)
-    try:
-        output, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try: os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError: pass  # It exited between timeout and group termination.
-        process.communicate()
-        raise
-    return subprocess.CompletedProcess(command_text, process.returncode, output)
-
-
 def command(dag, name, stack, overrides=None):
     values = {**dag.get('config', {}).get('tech_stack_commands', {}).get(stack, {}), **(overrides or {})}
     value = values.get(name)
@@ -103,6 +223,8 @@ def validate_modules(dag):
         if type(threshold) not in (int, float) or not 0 <= threshold <= 100:
             raise ValueError('Invalid module coverage threshold')
     for stage in dag['stages'].values():
+        if stage.get('mutation_checks') is not None:
+            validate_mutations(stage['mutation_checks'])
         checks = stage.get('module_checks')
         if checks is None:
             continue
@@ -236,6 +358,12 @@ def execute(dag, stage, project, log, report, stack=None):
             failure = failure or receipt['exit_code']
     if binding['modules']:
         Path(report).write_text(json.dumps(binding, indent=2))
+    if stage.get('mutation_checks') is not None:
+        result = run_mutations(stage['mutation_checks'], root, Path(report).parent / 'mutation-work')
+        Path(report).with_name('mutations.json').write_text(json.dumps(result, indent=2))
+        with Path(log).open('a') as stream:
+            stream.write('Mutation results: ' + json.dumps(result) + '\n')
+        if result['status'] != 'passed': failure = 1
     return failure
 
 

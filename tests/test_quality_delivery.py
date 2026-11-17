@@ -473,3 +473,63 @@ def test_real_pc_and_h5_journeys_bind_artifacts(browser_project):
         else: altered['evidence']['data']['sha256'] = 'old'
         with pytest.raises((ValueError, OSError)):
             validate_journey(altered, {'target':'pc-web','identity':{'browser':'chromium'},'min_steps':5}, binding)
+
+
+def mutation_configuration():
+    return {'inputs':['backend/server.py','api_checks.py'], 'mutable_inputs':['backend/server.py'], 'test_inputs':['api_checks.py'], 'command':'python3 api_checks.py',
+        'validate_command':'''python3 -c "compile(open('backend/server.py').read(), 'backend/server.py', 'exec')"''',
+        'result_file':'actual-mutation.json','result_env':'API_RESULTS',
+        'cases':['unauthorized','invalid','create_replay','conflict','concurrent','response_lost_retry','timeout_retry','sequence','persistence'],
+        'timeout_seconds':20, 'mutants':[
+            {'id':'AUTH-REMOVED','critical':True,'reason':'Unauthenticated writes become possible', 'changes':[
+                {'path':'backend/server.py','old':"        if self.path != '/items': self.reply(404, {}); return\n        if self.headers.get('Cookie', '').removeprefix('session=') not in self.server.sessions:\n            self.reply(401, {'error':'authentication required'}); return\n        if (",
+                 'new':"        if self.path != '/items': self.reply(404, {}); return\n        if False:\n            self.reply(401, {'error':'authentication required'}); return\n        if ("}]},
+            {'id':'INVALID-BOUNDARY','critical':True,'reason':'Zero quantity becomes accepted','changes':[
+                {'path':'backend/server.py','old':"body['quantity'] <= 0",'new':"body['quantity'] < 0"}]},
+            {'id':'IDEMPOTENCY-REMOVED','critical':True,'reason':'Replaying the same request creates extra rows','changes':[
+                {'path':'backend/server.py','old':'request_id TEXT UNIQUE','new':'request_id TEXT'},
+                {'path':'backend/server.py','old':'WHERE request_id=?', 'new':'WHERE request_id=? AND 0'}]},
+            {'id':'LOST-WRITE','critical':True,'reason':'HTTP claims a result that never persists','changes':[
+                {'path':'backend/server.py','old':'            db.commit()','new':'            db.rollback()'}]},
+        ]}
+
+
+def test_key_business_mutants_are_killed_by_actual_assertions(pilot_project):
+    from ai_sdlc_claudecode.verification import run_mutations
+    archive = pilot_project/'.artifacts/mutations'; archive.mkdir(parents=True)
+    config = mutation_configuration()
+    result = run_mutations(config,pilot_project,archive)
+    assert result['baseline']['status'] == 'survived', result
+    assert result['status'] == 'passed', result
+    assert {m['id']:m['status'] for m in result['mutants']} == {
+        'AUTH-REMOVED':'killed','INVALID-BOUNDARY':'killed','IDEMPOTENCY-REMOVED':'killed','LOST-WRITE':'killed'}
+
+
+@pytest.mark.parametrize('replacement,expected', [('return 7','survived'),('return (','invalid_mutation'),
+                                                ('raise RuntimeError("tool failure")','execution_error'),
+                                                ('__import__("time").sleep(3); return 7','timeout')])
+def test_mutation_tool_failures_do_not_count_as_kills(tmp_path,replacement,expected):
+    from ai_sdlc_claudecode.verification import run_mutations
+    (tmp_path/'value.py').write_text('def value():\n    return 7\n')
+    (tmp_path/'check.py').write_text('''import json,os
+from pathlib import Path
+from value import value
+ok = value() == 7
+Path(os.environ['MUTATION_RESULT']).write_text(json.dumps({'checks':{'value':'passed' if ok else 'failed'}}))
+raise SystemExit(0 if ok else 1)
+''')
+    config = {'inputs':['value.py','check.py'],'mutable_inputs':['value.py'],'test_inputs':['check.py'],'command':'python3 check.py',
+        'validate_command':'''python3 -c "compile(open('value.py').read(),'value.py','exec')"''',
+        'result_file':'result.json','result_env':'MUTATION_RESULT','cases':['value'],'timeout_seconds':1,
+        'mutants':[{'id':'one','critical':True,'reason':'Deliberate control for classifier',
+                    'changes':[{'path':'value.py','old':'return 7','new':replacement}]}]}
+    result = run_mutations(config,tmp_path,tmp_path/'.artifacts')
+    assert result['mutants'][0]['status'] == expected
+    assert result['status'] == 'failed'
+    if expected=='survived':
+        config['mutants'][0]['changes']=[{'path':'check.py','old':'value() == 7','new':'value() == 8'}]
+        with pytest.raises(ValueError,match='tests/expectations are frozen'):
+            run_mutations(config,tmp_path,tmp_path/'.artifacts/frozen')
+        config.update(mutable_inputs=['value.py','check.py'],test_inputs=['./check.py'])
+        with pytest.raises(ValueError,match='tests/expectations are frozen'):
+            run_mutations(config,tmp_path,tmp_path/'.artifacts/alias')

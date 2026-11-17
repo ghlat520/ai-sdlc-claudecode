@@ -419,6 +419,8 @@ class PipelineState:
                 report = json.loads(source.read_text())
                 if report.get('source_binding'):
                     record['contract_source'] = report['source_binding']
+            if check == 'mutations':
+                record['mutation_checks'] = json.loads(source.read_text())
 
     def finish_attempt(self, run, stage, attempt, status, output=None, fix_ids=()):
         with locked_json(self.path) as data:
@@ -453,6 +455,8 @@ class PipelineState:
         checks = {"schema", "gate"}
         if config.get("post_commands") or config.get('module_checks'):
             checks.add("post_commands")
+        if config.get('mutation_checks'):
+            checks.update(('post_commands', 'mutations'))
         if config.get("review_passes"):
             checks.add("refinement")
         if config["id"] in ("S2", "S3", "S3b"):
@@ -493,6 +497,13 @@ class PipelineState:
                 return False
             if record.get('contract_source'):
                 source = record['contract_source']
+                if acceptance.fingerprint(source['project_dir'], source['paths']) != source['manifest']:
+                    return False
+            if config.get('mutation_checks'):
+                mutation = record.get('mutation_checks', {})
+                if mutation.get('status') != 'passed' or mutation.get('attempt_id') != record['attempt_id']:
+                    return False
+                source = mutation['source_binding']
                 if acceptance.fingerprint(source['project_dir'], source['paths']) != source['manifest']:
                     return False
             receipts = record["verification"]["evidence"]

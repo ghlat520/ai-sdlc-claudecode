@@ -713,6 +713,10 @@ run_post_commands() {
         --report "${output_dir}/.attempts/${PIPELINE_ATTEMPT_ID}/module-checks.json" || code=$?
     collect_evidence "$feature_id" "$stage_id" post_commands "$code" "$log_file" || return 1
     POST_CMD_ERROR_OUTPUT=$(tail -40 "$log_file")
+    local mutations="${output_dir}/.attempts/${PIPELINE_ATTEMPT_ID}/mutations.json"
+    if [[ -f "$mutations" ]]; then
+        collect_evidence "$feature_id" "$stage_id" mutations "$code" "$mutations" || return 1
+    fi
     return "$code"
 }
 
