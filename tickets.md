@@ -6,6 +6,9 @@
 
 **当前状态：S20 真实调用和红灯复现完成，按计划暂停；暂停后发现资料引用超出 39 文件清单，已设置 execution hold，未恢复／未修复，整张任务卡 not_passed。用户授权及本轮不设费用门槛的决定继续如实保留。**
 
+**一致性修正：2026-11-18 已在 context-v2 新配置完成本地验证；旧实跑结果保持不变。
+本轮新增模型调用为 0，后续真实修复仍需按新配置取证。**
+
 ## 交付行为与成功边界
 
 让正式流水线在 AI Market 的冻结副本中，自主读取资料、复现测试账号碰撞、
@@ -191,4 +194,14 @@ Skill、Hook、AGENTS 修改均需各自授权。本卡没有授予这些动作�
 当前七个报告入口对暂停任务均为 `paused / incomplete`；产品复验未启动，S22／S23
 未执行，原产品文件、旧冻结候选及本次候选均未发生字节变化。详见
 [首轮真实试点回执](.artifacts/pilots/20261117-ai-market-test-isolation/pilot-run-result.json)。
-下一步先使任务卡引用、实际提示词和授权清单一致，再定义新的可验证执行快照；保留本轮反例。
+上述引用缺口已在新配置本地修正。协调者使用本文件查阅完整历史；模型只使用新副本的
+[模型任务卡](.artifacts/pilots/20261118-ai-market-test-isolation-context-v2/candidate/pilot/task.md)，
+其中保留 A1—A8、两文件修改范围及所有停止条件，九个直接来源链接均在原 39 文件清单内。
+它不要求读取本文件的历史链接；不得再次把项目级文档整份复制成模型任务卡。
+
+新入口在启动前核对模型卡／阶段模板／清单，在真正发送给 Codex 前校验最终 stdin，
+在阶段返回后校验 `source_refs`。产品 S9 读取产品状态并绑定当前 run/attempt；来源违规
+设置 hold，后续重试不能继续调用模型，且不会继续执行该阶段的业务检查。
+新配置继承首次实跑的 1 次调用与 538.40 秒累计耗时；本次本地修正未新增模型调用。
+这证明输入引用一致性检查通过，不代表操作系统读取隔离或完整自治试点已通过。
+修正回执见 [context-correction-validation.json](.artifacts/pilots/20261118-ai-market-test-isolation-context-v2/context-correction-validation.json)。

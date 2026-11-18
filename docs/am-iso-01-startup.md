@@ -8,10 +8,13 @@
 首次实际启动被宿主自动审批拒绝后，用户明确回复“授权上述文件、目的地及限定试点执行”。
 现已落实 39 文件／外部服务／限定修复授权。S20 已实际执行并完成红灯复现，随后按计划暂停；
 暂停后范围审计发现 9 个清单外引用路径，已设置执行 hold，整张任务卡 `not_passed`。
+该缺口已在新建的 context-v2 配置中完成本地修正；本次没有新增外部模型调用。
+旧 run 及其失败结论保持不变，后续真实修复须使用新版配置重新取证。
 
 ## 本地启动配置
 
-准备包位于 [ai-market-test-isolation](../.artifacts/pilots/20261117-ai-market-test-isolation/)。
+当前准备包位于 [context-v2](../.artifacts/pilots/20261118-ai-market-test-isolation-context-v2/)。
+上一轮保留在 [ai-market-test-isolation](../.artifacts/pilots/20261117-ai-market-test-isolation/)。
 配置使用本机绝对路径，移动目录或更换工具后必须重新核验与绑定，不能直接复用旧授权。
 
 | 对象 | 固定内容／证据 |
@@ -31,8 +34,8 @@
 在仓库根目录可执行以下无模型调用的检查：
 
 ```sh
-python3 .artifacts/pilots/20261117-ai-market-test-isolation/candidate/pilot/launch.py inspect
-python3 .artifacts/pilots/20261117-ai-market-test-isolation/candidate/pilot/launch.py dry-run
+python3 .artifacts/pilots/20261118-ai-market-test-isolation-context-v2/candidate/pilot/launch.py inspect
+python3 .artifacts/pilots/20261118-ai-market-test-isolation-context-v2/candidate/pilot/launch.py dry-run
 ```
 
 获准后的入口是同一程序的 `start`／`resume`。模型、文件外发／目的地与限定修复的
@@ -46,25 +49,42 @@ python3 .artifacts/pilots/20261117-ai-market-test-isolation/candidate/pilot/laun
 
 | 授权项 | 已知事实／拟定值 | 仍需明确的边界 |
 | --- | --- | --- |
-| 调用方 | 本机原生 Codex CLI 0.169.0，工具路径、解析后路径及摘要已记录 | 更换二进制、依赖或配置需重新核验 |
+| 调用方 | 修正版重新核验 Codex CLI 0.169.1（首轮为 0.169.0），路径及新摘要均已绑定；实际配置读取通过 | 更换二进制、依赖或配置需重新核验 |
 | 模型 | 用户明确授权并实际请求 `gpt-6.1-sol`、`max`；S20 真实会话完成，模型调用退出 0 | 服务回执未单独报告 `actual_model` 标识，不能把请求参数说成独立服务端身份验证 |
 | 身份来源 | 当前本机登录类型为 ChatGPT；不复制登录令牌，子进程去除继承的 API key／自定义 endpoint 环境变量 | 仅核对登录类型；凭证内容不写入授权清单 |
 | 逻辑提供方与目的地 | 按当前登录方式和无自定义 provider 的配置使用 ChatGPT/Codex 路线；已完成一次真实模型会话 | 实际网络目的地／代理上游未抓取，预期地址不能作为独立的实际出站证明 |
-| 拟读取源文件 | [model-context.json](../.artifacts/pilots/20261117-ai-market-test-isolation/model-context.json) 逐项列出 39 个文件、字节数及 SHA-256；包含相关 Python 源码、原测试、严格验收、U06 合同和试点接入资料 | 这是工作流允许范围，不是操作系统文件读取白名单 |
+| 拟读取源文件 | [model-context.json](../.artifacts/pilots/20261118-ai-market-test-isolation-context-v2/model-context.json) 逐项列出 39 个文件、字节数及 SHA-256；相对路径集合与原授权完全相同，模型卡和接入控制更新后重新取摘要 | 这是工作流允许范围，不是操作系统文件读取白名单 |
 | 自动上下文 | 两份现有 AGENTS 指令的路径和摘要已记录；原信任设置、审批与 hooks 保留 | 原生系统／工具元数据和 hooks 仍可能提供上下文，不能声称总载荷只有这 39 个文件 |
 | 工具与扩展 | 仅在本次调用中关闭 7 个配置 MCP、13 个配置插件、自动记忆与嵌套 agent；实际 CLI 读取显示 7 MCP 全部禁用，插件附加 MCP 消失 | 不改全局配置；新增配置来源或工具必须重新审阅 |
 | 运行证据 | 只允许本试点的阶段元数据、命令摘要及经脱敏审阅的证据 | 排除私钥、凭证、运行数据库、原始会话、客户／生产数据和无关仓库 |
 | 扫描 | 三种高置信度凭证模式在拟读取范围中无命中 | 模式扫描不证明不存在所有敏感内容 |
 | 费用 | 用户明确“费用边界先不要考虑”；已移除本地费用授权门槛；保留 60 分钟、8 次调用、2 轮修复限制 | 本轮不声称设置美元硬上限，实际返回的用量／费用仍如实记录 |
 
-授权记录见 [authorization.json](../.artifacts/pilots/20261117-ai-market-test-isolation/authorization.json)，
-模型和外发的真实用户授权已记录；当前执行状态为 `execution_hold_source_scope_mismatch`，
-原因是暂停后的实际来源审计与 39 文件清单不一致，并非撤销用户授权。
+新版授权记录见 [authorization.json](../.artifacts/pilots/20261118-ai-market-test-isolation-context-v2/authorization.json)。
+用户已批准的模型、目的地、39 个相对项目路径及取消费用门槛决定继续沿用，修正版绑定新摘要；
+旧包仍保持 `execution_hold_source_scope_mismatch`，不通过改写旧回执消除反例。
 `fee_enforcement.status=not_required_by_user`。旧框架只有数字费用比较器，试点配置使用
 最大有限数表示本轮无实际金额上限，保留原框架源码和真实耗用记录。
 具体文件／目的地已经确认；通过宿主审批后按当前启动包摘要执行，不再因费用门槛停留。
 
 ## 本地验证与结论边界
+
+本次一致性修正的回执为
+[context-correction-validation.json](../.artifacts/pilots/20261118-ai-market-test-isolation-context-v2/context-correction-validation.json)。
+已验证：28 项回归；原冻结 Bash 提示词生成函数的六阶段真实渲染；上一轮九个额外来源
+及七种显式／裸路径反例拒绝；任务／产品状态路由、错误 attempt、来源违规 hold；
+实际发送边界转发的字节与已检查字节相同。后两类使用隔离的合成状态和传输 spy，
+没有向外部模型发送请求，不算产品验收或自治交付证据。两份正式 dry-run 均退出 0。
+
+模型卡只含已批准来源。DAG 不再要求追读清单外历史引用；发送入口在接收到监督器
+最终 stdin 后先验证，再转发。阶段来源违规会设置执行 hold；来源检查与业务检查
+通过 `&&` 连接，来源不合格不会继续执行该阶段业务检查。返回来源检查使用规范路径；
+裸文件式的含糊标识也会保守拒绝。该词法检查不解释任意自然语言、代码或工具命令，
+也不拦截模型运行中的文件读取，仍不能声称提供操作系统级隔离。
+
+后续试点使用新 feature，从 discovery 开始；原无效范围的 S20 不冒充新版已通过阶段。
+新账本继承原 1 次调用与 538.40 秒耗时，不重置 8 次调用／60 分钟累计上限。
+以下表格为旧准备包历史检查，不能替代新配置的真实模型运行。
 
 | 验证 | 实测结果 | 可以证明的范围 |
 | --- | --- | --- |
@@ -98,8 +118,8 @@ python3 .artifacts/pilots/20261117-ai-market-test-isolation/candidate/pilot/laun
 
 已验证事实是配置解析、基线复现和拒绝路径。推断是这份冻结准备包可为后续有诊断上下文的
 自治修复提供起点；真实模型运行与 A1—A8 必须按新回执核验，不能复用准备结果冒充。
-用户授权已补充，费用已移出启动条件。实跑识别出的当前约束是任务引用、实际提示词与
-输入清单没有保持一致；下一步先修正这三者，再定义新的可验证执行快照，保留本轮失败样本。
+用户授权已补充，费用已移出启动条件。实跑发现的输入一致性缺口已由新版配置和本地回归控制；
+当前尚缺修正版的真实模型运行及完整 A1—A8 证据，不能从本地检查推断自治修复成功。
 
 若启动输入摘要、实际配置、工具身份或基线发生变化，撤回“该准备包仍适用”的结论并重新核验；
 若修复要求修改业务逻辑、严格验收预期或允许范围外的文件，停止并重新界定任务。
