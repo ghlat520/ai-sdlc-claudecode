@@ -5,6 +5,7 @@ not process isolation or an authorization service.
 """
 
 import argparse
+from contextlib import suppress
 import hashlib
 import json
 import math
@@ -16,7 +17,7 @@ import signal
 import subprocess
 import time
 
-from .acceptance import _names, fingerprint
+from .acceptance import REVIEW_COMMAND, REVIEW_REPORT, _names, fingerprint
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[2]
@@ -28,9 +29,13 @@ def run_bounded(command_text, directory, timeout, env=None, stream=None):
         stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
         output, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try: os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError: pass  # It exited between timeout and group termination.
+    except BaseException:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        with suppress(subprocess.TimeoutExpired):
+            process.communicate(timeout=2)
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
         raise
     return subprocess.CompletedProcess(command_text, process.returncode, output)
@@ -301,6 +306,8 @@ def execute(dag, stage, project, log, report, stack=None):
         raise ValueError('Project directory must exist')
     binding = dict(project_dir=str(root), run_id=os.environ.get('PIPELINE_RUN_ID'),
                    attempt_id=os.environ.get('PIPELINE_ATTEMPT_ID'), modules={})
+    acceptance = dag.get('config', {}).get('project_acceptance') or {}
+    review = acceptance.get('independent_review') if stage.get('id') == acceptance.get('stage_id') else None
     failure = 0
 
     def run(value, directory, stream, env=None):
@@ -354,7 +361,21 @@ def execute(dag, stage, project, log, report, stack=None):
                 raise ValueError('Empty post command is not a check')
             match = re.fullmatch(r'\{\{([a-z_]+)\}\}', template)
             value = command(dag, match[1], selected) if match else template
+            if review and value.strip() == review['command'].strip():
+                raise ValueError('Independent review requires a distinct executable command')
             receipt = run(value, root, stream)
+            failure = failure or receipt['exit_code']
+        if review:
+            report_path = Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']).with_name(REVIEW_REPORT)
+            command_path = report_path.with_name(REVIEW_COMMAND)
+            report_path.unlink(missing_ok=True)
+            command_path.unlink(missing_ok=True)
+            env = dict(os.environ, PIPELINE_ACCEPTANCE_REPORT=str(report_path))
+            receipt = run(review['command'], root, stream, env)
+            receipt.update(run_id=binding['run_id'], attempt_id=binding['attempt_id'],
+                           candidate_sha256=os.environ['PIPELINE_CANDIDATE_SHA256'])
+            with command_path.open('x', encoding='utf-8') as command_file:
+                json.dump(receipt, command_file, indent=2)
             failure = failure or receipt['exit_code']
     if binding['modules']:
         Path(report).write_text(json.dumps(binding, indent=2))
@@ -386,5 +407,12 @@ def main():
     raise SystemExit(0 if result == 0 else 1)
 
 
+def _exit_on_signal(signum, _frame):
+    signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGINT, signal.SIGTERM))
+    raise SystemExit(128 + signum)
+
+
 if __name__ == '__main__':
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, _exit_on_signal)
     main()

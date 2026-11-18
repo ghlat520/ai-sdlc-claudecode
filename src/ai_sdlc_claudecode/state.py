@@ -291,7 +291,7 @@ class PipelineState:
             raise ValueError("feature_id must be a simple identifier")
         dag_path = Path(dag_path).resolve()
         dag = json.loads(dag_path.read_text())
-        acceptance.policy(dag)
+        definition = acceptance.policy(dag)
         verification.validate_modules(dag)
         ids = {s["id"] for s in dag["stages"].values()}
         if not scope or not set(scope) <= ids:
@@ -312,8 +312,12 @@ class PipelineState:
                     raise ValueError("feature already has a live execution owner")
             data.setdefault("stages", {})
             data.setdefault("cost", {})
+            review_policy = data.get('independent_review_policy_sha256')
+            if review_policy and (not definition or acceptance.digest(definition) != review_policy):
+                raise ValueError('Cannot change required independent review in this task')
+            if definition and 'independent_review' in definition:
+                data['independent_review_policy_sha256'] = acceptance.digest(definition)
             if data.get('function_map_contract'):
-                definition = acceptance.policy(dag)
                 if not definition or not definition.get('function_map'):
                     raise ValueError('Cannot remove a frozen function-map obligation from this task')
                 if definition['required_checks'] != data['function_map_contract']['contract']['required_checks']:

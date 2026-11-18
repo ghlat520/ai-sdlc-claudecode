@@ -121,6 +121,42 @@ contract change; preserve unresolved obligations when migrating it.
 
 ## One current verdict
 
+### Required independent verification
+
+Important project scopes can add `independent_review` inside `config.project_acceptance`.
+The supervisor runs the configured command in a separate process after the stage's
+ordinary post-commands, using the same project directory and candidate digest. It
+keeps a separate command receipt and review report in the current attempt archive.
+
+```json
+{
+  "independent_review": {
+    "command": "python3 scripts/review_orders.py",
+    "checks": ["orders"]
+  }
+}
+```
+
+Pick the must-pass check groups from `required_checks` and include the review
+adapter and its inputs in `candidate_inputs`. The review command must differ from
+the primary post-commands. It reads `PIPELINE_RUN_ID`, `PIPELINE_ATTEMPT_ID`, and
+`PIPELINE_CANDIDATE_SHA256` and writes `run_id`, `attempt_id`, `candidate_sha256`,
+and the original named cases under `checks` to `PIPELINE_ACCEPTANCE_REPORT`.
+The supervisor supplies a separate output path for this invocation. Capture the
+original test results in the reviewer-owned adapter, using a fresh runtime when
+the check exercises a live application.
+
+An independent check fails acceptance on a nonzero exit or failed case. Missing
+cases, stale evidence, or a mismatch in run, attempt, or candidate leave
+verification incomplete. A green review cannot override a primary failure or an
+open known blocker. Projects remain responsible for authorizing the review
+command and for choosing an independent reviewer when person or model identity
+matters. The supervisor verifies the separate execution and its evidence.
+Once this policy is registered, the task keeps the same required review contract.
+Use a new task with its own approved scope for a deliberate contract change.
+
+### State and reporting
+
 `PipelineState.summary()` is the common calculation used by the runner, CLI, status/list
 scripts, both terminal panels and Markdown report. It recomputes validity from current
 inputs, policy, attempt-bound reports and stage evidence. The stored `pipeline_state` and

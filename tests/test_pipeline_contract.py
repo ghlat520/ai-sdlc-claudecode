@@ -857,6 +857,203 @@ Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']).write_text(json.dumps(report))
     return dag, path, env, run, tmp_path, driver
 
 
+@pytest.mark.parametrize('mode', ['pass', 'reject', 'missing', 'prewritten', 'command-fails',
+                                  'wrong-candidate', 'wrong-attempt', 'extra-failure'])
+def test_project_acceptance_requires_configured_independent_review(project_acceptance_case, mode):
+    dag, _, env, run, project, driver = project_acceptance_case
+    definition = dag['config']['project_acceptance']
+    definition['candidate_inputs'].append('review_driver.py')
+    definition['independent_review'] = {'command': 'python3 review_driver.py', 'checks': ['business']}
+    review_driver = project / 'review_driver.py'
+    if mode == 'prewritten':
+        # Only the separate supervisor execution may produce a review receipt.
+        driver.write_text(driver.read_text() + '''
+report['candidate_sha256'] = os.environ['PIPELINE_CANDIDATE_SHA256']
+Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']).with_name('independent-review.json').write_text(json.dumps(report))
+''')
+    review_driver.write_text(f'MODE = {mode!r}\n' + '''import json, os, runpy
+from pathlib import Path
+
+if MODE not in ('missing', 'prewritten'):
+    version = runpy.run_path('app/application.py')['VERSION']
+    status = 'passed' if version == 1 and MODE != 'reject' else 'failed'
+    report = {
+        'run_id': os.environ['PIPELINE_RUN_ID'],
+        'attempt_id': 'old-attempt' if MODE == 'wrong-attempt' else os.environ['PIPELINE_ATTEMPT_ID'],
+        'candidate_sha256': 'old-candidate' if MODE == 'wrong-candidate' else os.environ['PIPELINE_CANDIDATE_SHA256'],
+        'checks': {'business': {'create': status, 'replay': 'passed'}},
+    }
+    if MODE == 'extra-failure':
+        report['checks']['business']['additional_case'] = 'failed'
+    Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']).write_text(json.dumps(report))
+if MODE == 'command-fails':
+    raise SystemExit(7)
+''')
+
+    result, data = run('--stages', 'S9')
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    verdict = state.summary()['project_acceptance']
+    if mode == 'pass':
+        expected = 'passed'
+    elif mode in ('reject', 'command-fails', 'extra-failure'):
+        expected = 'failed'
+    else:
+        expected = 'incomplete'
+    assert verdict['status'] == expected, result.stdout + result.stderr
+    assert result.returncode == (0 if mode == 'pass' else 1)
+    assert verdict['passed_cases'] == 2
+    assert ('independent review' in ' '.join(verdict['reasons']).lower()) is (mode != 'pass')
+
+    if mode == 'pass':
+        archive = Path(data['stages']['S9']['archive'])
+        review = archive / 'independent-review.json'
+        assert review != Path(verdict['report_path'])
+        assert json.loads(review.read_text())['candidate_sha256'] == verdict['candidate_sha256']
+        review.write_text('{}')
+        assert state.summary()['project_acceptance']['status'] == 'incomplete'
+
+
+def test_independent_review_rejects_same_expanded_command(project_acceptance_case):
+    dag, _, env, run, _, _ = project_acceptance_case
+    config = dag['config']
+    config['project_acceptance']['independent_review'] = {
+        'command': 'python3 acceptance_driver.py', 'checks': ['business'],
+    }
+    config['tech_stack_commands'] = {'node-typescript': {'test': 'python3 acceptance_driver.py'}}
+    dag['stages']['second']['post_commands'] = ['{{test}}']
+    result, data = run('--stages', 'S9')
+    assert result.returncode == 1
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    assert state.summary()['project_acceptance']['status'] == 'failed'
+    log = Path(data['stages']['S9']['output_dir']) / 'post-commands.log'
+    assert 'Independent review requires a distinct executable command' in log.read_text()
+
+
+def test_required_review_cannot_be_removed_on_resume(project_acceptance_case):
+    dag, _, env, run, _, _ = project_acceptance_case
+    definition = dag['config']['project_acceptance']
+    definition['independent_review'] = {'command': 'exit 1', 'checks': ['business']}
+    result, data = run('--stages', 'S9')
+    assert result.returncode == 1
+    assert data['pipeline_state'] == 'failed'
+    del definition['independent_review']
+    resumed, after = run('--resume')
+    assert resumed.returncode == 1
+    assert 'Cannot change required independent review' in resumed.stdout + resumed.stderr
+    assert after == data
+    cli = subprocess.run([sys.executable, '-m', 'ai_sdlc_claudecode', 'run', '--phase', '2',
+                          '--feature-id', 'fixture', '--resume'], env=env, capture_output=True,
+                         text=True, timeout=15)
+    assert cli.returncode == 2
+    assert 'Resume requires the unchanged DAG' in cli.stdout
+
+
+def test_cli_resume_requires_existing_checkpoint(executor_case):
+    dag, path, env, _ = executor_case
+    path.write_text(json.dumps(dag))
+    result = subprocess.run(
+        [sys.executable, '-m', 'ai_sdlc_claudecode', 'run', '--phase', '2', '--feature-id',
+         'fixture', '--resume'], env=env, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert 'Resume requires an existing execution checkpoint' in result.stdout
+    assert not Path(env['FAKE_CALLS']).exists()
+    assert not (Path(env['PIPELINE_ROOT']) / 'fixture/state.json').exists()
+
+
+def test_executor_interrupt_stops_independent_review(project_acceptance_case):
+    import signal
+    import time
+
+    dag, path, env, _, project, _ = project_acceptance_case
+    definition = dag['config']['project_acceptance']
+    definition['candidate_inputs'].append('review_driver.py')
+    definition['independent_review'] = {'command': 'python3 review_driver.py', 'checks': ['business']}
+    (project / 'review_driver.py').write_text('''import os, time
+from pathlib import Path
+temporary = Path('review-pid.tmp')
+temporary.write_text(str(os.getpid()))
+temporary.replace('review-pid')
+time.sleep(30)
+''')
+    # Runtime markers stay outside the frozen candidate input paths.
+    path.write_text(json.dumps(dag))
+    command = ['bash', str(ROOT / 'pipeline-executor.sh'), 'fixture', 'local interruption',
+               '--project-dir', str(project), '--stages', 'S9']
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    marker = project / 'review-pid'
+    try:
+        deadline = time.monotonic() + 10
+        while not marker.is_file() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert marker.is_file(), 'The executor did not reach the review process'
+        os.killpg(process.pid, signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 143, stdout + stderr
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(marker.read_text()), 0)
+        state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+        assert state.read()['executor_exit']['exit_code'] == 143
+        assert state.summary()['execution_outcome'] == 'failed'
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=10)
+        if marker.is_file():
+            try:
+                os.kill(int(marker.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_verifier_preserves_first_signal_during_review_cleanup(project_acceptance_case):
+    import signal
+    import time
+
+    dag, path, env, _, project, _ = project_acceptance_case
+    definition = dag['config']['project_acceptance']
+    definition['independent_review'] = {'command': 'python3 review_driver.py', 'checks': ['business']}
+    (project / 'review_driver.py').write_text('''import os, signal, time
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+temporary = Path('review-pid.tmp')
+temporary.write_text(str(os.getpid()))
+temporary.replace('review-pid')
+time.sleep(30)
+''')
+    path.write_text(json.dumps(dag))
+    env.update(PIPELINE_RUN_ID='run', PIPELINE_ATTEMPT_ID='attempt', PIPELINE_CANDIDATE_SHA256='candidate',
+               PIPELINE_ACCEPTANCE_REPORT=str(project / 'project-acceptance.json'))
+    command = [sys.executable, '-m', 'ai_sdlc_claudecode.verification', '--dag', str(path),
+               '--stage', 'second', '--project', str(project), '--log', str(project / 'verify.log'),
+               '--report', str(project / 'modules.json')]
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    marker = project / 'review-pid'
+    try:
+        deadline = time.monotonic() + 10
+        while not marker.is_file() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert marker.is_file(), 'The verifier did not reach the review process'
+        process.send_signal(signal.SIGTERM)
+        time.sleep(0.12)
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 143, stdout + stderr
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(marker.read_text()), 0)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=10)
+        if marker.is_file():
+            try:
+                os.kill(int(marker.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 @pytest.fixture
 def function_map_case(project_acceptance_case):
     dag, path, env, run, project, driver = project_acceptance_case

@@ -11,6 +11,8 @@ from pathlib import Path
 
 _GENERATED = {'.git', '.artifacts', '.venv', 'node_modules', '__pycache__',
               '.pytest_cache', '.mypy_cache', '.ruff_cache'}
+REVIEW_REPORT = 'independent-review.json'
+REVIEW_COMMAND = 'independent-review-command.json'
 
 
 def digest(value):
@@ -38,7 +40,8 @@ def policy(dag):
     value = dag.get('config', {}).get('project_acceptance')
     if value is None:
         return None
-    allowed = {'scope', 'stage_id', 'candidate_inputs', 'required_checks', 'blocking_findings', 'function_map', 'journeys'}
+    allowed = {'scope', 'stage_id', 'candidate_inputs', 'required_checks', 'blocking_findings',
+               'function_map', 'journeys', 'independent_review'}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError('Invalid project_acceptance policy fields')
     for key in ('scope', 'stage_id'):
@@ -63,6 +66,16 @@ def policy(dag):
     stage = next((s for s in dag['stages'].values() if s['id'] == value['stage_id']), None)
     if stage is None or not stage.get('post_commands'):
         raise ValueError('Project acceptance requires a known stage with post_commands')
+    if 'independent_review' in value:
+        review = value['independent_review']
+        if not isinstance(review, dict) or set(review) != {'command', 'checks'}:
+            raise ValueError('Independent review requires command and checks')
+        command = review['command']
+        if (not isinstance(command, str) or not command.strip()
+                or any(command.strip() == item.strip() for item in stage['post_commands'] if isinstance(item, str))):
+            raise ValueError('Independent review requires a distinct executable command')
+        if not set(_names(review['checks'], 'independent_review.checks')) <= set(checks):
+            raise ValueError('Independent review checks must reference required checks')
     if 'function_map' in value:
         if value['function_map'] != {'source_stage_id': 'S1'}:
             raise ValueError('function_map must reference the S1 requirements artifact')
@@ -166,12 +179,15 @@ def prepare(definition, record, project, known_findings, function_map=None):
             target = behavior['target']
             if not any(name == target or name.startswith(target.rstrip('/') + '/') for name in manifest):
                 raise ValueError(f'Function-map target is outside candidate inputs: {target}')
-    return dict(scope=definition['scope'], policy_sha256=digest(definition),
+    binding = dict(scope=definition['scope'], policy_sha256=digest(definition),
                 run_id=record['run_id'], attempt_id=record['attempt_id'],
                 project_dir=str(Path(project).resolve()), candidate_manifest=manifest,
                 candidate_sha256=digest(manifest), known_findings=dict(known_findings),
                 report_path=str(Path(record['archive']) / 'project-acceptance.json'),
                 collected=False, function_map=function_map)
+    if 'independent_review' in definition:
+        binding['independent_review'] = {}
+    return binding
 
 
 def collect(binding, command_exit):
@@ -179,7 +195,50 @@ def collect(binding, command_exit):
     path = Path(binding['report_path'])
     binding['report_sha256'] = (hashlib.sha256(path.read_bytes()).hexdigest()
                                 if path.is_file() and not path.is_symlink() else None)
+    if 'independent_review' in binding:
+        for name in (REVIEW_REPORT, REVIEW_COMMAND):
+            source = path.with_name(name)
+            if source.is_file() and not source.is_symlink():
+                binding['independent_review'][name] = hashlib.sha256(source.read_bytes()).hexdigest()
     binding['collected'] = True
+
+
+def _independent_review(binding, definition):
+    records = {}
+    for name in (REVIEW_COMMAND, REVIEW_REPORT):
+        path = Path(binding['report_path']).with_name(name)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f'Independent review evidence missing: {name}')
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != binding.get('independent_review', {}).get(name):
+            raise ValueError(f'Independent review evidence changed: {name}')
+        record = json.loads(raw, object_pairs_hook=_unique_object)
+        if not isinstance(record, dict) or any(record.get(key) != binding[key]
+                for key in ('run_id', 'attempt_id', 'candidate_sha256')):
+            raise ValueError('Independent review evidence belongs to another run, attempt or candidate')
+        records[name] = record
+    command = records[REVIEW_COMMAND]
+    spec = definition['independent_review']
+    if command.get('command') != spec['command'] or type(command.get('exit_code')) is not int:
+        raise ValueError('Independent review command receipt does not match the policy')
+    if command['exit_code'] != 0:
+        return False
+    checks = records[REVIEW_REPORT].get('checks')
+    if not isinstance(checks, dict) or any(not isinstance(cases, dict) for cases in checks.values()):
+        raise ValueError('Independent review is missing named checks')
+    outcomes = [status for cases in checks.values() for status in cases.values()]
+    if any(status in ('failed', 'error') for status in outcomes):
+        return False
+    if any(status not in ('passed', 'skipped') for status in outcomes):
+        raise ValueError('Independent review has invalid case results')
+    for name in spec['checks']:
+        cases = checks.get(name, {})
+        required = definition['required_checks'][name]
+        if any(case not in cases for case in required):
+            raise ValueError(f'Independent review missing required cases: {name}')
+        if any(cases[case] != 'passed' for case in required):
+            raise ValueError(f'Independent review has unverified cases: {name}')
+    return True
 
 
 def evaluate(binding, definition, record):
@@ -284,6 +343,13 @@ def evaluate(binding, definition, record):
         if (current != binding['candidate_manifest']
                 or digest(current) != binding['candidate_sha256']):
             raise ValueError('Candidate inputs changed; repeat affected acceptance')
+        if 'independent_review' in definition:
+            if failed:
+                result['status'] = 'failed'
+            if not _independent_review(binding, definition):
+                failed = True
+                reasons.append('Independent review rejected the candidate')
+            result['independent_review_report_path'] = str(report_path.with_name(REVIEW_REPORT))
         result['status'] = 'failed' if failed else ('incomplete' if reasons else 'passed')
     except (OSError, ValueError, TypeError, KeyError) as exc:
         reasons.append(str(exc))
