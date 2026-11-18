@@ -15,8 +15,12 @@ from tests.test_pipeline_contract import executor_case, project_acceptance_case 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('blocked', [True, False], ids=['fixed-bad', 'legal-control'])
-def test_public_entrypoints_preserve_candidate_verdict(project_acceptance_case, blocked):
+@pytest.mark.parametrize('blocked,stall_args,expected_stalls', [
+    pytest.param(True, ['--max-failures', '1'], 1, id='fixed-bad-limit-1'),
+    pytest.param(True, [], 5, id='fixed-bad-default-limit'),
+    pytest.param(False, ['--max-failures', '1'], 0, id='legal-control'),
+])
+def test_public_entrypoints_preserve_candidate_verdict(project_acceptance_case, blocked, stall_args, expected_stalls):
     """Local model protocol fixture; real Bash, CLI, checks, state and readers."""
     dag, dag_path, env, run, project, driver = project_acceptance_case
     del dag['stages']['first']
@@ -53,12 +57,15 @@ sys.exit(0 if passed else 1)
         else:
             result = subprocess.run(
                 [sys.executable, '-m', 'ai_sdlc_claudecode', 'run', '--phase', '2',
-                 '--feature-id', 'fixture'],
+                 '--feature-id', 'fixture', *stall_args],
                 env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=35,
             )
             data = state.read()
             checkpoint = json.loads(state.path.with_name('ai-sdlc-state.json').read_text())
-            assert 1 <= checkpoint['current_iteration'] <= 10
+            assert checkpoint['consecutive_no_improve'] == expected_stalls, result.stdout + result.stderr
+            if blocked:
+                # The first iteration establishes the baseline for subsequent stalls.
+                assert checkpoint['current_iteration'] == 1 + expected_stalls
             assert (checkpoint['phases']['2']['status'] == 'complete') is (not blocked)
         (project / f'{entrypoint}-execution.log').write_text(result.stdout + result.stderr)
         assert result.returncode == expected_exit, result.stdout + result.stderr

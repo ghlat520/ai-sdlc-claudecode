@@ -112,7 +112,7 @@ class EvolvingAgent:
                 _log(f"Budget exceeded: {reason}", RED)
                 break
 
-            if self.state.check_stall():
+            if self.state.check_stall(window=self.state.max_consecutive_failures):
                 _log(f"Stalled: {self.state.consecutive_no_improve} iterations without improvement", YELLOW)
                 break
 
