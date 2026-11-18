@@ -1,0 +1,11 @@
+--- a/backend-python/tests/test_p4_money_materials.py
++++ b/backend-python/tests/test_p4_money_materials.py
+@@ -94,7 +94,7 @@
+ ], ids=["null", "string", "number", "array", "omitted", "false", "true"])
+ def test_material_return_checked_type_and_legal_values(client, case_no, fields, status):
+     buyer, demand, maker, _, _ = make_assigned_demand(
+-        client, f"138123406{case_no:02d}", f"138123407{case_no:02d}", f"return{case_no}")
++        client, f"138123408{case_no:02d}", f"138123407{case_no:02d}", f"return{case_no}")
+     order, operator = to_deposit(client, buyer, maker, demand)
+     paid = client.post(f"/api/me/orders/{order['id']}/simulated-payments", headers=auth(buyer),
+                        json={"stage": "DEPOSIT", "operationKey": f"return-pay{case_no}".ljust(24, "k"),
