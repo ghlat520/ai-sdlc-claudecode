@@ -104,13 +104,10 @@ def check_text(text, context):
             or len(identifiers) != len(set(identifiers))):
         raise ValueError("Invalid data identifier declaration")
     references = set()
-    for link in LINK.finditer(text):
-        target = link.group(1) or link.group(2)
-        if not target.startswith("#"):
-            references.add(source_path(target, context))
     # Decode complete JSON fragments first so escaped keys and descriptions retain
     # the same source contract as structured stage output.
     remaining = []
+    json_spans = []
     end = 0
     for match in re.finditer(r'[{\["]', text):
         start = match.start()
@@ -122,10 +119,19 @@ def check_text(text, context):
             continue
         remaining.append(text[end:start])
         end = start + size
+        json_spans.append((start, end))
         if SOURCE_REFS.search(text[:start]):
             references.update(check_source_refs(value, context))
         else:
             references.update(json_references(value, context, root=True))
+    for link in LINK.finditer(text):
+        # Complete links inside JSON are checked after decoding their string.
+        # A quoted target alone does not cover its outer Markdown link.
+        if any(start <= link.start() and link.end() <= finish for start, finish in json_spans):
+            continue
+        target = link.group(1) or link.group(2)
+        if not target.startswith("#"):
+            references.add(source_path(target, context))
     remaining.append(text[end:])
     text = " ".join(remaining)
     tokens = set()

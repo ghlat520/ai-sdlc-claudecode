@@ -267,3 +267,13 @@ def test_schema_marker_nested_in_handoff_data_does_not_grant_an_exception(contex
     }})
     with pytest.raises(ValueError, match="source"):
         validator().check_text(text, context)
+
+
+@pytest.mark.parametrize("quoted_target", [False, True])
+def test_markdown_inside_json_uses_the_decoded_complete_path(context, quoted_target):
+    path = "backend-python/tests/conftest.py"
+    target = f'"{path}"' if quoted_target else path
+    text = json.dumps({"summary": f"Read [fixture]({target}).", "source_refs": ["pilot/task.md"]})
+    if not quoted_target:
+        text = text.replace("/", "\\u002f")
+    assert validator().check_text(text, context) == [path, "pilot/task.md"]
