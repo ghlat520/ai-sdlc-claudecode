@@ -106,7 +106,7 @@ class PipelineRunner:
             exit_code = 124
             stderr += f"\nPipeline timed out after {timeout_seconds}s"
 
-        except BaseException:
+        except BaseException as error:
             # Interrupt/shutdown must not leave an autonomous child running.
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -122,7 +122,10 @@ class PipelineRunner:
                 process.communicate()
             data = state.read()
             if data.get('invocation_id') == invocation:
-                state.record_executor_exit(data['run_id'], invocation, 130)
+                code = 130
+                if isinstance(error, SystemExit) and isinstance(error.code, int) and error.code:
+                    code = error.code
+                state.record_executor_exit(data['run_id'], invocation, code)
             raise
 
         duration = time.time() - start_time

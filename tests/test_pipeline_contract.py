@@ -281,6 +281,130 @@ def test_bash_interruption_persists_exit_and_stops_running_stage(executor_case, 
                and record['status'] == 'failed' for record in after['history'])
 
 
+@pytest.mark.parametrize('signal_name,expected_code', [('SIGINT', 130), ('SIGTERM', 143)])
+def test_cli_runner_bash_joint_interruption(executor_case, tmp_path, signal_name, expected_code):
+    """Signal only the public CLI; its real Runner must stop and finalize Bash."""
+    import hashlib
+    import shlex
+    import signal
+    import time
+
+    dag, path, env, run = executor_case
+    path.write_text(json.dumps(dag))
+    ready = tmp_path / 'joint-model.pid'
+    wrapper = tmp_path / 'pipeline-executor.sh'
+    wrapper.write_text('#!/bin/sh\nexec bash ' + shlex.quote(str(ROOT / 'pipeline-executor.sh'))
+                       + ' "$@" --project-dir ' + shlex.quote(str(tmp_path)) + '\n')
+    driver = tmp_path / 'joint-cli.py'
+    driver.write_text(
+        'import runpy, sys\nfrom pathlib import Path\n'
+        'import ai_sdlc_claudecode.cli as cli\n'
+        f'cli.resolve_executor = lambda: Path({str(wrapper)!r})\n'
+        f'cli.resolve_pipeline_root = lambda: Path({str(tmp_path / "pipeline")!r})\n'
+        'cli.EvolvingAgent._preflight = lambda self: None\n'
+        'cli.MAX_ITERATIONS_PER_PHASE = 1\n'
+        'sys.argv = ["ai-sdlc", "run", "--phase", "2", "--feature-id", "fixture"]\n'
+        'runpy.run_module("ai_sdlc_claudecode", run_name="__main__")\n'
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(driver)], env={**env, 'FAKE_MODE': 'block', 'FAKE_READY': str(ready)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    state = PipelineState(tmp_path / 'pipeline/fixture/state.json')
+    bash_pid = None
+    try:
+        deadline = time.monotonic() + 15
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists(), 'joint chain did not reach the local blocking model'
+        before = state.read()
+        bash_pid = before['owner_pid']
+        assert before['stages']['S8']['status'] == 'running'
+        process.send_signal(getattr(signal, signal_name))
+        stdout, stderr = process.communicate(timeout=15)
+        data = state.read()
+        raw_state = state.path.read_bytes()
+        assert json.loads(raw_state) == data
+        checkpoint = json.loads((tmp_path / 'pipeline/fixture/ai-sdlc-state.json').read_text())
+        observation = {'signal': signal_name, 'cli_exit_code': process.returncode,
+                       'recorded_exit_code': data.get('executor_exit', {}).get('exit_code'),
+                       'pipeline_state': data.get('pipeline_state'),
+                       'stage_status': data['stages']['S8']['status'],
+                       'owner_pid': data.get('owner_pid'), 'run_id': data['run_id'],
+                       'invocation_id': data['invocation_id'],
+                       'checkpoint_phase_status': checkpoint['phases'].get('2', {}).get('status', 'not_recorded')}
+        (tmp_path / 'joint-observation.json').write_text(json.dumps(observation, indent=2))
+        (tmp_path / 'joint-interrupted-state.json').write_bytes(raw_state)
+        (tmp_path / 'joint-cli.log').write_text(stdout + stderr)
+        assert process.returncode == expected_code, stdout + stderr
+        assert data['executor_exit']['exit_code'] == expected_code, observation
+        assert data['executor_exit']['run_id'] == data['run_id']
+        assert data['executor_exit']['invocation_id'] == data['invocation_id']
+        assert data['pipeline_state'] == data['stages']['S8']['status'] == 'failed'
+        assert data['owner_pid'] is None
+        assert checkpoint['phases'].get('2', {}).get('status') != 'complete'
+        assert checkpoint['current_iteration'] == 0
+        assert state.summary()['project_acceptance']['status'] == 'not_evaluated'
+        for pid in (bash_pid, int(ready.read_text())):
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        readers = [
+            ('cli-status', [sys.executable, '-m', 'ai_sdlc_claudecode', 'status', '--feature-id', 'fixture']),
+            ('shell-status', ['bash', str(ROOT / 'pipeline-status.sh'), 'fixture']),
+            ('monitor', ['bash', str(ROOT / 'pipeline-monitor.sh'), 'fixture']),
+            ('list', ['bash', str(ROOT / 'pipeline-list.sh')]),
+            ('list-verbose', ['bash', str(ROOT / 'pipeline-list.sh'), '--verbose']),
+            ('list-json', ['bash', str(ROOT / 'pipeline-list.sh'), '--json']),
+            ('markdown', [sys.executable, '-m', 'ai_sdlc_claudecode', 'report', '--feature-id', 'fixture']),
+        ]
+        readback = []
+        for name, command in readers:
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, name + result.stderr
+            content = ((state.path.parent / 'ai-sdlc-report.md').read_text()
+                       if name == 'markdown' else result.stdout)
+            if name == 'list-json':
+                row = json.loads(content)[0]
+                assert row['pipeline_state'] == 'failed'
+                assert row['project_acceptance']['status'] == 'not_evaluated'
+            else:
+                assert ('**Execution**: failed' if name == 'markdown' else 'Execution: failed') in content
+                assert ('**Project acceptance**: not_evaluated' if name == 'markdown'
+                        else 'Project acceptance: not_evaluated') in content
+            readback.append({'reader': name, 'exit_code': result.returncode,
+                             'execution': 'failed', 'project_acceptance': 'not_evaluated'})
+        assert state.path.read_bytes() == raw_state
+        (tmp_path / 'joint-readers.json').write_text(json.dumps({
+            'state_sha256': hashlib.sha256(raw_state).hexdigest(), 'readers': readback,
+            'state_unchanged_by_readers': True}, indent=2))
+    finally:
+        if bash_pid:
+            try:
+                os.kill(bash_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                os.killpg(bash_pid, signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+        if ready.exists():
+            try:
+                os.kill(int(ready.read_text()), 0)
+            except ProcessLookupError:
+                pass
+            else:
+                os.kill(int(ready.read_text()), signal.SIGKILL)
+
+    resumed, after = run('--resume')
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert after['run_id'] != data['run_id']
+    assert after['scope'] == data['scope'] == ['S8', 'S9']
+    assert after['executor_exit']['exit_code'] == 0
+    assert any(record['attempt_id'] == data['stages']['S8']['attempt_id']
+               and record['status'] == 'failed' for record in after['history'])
+
+
 @pytest.mark.parametrize("template_has_description", [False, True])
 def test_code_stage_can_write_source_and_returns_metadata(executor_case, template_has_description):
     dag, path, env, run = executor_case
