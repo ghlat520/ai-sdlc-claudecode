@@ -20,6 +20,7 @@ def context(tmp_path):
     root = tmp_path / "candidate"
     files = {"pilot/task.md": "Read [source](backend-python/app/main.py).",
              "backend-python/app/main.py": "print('synthetic')\n",
+             "backend-python/tests/conftest.py": "# shared runtime fixture\n",
              "backend-python/tests/test_case.py": "def test_case(): pass\n"}
     for name, content in files.items():
         path = root / name
@@ -108,3 +109,61 @@ def test_schema_identifier_and_supervisor_sink_are_metadata(context):
 def test_http_parameter_values_are_data_and_not_file_references(context):
     assert validator().check_text(
         '"tests/test_case.py::test_case[/api/x-/api]"', context) == ["backend-python/tests/test_case.py"]
+
+
+def test_handoff_prose_resolves_unique_approved_filename(context):
+    guard = validator()
+    assert guard.check_text(
+        "No conftest.py change is currently justified. Read test_case.py:1.", context
+    ) == ["backend-python/tests/conftest.py", "backend-python/tests/test_case.py"]
+    with pytest.raises(ValueError, match="source"):
+        guard.check_source_refs(["conftest.py; abbreviated structured source"], context)
+    with pytest.raises(ValueError, match="source"):
+        guard.check_text("Read [fixture](conftest.py).", context)
+
+
+def test_handoff_prose_rejects_ambiguous_approved_filename(context):
+    root = Path(context["candidate_root"])
+    other = "backend-python/app/conftest.py"
+    (root / other).write_text("# different fixture\n")
+    context["proposed_model_read_files"][other] = {
+        "sha256": hashlib.sha256((root / other).read_bytes()).hexdigest()
+    }
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text("Read conftest.py.", context)
+
+
+def test_handoff_filename_cannot_hide_an_unapproved_root_file(context):
+    (Path(context["candidate_root"]) / "conftest.py").write_text("# outside the inventory\n")
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text("Read conftest.py.", context)
+
+
+def test_declared_database_field_is_data_in_handoff_prose(context):
+    context["data_identifiers"] = ["market_user.phone"]
+    assert validator().check_text(
+        "Registration maps a market_user.phone integrity conflict to HTTP 409. "
+        "No conftest.py change is currently justified.", context
+    ) == ["backend-python/tests/conftest.py"]
+
+
+@pytest.mark.parametrize("text", [
+    "Read [source](market_user.phone).",
+    'Upstream source_refs: ["market_user.phone"]',
+    'Upstream source_refs: ["conftest.py"]',
+    "Read ./market_user.phone.",
+])
+def test_database_data_declaration_cannot_authorize_a_file_reference(context, text):
+    context["data_identifiers"] = ["market_user.phone"]
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text(text, context)
+
+
+@pytest.mark.parametrize("identifiers", [
+    "market_user.phone", ["../market_user.phone"], ["market_user.phone:1"],
+    ["market_user.phone", "market_user.phone"], [12],
+])
+def test_invalid_data_identifier_declarations_rejected(context, identifiers):
+    context["data_identifiers"] = identifiers
+    with pytest.raises(ValueError, match="identifier"):
+        validator().check_text("Return the task summary.", context)
