@@ -72,8 +72,13 @@ class PipelineRunner:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", feature_id):
             raise ValueError("invalid feature_id")
         state = PipelineState(self.pipeline_root / feature_id / "state.json")
-        previous_run = state.read().get("run_id")
+        previous = state.read()
+        previous_run = previous.get("run_id")
         env = os.environ.copy()
+        if resume:
+            dag = env.get('PIPELINE_DAG_FILE') or previous.get('dag_path')
+            if dag:
+                env['PIPELINE_DAG_FILE'] = str(Path(dag).resolve())
         invocation = uuid.uuid4().hex
         env['PIPELINE_INVOCATION_ID'] = invocation
         env["PIPELINE_ROOT"] = str(self.pipeline_root)

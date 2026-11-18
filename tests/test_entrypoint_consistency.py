@@ -57,8 +57,9 @@ sys.exit(0 if passed else 1)
         else:
             result = subprocess.run(
                 [sys.executable, '-m', 'ai_sdlc_claudecode', 'run', '--phase', '2',
-                 '--feature-id', 'fixture', *stall_args],
-                env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=35,
+                 '--feature-id', 'fixture', '--resume', *stall_args],
+                env={key: value for key, value in env.items() if key != 'PIPELINE_DAG_FILE'},
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=35,
             )
             data = state.read()
             checkpoint = json.loads(state.path.with_name('ai-sdlc-state.json').read_text())
@@ -66,7 +67,10 @@ sys.exit(0 if passed else 1)
             if blocked:
                 # The first iteration establishes the baseline for subsequent stalls.
                 assert checkpoint['current_iteration'] == 1 + expected_stalls
-            assert (checkpoint['phases']['2']['status'] == 'complete') is (not blocked)
+            expected_phase = 'stalled' if blocked else 'complete'
+            assert checkpoint['phases']['2']['status'] == expected_phase
+            if blocked:
+                assert checkpoint['phases']['2']['stop_reason'] == f'{expected_stalls} iterations without improvement'
         (project / f'{entrypoint}-execution.log').write_text(result.stdout + result.stderr)
         assert result.returncode == expected_exit, result.stdout + result.stderr
         summary = state.summary()
@@ -128,6 +132,8 @@ sys.exit(0 if passed else 1)
                     assert line in plain, (name, line, content)
                 if blocked:
                     assert 'Blocking finding not verified closed: R1' in content
+                if entrypoint == 'python-cli' and blocked and name in ('python-status', 'python-report'):
+                    assert 'stalled' in plain and 'iterations without improvement' in plain
             assert state.path.read_bytes() == frozen_state, name + ' changed the execution state'
             observations.append(dict(entrypoint=entrypoint, reader=name, exit_code=read.returncode,
                                      run_id=data['run_id'], attempt_id=record['attempt_id'],
@@ -135,3 +141,16 @@ sys.exit(0 if passed else 1)
                                      candidate_sha256=candidate_sha))
         assert hashlib.sha256((project / 'app/application.py').read_bytes()).hexdigest() == original_candidate
     (project / 'entrypoint-observations.json').write_text(json.dumps(observations, indent=2))
+
+    if blocked and expected_stalls == 1:
+        # A revised candidate can make progress after an explicit new resume.
+        (project / 'app/application.py').write_text('VERSION = 1\n')
+        resumed = subprocess.run(
+            [sys.executable, '-m', 'ai_sdlc_claudecode', 'run', '--phase', '2', '--feature-id',
+             'fixture', '--resume', '--max-failures', '1'],
+            cwd=dag_path.parent, env={**display_env, 'PIPELINE_DAG_FILE': dag_path.name},
+            capture_output=True, text=True, timeout=15,
+        )
+        assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+        assert state.summary()['project_acceptance']['status'] == 'passed'
+        assert state.summary()['run_id'] != previous_run

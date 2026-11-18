@@ -144,6 +144,13 @@ Source drift invalidates the affected final acceptance, while unrelated upstream
 remain reusable. Resume re-runs invalid evidence. Serial and parallel stages use the same
 collector. Human-required gates remain `human_waiting`; no bare approval marker or agent
 statement grants approval. Old DAGs still run with project acceptance `not_evaluated`.
+The Python CLI checkpoint and phase reports also record why a run stopped,
+including a stall, budget exhaustion, iteration limit, wait, or interruption.
+Each execution keeps its native exit code and the original acceptance outcome.
+Use `ai-sdlc run --resume --phase 2 --feature-id <id>` to resume an existing
+execution with its saved DAG and scope. The command requires a valid checkpoint
+and unchanged DAG. Explicit resume starts a new stop-count window while retaining
+attempt history and cumulative resource usage.
 
 ```bash
 PIPELINE_ROOT=/path/to/runs PIPELINE_DAG_FILE=/path/to/project-dag.json \

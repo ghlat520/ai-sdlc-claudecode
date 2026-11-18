@@ -168,7 +168,7 @@ def test_cli_run_preserves_executor_failure_exit(tmp_path):
     assert result.returncode == 7, result.stdout + result.stderr
     checkpoint = json.loads((tmp_path / 'pipeline/local-case/ai-sdlc-state.json').read_text())
     assert checkpoint['current_iteration'] == 1
-    assert checkpoint['phases']['2']['status'] != 'complete'
+    assert checkpoint['phases']['2']['status'] == 'iteration_limit'
 
 
 @pytest.mark.parametrize('outcome,native_exit,complete,expected_exit', [
@@ -210,7 +210,7 @@ def test_cli_exit_requires_completed_scope(tmp_path, outcome, native_exit, compl
     )
     assert result.returncode == expected_exit, result.stdout + result.stderr
     checkpoint = json.loads((tmp_path / 'pipeline/local-case/ai-sdlc-state.json').read_text())
-    assert (checkpoint['phases']['2']['status'] == 'complete') == complete
+    assert checkpoint['phases']['2']['status'] == ('iteration_limit' if outcome == 'failed' else outcome)
     assert checkpoint['current_iteration'] == 1
 
 
@@ -220,6 +220,9 @@ def test_cli_budget_stop_before_execution_is_not_success(tmp_path):
     import sys
 
     executor = tmp_path / 'pipeline-executor.sh'
+    state_dir = tmp_path / 'pipeline/local-case'
+    state_dir.mkdir(parents=True)
+    (state_dir / 'ai-sdlc-state.json').write_text(json.dumps({'current_phase': 1}))
     marker = tmp_path / 'unexpected-execution'
     executor.write_text('#!/bin/sh\ntouch ' + str(marker) + '\nexit 0\n')
     driver = tmp_path / 'budget-cli.py'
@@ -242,6 +245,9 @@ def test_cli_budget_stop_before_execution_is_not_success(tmp_path):
     assert not marker.exists()
     checkpoint = json.loads((tmp_path / 'pipeline/local-case/ai-sdlc-state.json').read_text())
     assert checkpoint['current_iteration'] == 0
+    assert checkpoint['current_phase'] == 2
+    assert checkpoint['phases']['2']['status'] == 'budget_exceeded'
+    assert 'Cost limit' in checkpoint['phases']['2']['stop_reason']
 
 
 @pytest.mark.parametrize('signum', [2, 15])
@@ -270,6 +276,7 @@ def test_cli_shutdown_preserves_signal_exit(tmp_path, signum):
     assert result.returncode == 128 + signum, result.stdout + result.stderr
     checkpoint = json.loads((tmp_path / 'pipeline/local-case/ai-sdlc-state.json').read_text())
     assert checkpoint['current_iteration'] == 0
+    assert checkpoint['phases']['2']['status'] == 'interrupted'
     assert (tmp_path / 'pipeline/local-case/ai-sdlc-report.md').exists()
 
 

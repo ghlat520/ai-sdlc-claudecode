@@ -11,7 +11,7 @@ import math
 import tempfile
 import time
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import acceptance, quality, verification
@@ -21,10 +21,11 @@ from . import acceptance, quality, verification
 class PhaseState:
     """Immutable state for a single phase."""
 
-    status: str  # "pending" | "running" | "complete" | "stalled" | "budget_exceeded"
+    status: str
     iterations: int = 0
     stages_passed: tuple[int, ...] = ()
     errors_learned: int = 0
+    stop_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class EvolveState:
                 iterations=v.get("iterations", 0),
                 stages_passed=tuple(v.get("stages_passed", [])),
                 errors_learned=v.get("errors_learned", 0),
+                stop_reason=v.get("stop_reason", ""),
             )
             for k, v in data.get("phases", {}).items()
         }
@@ -128,27 +130,12 @@ class EvolveState:
 
     def complete_phase(self, phase: int) -> EvolveState:
         """Mark a phase as complete. Returns new state."""
-        new_phases = deepcopy(self.phases)
-        old = new_phases.get(phase, PhaseState(status="running"))
-        new_phases[phase] = PhaseState(
-            status="complete",
-            iterations=old.iterations,
-            stages_passed=old.stages_passed,
-            errors_learned=old.errors_learned,
-        )
-        return EvolveState(
-            state_file=self.state_file,
-            start_time=self.start_time,
-            current_phase=self.current_phase,
-            current_iteration=self.current_iteration,
-            max_cost_usd=self.max_cost_usd,
-            max_runtime_hours=self.max_runtime_hours,
-            max_consecutive_failures=self.max_consecutive_failures,
-            cost_spent_usd=self.cost_spent_usd,
-            elapsed_hours=self.elapsed_hours,
-            phases=new_phases,
-            consecutive_no_improve=self.consecutive_no_improve,
-        )
+        return self.finish_phase(phase, "complete")
+
+    def finish_phase(self, phase: int, status: str, reason: str = "") -> EvolveState:
+        previous = self.phases.get(phase, PhaseState(status="pending"))
+        phase_state = replace(previous, status=status, stop_reason=reason)
+        return replace(self, current_phase=phase, phases={**self.phases, phase: phase_state})
 
     # ---- checks ----
 
@@ -184,6 +171,7 @@ class EvolveState:
                     "iterations": v.iterations,
                     "stages_passed": list(v.stages_passed),
                     "errors_learned": v.errors_learned,
+                    "stop_reason": v.stop_reason,
                 }
                 for k, v in self.phases.items()
             },
@@ -221,13 +209,13 @@ class EvolveState:
             "",
             "## Phase Summary",
             "",
-            "| Phase | Status | Iterations | Best Stages | Errors Learned |",
-            "|-------|--------|------------|-------------|----------------|",
+            "| Phase | Status | Iterations | Best Stages | Errors Learned | Stop reason |",
+            "|-------|--------|------------|-------------|----------------|-------------|",
         ]
         for num in sorted(self.phases):
             ps = self.phases[num]
             best = max(ps.stages_passed) if ps.stages_passed else 0
-            lines.append(f"| {num} | {ps.status} | {ps.iterations} | {best} | {ps.errors_learned} |")
+            lines.append(f"| {num} | {ps.status} | {ps.iterations} | {best} | {ps.errors_learned} | {ps.stop_reason} |")
 
         lines.extend(["", "## Improvement Trend", ""])
         for num in sorted(self.phases):

@@ -11,7 +11,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+import hashlib
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -76,7 +79,13 @@ class EvolvingAgent:
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
 
-    def run(self) -> int:
+    def run(self, resume: bool = False) -> int:
+        if resume:
+            problem = self._resume_problem()
+            if problem:
+                _log(problem, RED)
+                return 2
+            self.state = replace(self.state, consecutive_no_improve=0)
         self._preflight()
         self._banner()
 
@@ -84,9 +93,24 @@ class EvolvingAgent:
             # The selected phase and feature are the complete authorization scope.
             return self._phase(self.start_phase, "Selected feature execution",
                                mock_review=self.start_phase == 1,
-                               start_from="S3" if self.start_phase == 3 else None)
+                               start_from="S3" if self.start_phase == 3 else None,
+                               resume=resume)
         finally:
             self._finalize()
+
+    def _resume_problem(self) -> Optional[str]:
+        saved = PipelineState(self.state_path.with_name('state.json')).read()
+        if not all(saved.get(key) for key in ('run_id', 'scope', 'dag_path', 'dag_sha256')):
+            return 'Resume requires an existing execution checkpoint'
+        dag = Path(saved['dag_path'])
+        selected = Path(os.environ.get('PIPELINE_DAG_FILE') or dag)
+        try:
+            if (selected.resolve() != dag.resolve()
+                    or hashlib.sha256(dag.read_bytes()).hexdigest() != saved['dag_sha256']):
+                return 'Resume requires the unchanged DAG saved in the execution checkpoint'
+        except OSError as exc:
+            return f'Cannot read the saved DAG for resume: {exc}'
+        return None
 
     def _phase(
         self,
@@ -96,6 +120,7 @@ class EvolvingAgent:
         start_from: Optional[str] = None,
         feature_override: Optional[str] = None,
         description_override: Optional[str] = None,
+        resume: bool = False,
     ) -> int:
         _log(f"{'=' * 60}", BOLD)
         _log(f"Phase {phase}: {label}", BOLD + CYAN)
@@ -105,15 +130,20 @@ class EvolvingAgent:
         desc = description_override or self.description
         pipeline_root = resolve_pipeline_root()
         exit_code = 2  # No execution completed before a budget/stall stop.
+        stop_status = "iteration_limit"
+        stop_reason = f"Reached the limit of {MAX_ITERATIONS_PER_PHASE} iterations"
 
         for iteration in range(MAX_ITERATIONS_PER_PHASE):
             ok, reason = self.state.check_budget()
             if not ok:
+                stop_status, stop_reason = "budget_exceeded", reason
                 _log(f"Budget exceeded: {reason}", RED)
                 break
 
             if self.state.check_stall(window=self.state.max_consecutive_failures):
-                _log(f"Stalled: {self.state.consecutive_no_improve} iterations without improvement", YELLOW)
+                stop_status = "stalled"
+                stop_reason = f"{self.state.consecutive_no_improve} iterations without improvement"
+                _log(f"Stalled: {stop_reason}", YELLOW)
                 break
 
             _log(f"Phase {phase}, Iteration {iteration + 1}/{MAX_ITERATIONS_PER_PHASE}", CYAN)
@@ -125,7 +155,7 @@ class EvolvingAgent:
                 feature_id=feat,
                 description=desc,
                 mock_review=mock_review,
-                resume=(iteration > 0),
+                resume=resume or iteration > 0,
                 start_from=start_from if iteration == 0 else None,
                 evolve_errors_dir=self.errors_dir,
                 cost_limit=self.state.max_cost_usd,
@@ -154,17 +184,19 @@ class EvolvingAgent:
             )
 
             if result.outcome in ("human_waiting", "paused", "partial", "simulated", "unverified"):
-                _log(f"Execution stopped: {result.outcome}; scope preserved", YELLOW)
+                stop_status = result.outcome
+                stop_reason = f"Requested execution ended as {result.outcome}"
+                _log(stop_reason, YELLOW)
                 break
 
             if result.all_passed:
                 project_status = (result.project_acceptance or {}).get('status', 'not_evaluated')
                 _log(f"Phase {phase} configured checks complete; project acceptance: {project_status}", GREEN + BOLD)
                 self.state = self.state.complete_phase(phase)
-                self.state.checkpoint()
-                break
+                return exit_code
         else:
             _log(f"Phase {phase}: max iterations reached", YELLOW)
+        self.state = self.state.finish_phase(phase, stop_status, stop_reason)
         return exit_code
 
     def _preflight(self) -> None:
@@ -206,6 +238,7 @@ class EvolvingAgent:
 
     def _shutdown(self, signum: int, frame: object) -> None:
         _log("Shutdown signal received, saving checkpoint...", YELLOW)
+        self.state = self.state.finish_phase(self.start_phase, "interrupted", signal.Signals(signum).name)
         self.state.checkpoint()
         self.state.generate_report(self.report_path)
         _log(f"Report: {self.report_path}", GREEN)
@@ -234,7 +267,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         feature_id=args.feature_id,
         description=args.description,
     )
-    return agent.run()
+    return agent.run(resume=args.resume)
 
 
 # ---------------------------------------------------------------------------
@@ -264,13 +297,14 @@ def _cmd_status(args: argparse.Namespace) -> None:
 
     phases = data.get("phases", {})
     if phases:
-        print(f"\n  {'Phase':<8} {'Status':<12} {'Iters':<8} {'Best':<8} {'Errors':<8}")
-        print(f"  {'─' * 44}")
+        print(f"\n  {'Phase':<8} {'Status':<16} {'Iters':<8} {'Best':<8} {'Errors':<8} Stop reason")
+        print(f"  {'─' * 59}")
         for num in sorted(phases, key=int):
             p = phases[num]
             sp = p.get("stages_passed", [])
             best = max(sp) if sp else 0
-            print(f"  {num:<8} {p['status']:<12} {p.get('iterations', 0):<8} {best:<8} {p.get('errors_learned', 0):<8}")
+            print(f"  {num:<8} {p['status']:<16} {p.get('iterations', 0):<8} {best:<8} "
+                  f"{p.get('errors_learned', 0):<8} {p.get('stop_reason', '')}")
 
     trend = data.get("improvement_trend", [])
     if trend:
@@ -368,6 +402,7 @@ def main() -> None:
     run_p.add_argument("--max-hours", type=float, default=4.0, help="Max runtime in hours (default: 4)")
     run_p.add_argument("--max-failures", type=int, default=5, help="Max stall iterations (default: 5)")
     run_p.add_argument("--phase", type=int, default=1, choices=[1, 2, 3], help="Start phase (1=mock, 2=real, 3=selected feature from S3)")
+    run_p.add_argument("--resume", action="store_true", help="Resume the existing feature on the first iteration")
     run_p.add_argument("--feature-id", default="ai-sdlc-test", help="Feature ID (default: ai-sdlc-test)")
     run_p.add_argument("--description", default="Self-evolving agent test run", help="Feature description")
     run_p.set_defaults(func=_cmd_run)
