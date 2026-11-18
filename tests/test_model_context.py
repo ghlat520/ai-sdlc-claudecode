@@ -243,3 +243,27 @@ def test_schema_metadata_description_is_checked_after_json_decoding(context):
 def test_source_reference_label_in_ordinary_prose_is_not_a_json_document(context):
     assert validator().check_text(
         "About source_refs: keep the approved entries.", context) == []
+
+
+@pytest.mark.parametrize("target", ["conftest.py", "market_user.phone"])
+def test_quoted_markdown_target_remains_a_strict_file_reference(context, target):
+    context["data_identifiers"] = ["market_user.phone"]
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text(f'Read [source]("{target}").', context)
+
+
+def test_duplicate_source_reference_keys_cannot_discard_a_rejected_reference(context):
+    text = '{"source_refs": ["conftest.py"], "source_refs": ["pilot/task.md"]}'
+    with pytest.raises(ValueError, match="Duplicate"):
+        validator().check_text(text, context)
+
+
+def test_schema_marker_nested_in_handoff_data_does_not_grant_an_exception(context):
+    text = json.dumps({"wrapper": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object", "properties": {
+            "source_refs": {"type": "array", "items": {"type": "string"}}
+        }
+    }})
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text(text, context)

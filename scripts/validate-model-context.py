@@ -61,11 +61,20 @@ def source_path(token, context, *, prose=False):
     return relative
 
 
-def json_references(value, context, *, schema=False, schema_properties=False):
+def unique_object(pairs):
+    value = {}
+    for name, child in pairs:
+        if name in value:
+            raise ValueError("Duplicate JSON source field: " + name)
+        value[name] = child
+    return value
+
+
+def json_references(value, context, *, root=False, schema_properties=False):
     """Validate decoded handoff fields while recognizing the inline output schema."""
     references = set()
     if isinstance(value, dict):
-        schema = schema or value.get("$schema") == SCHEMA_ID
+        schema = root and value.get("$schema") == SCHEMA_ID
         for name, child in value.items():
             if name == "source_refs" and not schema_properties:
                 references.update(check_source_refs(child, context))
@@ -77,10 +86,10 @@ def json_references(value, context, *, schema=False, schema_properties=False):
                     raise ValueError("Invalid source_refs schema")
             references.update(check_text(name, context))
             references.update(json_references(
-                child, context, schema=schema, schema_properties=schema and name == "properties"))
+                child, context, schema_properties=schema and name == "properties"))
     elif isinstance(value, list):
         for child in value:
-            references.update(json_references(child, context, schema=schema))
+            references.update(json_references(child, context))
     elif isinstance(value, str):
         references.update(check_text(value, context))
     return references
@@ -95,6 +104,10 @@ def check_text(text, context):
             or len(identifiers) != len(set(identifiers))):
         raise ValueError("Invalid data identifier declaration")
     references = set()
+    for link in LINK.finditer(text):
+        target = link.group(1) or link.group(2)
+        if not target.startswith("#"):
+            references.add(source_path(target, context))
     # Decode complete JSON fragments first so escaped keys and descriptions retain
     # the same source contract as structured stage output.
     remaining = []
@@ -104,7 +117,7 @@ def check_text(text, context):
         if start < end:
             continue
         try:
-            value, size = json.JSONDecoder().raw_decode(text[start:])
+            value, size = json.JSONDecoder(object_pairs_hook=unique_object).raw_decode(text[start:])
         except json.JSONDecodeError:
             continue
         remaining.append(text[end:start])
@@ -112,13 +125,9 @@ def check_text(text, context):
         if SOURCE_REFS.search(text[:start]):
             references.update(check_source_refs(value, context))
         else:
-            references.update(json_references(value, context))
+            references.update(json_references(value, context, root=True))
     remaining.append(text[end:])
     text = " ".join(remaining)
-    for link in LINK.finditer(text):
-        target = link.group(1) or link.group(2)
-        if not target.startswith("#"):
-            references.add(source_path(target, context))
     tokens = set()
     for pattern in (TOKEN, EXPLICIT, RELATIVE_FILE, BARE_FILE):
         tokens.update(match.group(0).rstrip(".,;") for match in pattern.finditer(text))
