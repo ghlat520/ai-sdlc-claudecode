@@ -1388,6 +1388,19 @@ EVOLVE_JSON
 }
 
 # --- Main ---
+finalize_executor_exit() {
+    local code="$1"
+    # Parallel-stage subshells do not own the pipeline's final process result.
+    [[ "${BASH_SUBSHELL:-0}" -eq 0 ]] || return "$code"
+    trap - EXIT INT TERM
+    if ! _pipeline_state executor-exit "$PIPELINE_ACTIVE_FEATURE" \
+        "$PIPELINE_RUN_ID" "$PIPELINE_INVOCATION_ID" "$code"; then
+        echo "Failed to persist the owned pipeline exit" >&2
+        [[ "$code" -ne 0 ]] || code=1
+    fi
+    exit "$code"
+}
+
 main() {
     local feature_id=""
     local feature_description=""
@@ -1557,8 +1570,16 @@ print(f'{passed}/{total} stages passed, last updated: {last_update}')
         exit 1
     fi
 
+    if [[ -z "${PIPELINE_INVOCATION_ID:-}" ]]; then
+        PIPELINE_INVOCATION_ID=$(python3 -c 'import uuid; print(uuid.uuid4().hex)') || return 1
+    fi
+    export PIPELINE_INVOCATION_ID
     PIPELINE_RUN_ID=$(_pipeline_state start "$feature_id" "$feature_id" "$DAG_FILE" "$specific_stages" "$start_from" "$mock_review" "$PROJECT_CODE_DIR" "$$" "$feature_description" "$COST_LIMIT" "$MAX_RETRIES") || return 1
     export PIPELINE_RUN_ID
+    PIPELINE_ACTIVE_FEATURE="$feature_id"
+    trap 'finalize_executor_exit $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     _pipeline_state replay "$feature_id" || return 1
     emit_event "$feature_id" pipeline_start PIPE "Starting requested execution scope"
 

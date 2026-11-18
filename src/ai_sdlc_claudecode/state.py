@@ -614,6 +614,16 @@ class PipelineState:
                 return False
             data['executor_exit'] = dict(run_id=run, invocation_id=invocation,
                                          exit_code=code, observed_at=_now())
+            if code not in (0, 3, 4):
+                reason = f'Executor exited with code {code}'
+                for record in data.get('stages', {}).values():
+                    if record.get('run_id') == run and record.get('status') in ('running', 'gate_checking'):
+                        record.update(status='failed', updated_at=_now(), failure_reason=reason)
+                        record.setdefault('verification', {})['status'] = 'unverified'
+                        if 'quality_snapshot' not in record:
+                            record['quality_snapshot'] = quality.capture_attempt(record, time.time())
+                data['pipeline_state_reason'] = reason
+            data.update(pipeline_state=self.outcome(data), owner_pid=None, updated_at=_now())
             return True
 
     @staticmethod
@@ -778,6 +788,10 @@ def _pipeline_cli():
         scope = data.get("scope", [])
         execution_scope = data.get("execution_scope", scope)
         sys.exit(0 if args[0] in scope and args[0] in execution_scope else 1)
+    elif command == 'executor-exit':
+        run, invocation, code = args
+        if not state.record_executor_exit(run, invocation, int(code)):
+            raise ValueError('stale executor finalization writer')
     elif command == "pipeline":
         with locked_json(path) as data:
             if os.environ.get("PIPELINE_RUN_ID") != data.get("run_id"):

@@ -186,6 +186,11 @@ if mode == 'empty':
 elif mode == 'agent_error':
     print('actual model invocation error')
     sys.exit(2)
+elif mode == 'block':
+    from pathlib import Path
+    import time
+    Path(os.environ['FAKE_READY']).write_text(str(os.getpid()))
+    time.sleep(30)
 else:
     print(json.dumps({'stage_id': stage, 'status': 'complete', 'summary': 'fixture'} if mode != 'bad_schema' else {'stage_id': stage}))
 ''')
@@ -211,12 +216,69 @@ else:
         dag_path.write_text(json.dumps(dag))
         result = subprocess.run(['bash', str(ROOT / 'pipeline-executor.sh'), 'fixture', 'local only',
                                  '--project-dir', str(tmp_path), *flags], env={**env, 'FAKE_MODE': mode},
-                                capture_output=True, text=True, timeout=25)
+                                capture_output=True, text=True, timeout=max(25, 5 * len(dag['stages'])))
         state_file = tmp_path / 'pipeline' / 'fixture' / 'state.json'
         data = json.loads(state_file.read_text()) if state_file.exists() else {}
         (tmp_path / 'last-output.log').write_text(result.stdout + result.stderr)
         return result, data
     return dag, dag_path, env, run
+
+
+@pytest.mark.parametrize('signal_name,expected_code', [('SIGTERM', 143), ('SIGINT', 130)])
+def test_bash_interruption_persists_exit_and_stops_running_stage(executor_case, tmp_path, signal_name, expected_code):
+    """Real Bash entry and dispatcher; the model executable is local and blocking."""
+    import signal
+    import time
+
+    dag, path, env, run = executor_case
+    path.write_text(json.dumps(dag))
+    ready = tmp_path / 'blocked-model.pid'
+    process = subprocess.Popen(
+        ['bash', str(ROOT / 'pipeline-executor.sh'), 'fixture', 'local interrupt',
+         '--stages', 'S8', '--project-dir', str(tmp_path)],
+        env={**env, 'FAKE_MODE': 'block', 'FAKE_READY': str(ready)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists(), 'local model fixture did not reach the running stage'
+        os.killpg(process.pid, getattr(signal, signal_name))
+        stdout, stderr = process.communicate(timeout=10)
+        state = PipelineState(tmp_path / 'pipeline/fixture/state.json')
+        data = state.read()
+        assert data['pipeline_state'] == 'failed', stdout + stderr
+        assert data['stages']['S8']['status'] == 'failed'
+        assert data['owner_pid'] is None
+        assert process.returncode == expected_code
+        assert data['executor_exit']['exit_code'] == expected_code
+        assert data['executor_exit']['run_id'] == data['run_id']
+        assert state.summary()['execution_outcome'] == 'failed'
+        assert state.summary()['project_acceptance']['status'] == 'not_evaluated'
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(ready.read_text()), 0)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        if ready.exists():
+            try:
+                os.kill(int(ready.read_text()), 0)
+            except ProcessLookupError:
+                pass
+            else:
+                os.kill(int(ready.read_text()), signal.SIGKILL)
+
+    resumed, after = run('--resume')
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert after['run_id'] != data['run_id']
+    assert after['scope'] == ['S8']
+    assert after['stages']['S8']['attempt_id'] != data['stages']['S8']['attempt_id']
+    assert after['stages']['S8']['status'] == 'passed'
+    assert after['executor_exit']['exit_code'] == 0
+    assert any(record['attempt_id'] == data['stages']['S8']['attempt_id']
+               and record['status'] == 'failed' for record in after['history'])
 
 
 @pytest.mark.parametrize("template_has_description", [False, True])
