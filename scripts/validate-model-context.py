@@ -22,7 +22,7 @@ TOKEN = re.compile(
 EXPLICIT = re.compile(r'''(?<![^\s"'`(<])(?:[A-Za-z]:[\\/]|/|\.{1,2}/)[^\s<>"'`()\[\]{};,|]+''')
 RELATIVE_FILE = re.compile(r'''(?<![^\s"'`(<])(?:[\w@%+~.\-]+/)+[\w@%+~.\-]+\.[\w.\-]+''')
 BARE_FILE = re.compile(r'''(?<![^\s"'`(<])(?:\.[A-Za-z][\w.\-]*|[\w@%+~\-][\w@%+~.\-]*\.[A-Za-z][\w.\-]{1,15})(?![\w/])''')
-SOURCE_REFS = re.compile(r'''(?<!\w)["']?source_refs["']?\s*:\s*''')
+SOURCE_REFS = re.compile(r'''(?<!\w)["']?source_refs["']?\s*:\s*$''')
 SCHEMA_ID = "https://json-schema.org/draft/2020-12/schema"
 
 
@@ -61,6 +61,31 @@ def source_path(token, context, *, prose=False):
     return relative
 
 
+def json_references(value, context, *, schema=False, schema_properties=False):
+    """Validate decoded handoff fields while recognizing the inline output schema."""
+    references = set()
+    if isinstance(value, dict):
+        schema = schema or value.get("$schema") == SCHEMA_ID
+        for name, child in value.items():
+            if name == "source_refs" and not schema_properties:
+                references.update(check_source_refs(child, context))
+                continue
+            if name == "source_refs":
+                if (not isinstance(child, dict) or child.get("type") != "array"
+                        or not isinstance(child.get("items"), dict)
+                        or child["items"].get("type") != "string"):
+                    raise ValueError("Invalid source_refs schema")
+            references.update(check_text(name, context))
+            references.update(json_references(
+                child, context, schema=schema, schema_properties=schema and name == "properties"))
+    elif isinstance(value, list):
+        for child in value:
+            references.update(json_references(child, context, schema=schema))
+    elif isinstance(value, str):
+        references.update(check_text(value, context))
+    return references
+
+
 def check_text(text, context):
     # Explicitly declared business symbols apply only to bare prose, never file links or source_refs.
     identifiers = context.get("data_identifiers", [])
@@ -70,13 +95,26 @@ def check_text(text, context):
             or len(identifiers) != len(set(identifiers))):
         raise ValueError("Invalid data identifier declaration")
     references = set()
-    for match in SOURCE_REFS.finditer(text):
-        refs, _ = json.JSONDecoder().raw_decode(text[match.end():])
-        # The supervisor includes the output field's JSON Schema in the prompt.
-        if (isinstance(refs, dict) and refs.get("type") == "array"
-                and isinstance(refs.get("items"), dict) and refs["items"].get("type") == "string"):
+    # Decode complete JSON fragments first so escaped keys and descriptions retain
+    # the same source contract as structured stage output.
+    remaining = []
+    end = 0
+    for match in re.finditer(r'[{\["]', text):
+        start = match.start()
+        if start < end:
             continue
-        references.update(check_source_refs(refs, context))
+        try:
+            value, size = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        remaining.append(text[end:start])
+        end = start + size
+        if SOURCE_REFS.search(text[:start]):
+            references.update(check_source_refs(value, context))
+        else:
+            references.update(json_references(value, context))
+    remaining.append(text[end:])
+    text = " ".join(remaining)
     for link in LINK.finditer(text):
         target = link.group(1) or link.group(2)
         if not target.startswith("#"):

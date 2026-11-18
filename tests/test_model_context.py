@@ -203,7 +203,8 @@ def test_embedded_references_use_the_decoded_structured_source_contract(context,
 
 
 def test_inline_source_reference_schema_remains_metadata(context):
-    schema = {"properties": {"source_refs": {
+    schema = {"$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object", "properties": {"source_refs": {
         "type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}
     }}}
     assert validator().check_text(json.dumps(schema), context) == []
@@ -212,3 +213,33 @@ def test_inline_source_reference_schema_remains_metadata(context):
 def test_declared_data_identifier_with_file_like_suffix_is_still_data(context):
     context["data_identifiers"] = ["market_user.env"]
     assert validator().check_text("The field market_user.env is a string.", context) == []
+
+
+def test_escaped_source_reference_key_cannot_become_prose(context):
+    text = '{"source\\u005frefs": ["conftest.py"]}'
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text(text, context)
+
+
+def test_schema_shaped_source_reference_value_is_still_a_bad_reference(context):
+    text = json.dumps({"source_refs": {
+        "type": "array", "items": {"type": "string"}, "references": ["conftest.py"]
+    }})
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text(text, context)
+
+
+def test_schema_metadata_description_is_checked_after_json_decoding(context):
+    schema = {"$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object", "properties": {"source_refs": {
+                  "type": "array", "items": {"type": "string"},
+                  "description": "Read ../outside.custom"
+              }}}
+    text = json.dumps(schema).replace(".", "\\u002e").replace("/", "\\u002f")
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text(text, context)
+
+
+def test_source_reference_label_in_ordinary_prose_is_not_a_json_document(context):
+    assert validator().check_text(
+        "About source_refs: keep the approved entries.", context) == []
