@@ -5,11 +5,16 @@ work; the local supervisor computes acceptance from the declared project contrac
 collected execution evidence. A stage finishing is a different claim from a product
 passing its acceptance checks. Neither grants permission to deploy.
 
+The **AI 管理 AI** method guides responsibilities, context and authorization. Its
+**行政总厨与专业副厨** correspond to the existing coordinator and bounded stage
+implementers. The **Agent 极速编码的质量保障** method guides executable constraints,
+verification and delivery verdicts through the existing supervisor and project contract.
+
 ## Responsibilities and context
 
 | Owner | Responsibility | Completion boundary |
 | --- | --- | --- |
-| Product owner | Intent, priorities, tradeoffs, important authorization | Business decisions and any required human acceptance |
+| Product owner | Intent, priorities, tradeoffs, important authorization, sampling delivered results | Business decisions and any required human acceptance |
 | Coordinator | Source discovery, scope, dependencies, next owner/action | Arrange verification; cannot override failed evidence |
 | Implementer | Bounded changes, equivalent call sites, focused self-checks | Candidate submitted with actual tested scope |
 | Reviewer | Original contract, counterexamples, same-rule entrypoints | Independently verified scope and remaining findings |
@@ -36,6 +41,28 @@ Every rendered stage prompt includes these responsibilities. Existing
 Keep source references short and authoritative. Agents read the underlying sources and
 report relevant versions. Do not place credentials or customer records in this metadata.
 The project owns business expectations and permitted file/module scope.
+
+## Human sampling and required verification
+
+**抽样尝菜** belongs to the product owner's review of actual user-visible outcomes,
+experience, business value and missed-defect trends. Once the declared checks pass,
+the shared CLI, terminal and Markdown summaries hand these decisions to the product owner.
+
+Every delivered candidate must have valid evidence for all named required checks,
+applicable independent verification and open blockers. The supervisor evaluates that
+evidence on every verdict read. Evidence may be reused while its candidate, policy and
+bound inputs remain valid. Candidate changes require the affected checks to run again.
+
+An agent's report that human sampling passed cannot satisfy a failed or missing required
+check. A configured `human-required` gate retains `human_waiting` until an authorized
+approval integration can satisfy its requirement. Sampling feedback and a local approval
+marker cannot authorize that gate or a release action.
+
+Keep **历史纠错案例** in the project's existing defect and acceptance workflow with the
+trigger, expected and actual results, affected candidate, cause and verified correction.
+Use a normal case and the original counterexample when turning a mechanical failure into
+an executable check. Project context and source references guide the work within the
+user's authorized scope. Product and release actions follow their existing authorization.
 
 ## Opt in through the project's DAG
 

@@ -431,6 +431,10 @@ def test_code_stage_can_write_source_and_returns_metadata(executor_case, templat
     assert 'docs/approved-spec.md' in prompt
     assert 'production rollout' in prompt
     assert 'The supervisor decides acceptance' in prompt
+    assert 'Product owner: set intent, authorize scope, and sample delivered results' in prompt
+    assert 'Human sampling reviews experience, business value, and missed-defect trends.' in prompt
+    assert 'Every delivered candidate needs valid evidence for all required checks.' in prompt
+    assert "Authorization follows the user's task scope and required trusted approvals." in prompt
 
 
 def test_imported_architecture_materializes_configured_contracts(executor_case, tmp_path):
@@ -855,6 +859,39 @@ Path(os.environ['PIPELINE_ACCEPTANCE_REPORT']).write_text(json.dumps(report))
     }
     dag['stages']['second']['post_commands'] = ['python3 acceptance_driver.py']
     return dag, path, env, run, tmp_path, driver
+
+
+@pytest.mark.parametrize('scenario,expected_exit,expected_project', [
+    ('required-check-fails', 1, 'failed'),
+    ('required-checks-pass', 0, 'passed'),
+    ('human-approval-required', 3, 'incomplete'),
+])
+def test_human_sampling_claim_preserves_required_verification(project_acceptance_case,
+                                                            scenario, expected_exit, expected_project):
+    dag, path, env, run, project, driver = project_acceptance_case
+    model = Path(env['PATH'].split(os.pathsep)[0]) / 'claude'
+    model.write_text(model.read_text().replace(
+        "'summary': 'fixture'",
+        "'summary': 'Human sampling accepted', 'human_sampling': 'passed'"))
+    if scenario == 'required-check-fails':
+        driver.write_text(driver.read_text().replace("'replay': 'passed'", "'replay': 'failed'"))
+    if scenario == 'human-approval-required':
+        dag['stages']['second']['gate'] = {'type': 'human-required'}
+    result, data = run('--stages', 'S8,S9')
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    state = PipelineState(Path(env['PIPELINE_ROOT']) / 'fixture/state.json')
+    acceptance = state.project_acceptance()
+    assert acceptance['status'] == expected_project
+    assert acceptance['required_cases'] == 2
+    assert acceptance['passed_cases'] == (1 if scenario == 'required-check-fails' else 2)
+    record = data['stages']['S9']
+    output = json.loads((Path(record['output_dir']) / 'output.json').read_text())
+    assert output['human_sampling'] == 'passed'
+    if scenario == 'human-approval-required':
+        assert data['pipeline_state'] == 'human_waiting'
+        assert not record['authorization']['actor']
+    else:
+        assert data['pipeline_state'] == ('failed' if expected_exit else 'complete')
 
 
 @pytest.mark.parametrize('mode', ['pass', 'reject', 'missing', 'prewritten', 'command-fails',

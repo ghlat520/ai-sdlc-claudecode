@@ -132,6 +132,8 @@ sys.exit(0 if passed else 1)
                     assert line in plain, (name, line, content)
                 if blocked:
                     assert 'Blocking finding not verified closed: R1' in content
+                else:
+                    assert 'Product owner: sample user-visible results for experience and business value' in plain
                 if entrypoint == 'python-cli' and blocked and name in ('python-status', 'python-report'):
                     assert 'stalled' in plain and 'iterations without improvement' in plain
             assert state.path.read_bytes() == frozen_state, name + ' changed the execution state'

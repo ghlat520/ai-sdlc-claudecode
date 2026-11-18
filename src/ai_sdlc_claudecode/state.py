@@ -638,7 +638,8 @@ class PipelineState:
         elif project['status'] == 'not_evaluated':
             values.append(('Next', 'Coordinator: declare and execute project acceptance when required by the goal'))
         else:
-            values.append(('Next', 'Product owner: review the accepted scope and any separately authorized release decision'))
+            values.append(('Next', 'Product owner: sample user-visible results for experience and business value. '
+                                  'Release actions follow existing authorization.'))
         return [f"{'**' if markdown else ''}{key}{'**' if markdown else ''}: {value}" for key, value in values]
 
     def outcome(self, data=None):
