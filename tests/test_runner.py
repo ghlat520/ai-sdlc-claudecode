@@ -140,6 +140,139 @@ def test_runner_never_reuses_success_after_entrypoint_fails(tmp_path):
     assert result.outcome == 'failed'
 
 
+def test_cli_run_preserves_executor_failure_exit(tmp_path):
+    """A real local executor failure must reach the public CLI process boundary."""
+    import os
+    import subprocess
+    import sys
+
+    executor = tmp_path / 'pipeline-executor.sh'
+    executor.write_text('#!/bin/sh\nexit 7\n')
+    driver = tmp_path / 'local-cli.py'
+    driver.write_text(
+        'import runpy, sys\n'
+        'from pathlib import Path\n'
+        'import ai_sdlc_claudecode.cli as cli\n'
+        f'cli.resolve_executor = lambda: Path({str(executor)!r})\n'
+        f'cli.resolve_pipeline_root = lambda: Path({str(tmp_path / "pipeline")!r})\n'
+        'cli.EvolvingAgent._preflight = lambda self: None\n'
+        'cli.MAX_ITERATIONS_PER_PHASE = 1\n'
+        'sys.argv = ["ai-sdlc", "run", "--phase", "2", "--feature-id", "local-case"]\n'
+        'runpy.run_module("ai_sdlc_claudecode", run_name="__main__")\n'
+    )
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, str(driver)], text=True, capture_output=True, timeout=15,
+        env={**os.environ, 'PYTHONPATH': str(root / 'src')},
+    )
+    assert result.returncode == 7, result.stdout + result.stderr
+    checkpoint = json.loads((tmp_path / 'pipeline/local-case/ai-sdlc-state.json').read_text())
+    assert checkpoint['current_iteration'] == 1
+    assert checkpoint['phases']['2']['status'] != 'complete'
+
+
+@pytest.mark.parametrize('outcome,native_exit,complete,expected_exit', [
+    ('complete', 0, True, 0),
+    ('failed', 0, False, 1),
+    ('human_waiting', 3, False, 3),
+    ('paused', 4, False, 4),
+    ('partial', 0, False, 4),
+    ('simulated', 0, False, 4),
+    ('unverified', 0, False, 1),
+])
+def test_cli_exit_requires_completed_scope(tmp_path, outcome, native_exit, complete, expected_exit):
+    """Controlled runner receipts exercise CLI exit and checkpoint semantics."""
+    import os
+    import subprocess
+    import sys
+
+    executor = tmp_path / 'pipeline-executor.sh'
+    executor.write_text('#!/bin/sh\nexit 99\n')
+    driver = tmp_path / 'controlled-cli.py'
+    driver.write_text(
+        'import runpy, sys\n'
+        'from pathlib import Path\n'
+        'import ai_sdlc_claudecode.cli as cli\n'
+        'from ai_sdlc_claudecode.runner import RunResult\n'
+        f'cli.resolve_executor = lambda: Path({str(executor)!r})\n'
+        f'cli.resolve_pipeline_root = lambda: Path({str(tmp_path / "pipeline")!r})\n'
+        'cli.EvolvingAgent._preflight = lambda self: None\n'
+        'cli.MAX_ITERATIONS_PER_PHASE = 1\n'
+        'cli.PipelineRunner.run = lambda *args, **kwargs: RunResult('\
+        f'"local-case", {native_exit}, "", "", {int(complete)}, 1, 0, 0, {complete}, {outcome!r})\n'
+        'sys.argv = ["ai-sdlc", "run", "--phase", "2", "--feature-id", "local-case"]\n'
+        'runpy.run_module("ai_sdlc_claudecode", run_name="__main__")\n'
+    )
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, str(driver)], text=True, capture_output=True, timeout=15,
+        env={**os.environ, 'PYTHONPATH': str(root / 'src')},
+    )
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    checkpoint = json.loads((tmp_path / 'pipeline/local-case/ai-sdlc-state.json').read_text())
+    assert (checkpoint['phases']['2']['status'] == 'complete') == complete
+    assert checkpoint['current_iteration'] == 1
+
+
+def test_cli_budget_stop_before_execution_is_not_success(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    executor = tmp_path / 'pipeline-executor.sh'
+    marker = tmp_path / 'unexpected-execution'
+    executor.write_text('#!/bin/sh\ntouch ' + str(marker) + '\nexit 0\n')
+    driver = tmp_path / 'budget-cli.py'
+    driver.write_text(
+        'import runpy, sys\n'
+        'from pathlib import Path\n'
+        'import ai_sdlc_claudecode.cli as cli\n'
+        f'cli.resolve_executor = lambda: Path({str(executor)!r})\n'
+        f'cli.resolve_pipeline_root = lambda: Path({str(tmp_path / "pipeline")!r})\n'
+        'cli.EvolvingAgent._preflight = lambda self: None\n'
+        'sys.argv = ["ai-sdlc", "run", "--phase", "2", "--feature-id", "local-case", "--max-cost", "0"]\n'
+        'runpy.run_module("ai_sdlc_claudecode", run_name="__main__")\n'
+    )
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, str(driver)], text=True, capture_output=True, timeout=15,
+        env={**os.environ, 'PYTHONPATH': str(root / 'src')},
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not marker.exists()
+    checkpoint = json.loads((tmp_path / 'pipeline/local-case/ai-sdlc-state.json').read_text())
+    assert checkpoint['current_iteration'] == 0
+
+
+@pytest.mark.parametrize('signum', [2, 15])
+def test_cli_shutdown_preserves_signal_exit(tmp_path, signum):
+    import os
+    import subprocess
+    import sys
+
+    executor = tmp_path / 'pipeline-executor.sh'
+    executor.write_text('#!/bin/sh\nexit 99\n')
+    driver = tmp_path / 'signal-cli.py'
+    driver.write_text(
+        'import os\n'
+        'from pathlib import Path\n'
+        'import ai_sdlc_claudecode.cli as cli\n'
+        f'cli.resolve_executor = lambda: Path({str(executor)!r})\n'
+        f'cli.resolve_pipeline_root = lambda: Path({str(tmp_path / "pipeline")!r})\n'
+        'agent = cli.EvolvingAgent(50, 4, 5, 2, "local-case", "local signal fixture")\n'
+        f'os.kill(os.getpid(), {signum})\n'
+    )
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, str(driver)], text=True, capture_output=True, timeout=15,
+        env={**os.environ, 'PYTHONPATH': str(root / 'src')},
+    )
+    assert result.returncode == 128 + signum, result.stdout + result.stderr
+    checkpoint = json.loads((tmp_path / 'pipeline/local-case/ai-sdlc-state.json').read_text())
+    assert checkpoint['current_iteration'] == 0
+    assert (tmp_path / 'pipeline/local-case/ai-sdlc-report.md').exists()
+
+
 def test_runner_timeout_terminates_stage_children(tmp_path):
     import time
     executor = tmp_path / 'pipeline-executor.sh'

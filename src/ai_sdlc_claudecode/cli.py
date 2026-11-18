@@ -76,15 +76,15 @@ class EvolvingAgent:
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
 
-    def run(self) -> None:
+    def run(self) -> int:
         self._preflight()
         self._banner()
 
         try:
             # The selected phase and feature are the complete authorization scope.
-            self._phase(self.start_phase, "Selected feature execution",
-                        mock_review=self.start_phase == 1,
-                        start_from="S3" if self.start_phase == 3 else None)
+            return self._phase(self.start_phase, "Selected feature execution",
+                               mock_review=self.start_phase == 1,
+                               start_from="S3" if self.start_phase == 3 else None)
         finally:
             self._finalize()
 
@@ -96,7 +96,7 @@ class EvolvingAgent:
         start_from: Optional[str] = None,
         feature_override: Optional[str] = None,
         description_override: Optional[str] = None,
-    ) -> None:
+    ) -> int:
         _log(f"{'=' * 60}", BOLD)
         _log(f"Phase {phase}: {label}", BOLD + CYAN)
         _log(f"{'=' * 60}", BOLD)
@@ -104,6 +104,7 @@ class EvolvingAgent:
         feat = feature_override or self.feature_id
         desc = description_override or self.description
         pipeline_root = resolve_pipeline_root()
+        exit_code = 2  # No execution completed before a budget/stall stop.
 
         for iteration in range(MAX_ITERATIONS_PER_PHASE):
             ok, reason = self.state.check_budget()
@@ -129,6 +130,10 @@ class EvolvingAgent:
                 evolve_errors_dir=self.errors_dir,
                 cost_limit=self.state.max_cost_usd,
             )
+            exit_code = result.exit_code
+            if exit_code == 0 and not result.all_passed:
+                exit_code = {"human_waiting": 3, "paused": 4, "partial": 4,
+                             "simulated": 4}.get(result.outcome, 1)
 
             new_errors = [] if mock_review else self.engine.read_failures(iteration, phase, feat)
 
@@ -160,6 +165,7 @@ class EvolvingAgent:
                 break
         else:
             _log(f"Phase {phase}: max iterations reached", YELLOW)
+        return exit_code
 
     def _preflight(self) -> None:
         try:
@@ -203,7 +209,7 @@ class EvolvingAgent:
         self.state.checkpoint()
         self.state.generate_report(self.report_path)
         _log(f"Report: {self.report_path}", GREEN)
-        sys.exit(0)
+        sys.exit(128 + signum)
 
     def _finalize(self) -> None:
         self.state.checkpoint()
@@ -219,7 +225,7 @@ class EvolvingAgent:
         print(f"{BOLD}{CYAN}{'=' * 60}{NC}\n")
 
 
-def _cmd_run(args: argparse.Namespace) -> None:
+def _cmd_run(args: argparse.Namespace) -> int:
     agent = EvolvingAgent(
         max_cost=args.max_cost,
         max_hours=args.max_hours,
@@ -228,7 +234,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         feature_id=args.feature_id,
         description=args.description,
     )
-    agent.run()
+    return agent.run()
 
 
 # ---------------------------------------------------------------------------
@@ -389,4 +395,4 @@ def main() -> None:
     reset_p.set_defaults(func=_cmd_reset)
 
     args = parser.parse_args()
-    args.func(args)
+    raise SystemExit(args.func(args))
