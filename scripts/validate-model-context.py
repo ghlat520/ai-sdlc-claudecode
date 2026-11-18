@@ -22,7 +22,7 @@ TOKEN = re.compile(
 EXPLICIT = re.compile(r'''(?<![^\s"'`(<])(?:[A-Za-z]:[\\/]|/|\.{1,2}/)[^\s<>"'`()\[\]{};,|]+''')
 RELATIVE_FILE = re.compile(r'''(?<![^\s"'`(<])(?:[\w@%+~.\-]+/)+[\w@%+~.\-]+\.[\w.\-]+''')
 BARE_FILE = re.compile(r'''(?<![^\s"'`(<])(?:\.[A-Za-z][\w.\-]*|[\w@%+~\-][\w@%+~.\-]*\.[A-Za-z][\w.\-]{1,15})(?![\w/])''')
-SOURCE_REFS = re.compile(r'''(?<!\w)["']?source_refs["']?\s*:\s*(?=\[)''')
+SOURCE_REFS = re.compile(r'''(?<!\w)["']?source_refs["']?\s*:\s*''')
 SCHEMA_ID = "https://json-schema.org/draft/2020-12/schema"
 
 
@@ -35,8 +35,8 @@ def source_path(token, context, *, prose=False):
     if re.match(r"^[A-Za-z]:", raw) or "://" in raw:
         raise ValueError("Unapproved project source: " + token)
     root = Path(context["candidate_root"]).resolve(strict=True)
-    if prose and "/" not in raw and not raw.startswith("."):
-        if raw not in context["proposed_model_read_files"] and ((root / raw).exists() or (root / raw).is_symlink()):
+    if prose and "/" not in raw and not raw.startswith(".") and raw not in context["proposed_model_read_files"]:
+        if (root / raw).exists() or (root / raw).is_symlink():
             raise ValueError("Unapproved project source: " + token)
         matches = [name for name in context["proposed_model_read_files"] if Path(name).name == raw]
         if len(matches) > 1:
@@ -72,27 +72,26 @@ def check_text(text, context):
     references = set()
     for match in SOURCE_REFS.finditer(text):
         refs, _ = json.JSONDecoder().raw_decode(text[match.end():])
-        if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
-            raise ValueError("Model source_refs must contain approved project paths")
-        for ref in refs:
-            references.add(source_path(ref.split(";", 1)[0], context))
+        # The supervisor includes the output field's JSON Schema in the prompt.
+        if (isinstance(refs, dict) and refs.get("type") == "array"
+                and isinstance(refs.get("items"), dict) and refs["items"].get("type") == "string"):
+            continue
+        references.update(check_source_refs(refs, context))
     for link in LINK.finditer(text):
         target = link.group(1) or link.group(2)
         if not target.startswith("#"):
             references.add(source_path(target, context))
-    for match in TOKEN.finditer(text):
-        token = match.group(0).rstrip(".,;")
+    tokens = set()
+    for pattern in (TOKEN, EXPLICIT, RELATIVE_FILE, BARE_FILE):
+        tokens.update(match.group(0).rstrip(".,;") for match in pattern.finditer(text))
+    root = Path(context["candidate_root"]).resolve(strict=True)
+    for token in sorted(tokens):
         # The schema URL is an identifier; output.json is the supervisor-owned sink.
         if token in (SCHEMA_ID, "output.json"):
             continue
+        if token in identifiers and not (root / token).exists() and not (root / token).is_symlink():
+            continue
         references.add(source_path(token, context, prose=True))
-    for pattern in (EXPLICIT, RELATIVE_FILE, BARE_FILE):
-        for match in pattern.finditer(text):
-            token = match.group(0).rstrip(".,;")
-            if pattern is BARE_FILE and token in identifiers:
-                continue
-            if token != 'output.json':
-                references.add(source_path(token, context, prose=True))
     return sorted(references)
 
 

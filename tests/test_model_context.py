@@ -167,3 +167,48 @@ def test_invalid_data_identifier_declarations_rejected(context, identifiers):
     context["data_identifiers"] = identifiers
     with pytest.raises(ValueError, match="identifier"):
         validator().check_text("Return the task summary.", context)
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_declared_database_field_cannot_hide_a_root_file(context, tmp_path, symlink):
+    context["data_identifiers"] = ["market_user.phone"]
+    path = Path(context["candidate_root"]) / "market_user.phone"
+    if symlink:
+        path.symlink_to(tmp_path / "outside-data")
+    else:
+        path.write_text("outside the approved file inventory\n")
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text("Open market_user.phone.", context)
+
+
+def test_authorized_root_filename_remains_canonical_when_nested_name_matches(context):
+    root = Path(context["candidate_root"])
+    (root / "conftest.py").write_text("# approved root fixture\n")
+    context["proposed_model_read_files"]["conftest.py"] = {
+        "sha256": hashlib.sha256((root / "conftest.py").read_bytes()).hexdigest()
+    }
+    guard = validator()
+    assert guard.check_text("Read [root](conftest.py).", context) == ["conftest.py"]
+    assert guard.check_source_refs(["conftest.py; approved root"], context) == ["conftest.py"]
+
+
+@pytest.mark.parametrize("refs", [
+    "conftest.py", [], {"file": "conftest.py"},
+    ["pilot/task.md; inspect ../outside.custom"],
+])
+def test_embedded_references_use_the_decoded_structured_source_contract(context, refs):
+    payload = json.dumps({"source_refs": refs}).replace(".", "\\u002e")
+    with pytest.raises(ValueError, match="source"):
+        validator().check_text(payload, context)
+
+
+def test_inline_source_reference_schema_remains_metadata(context):
+    schema = {"properties": {"source_refs": {
+        "type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}
+    }}}
+    assert validator().check_text(json.dumps(schema), context) == []
+
+
+def test_declared_data_identifier_with_file_like_suffix_is_still_data(context):
+    context["data_identifiers"] = ["market_user.env"]
+    assert validator().check_text("The field market_user.env is a string.", context) == []
