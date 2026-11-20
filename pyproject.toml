@@ -22,11 +22,21 @@ dev = [
 [project.scripts]
 ai-sdlc = "ai_sdlc_claudecode.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = ["ai_sdlc_claudecode", "ai_sdlc_claudecode.bash"]
+include-package-data = false
+
+[tool.setuptools.package-dir]
+ai_sdlc_claudecode = "src/ai_sdlc_claudecode"
+"ai_sdlc_claudecode.bash" = "."
 
 [tool.setuptools.package-data]
-ai_sdlc_claudecode = ["bash/*.sh", "bash/*.json", "bash/schemas/*.json", "bash/lib/*.sh"]
+"ai_sdlc_claudecode.bash" = [
+    "*.sh", "pipeline-dag.json",
+    "lib/*.sh", "lib/*.py", "lib/hooks/*.sh",
+    "schemas/*.json", "prompts/**/*.md", "prompts/**/*.json",
+    "scripts/*.sh", "scripts/*.py", "scripts/*.cjs",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
